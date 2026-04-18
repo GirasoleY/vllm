@@ -412,5 +412,27 @@ def test_decode_bench_connector_concurrent_requests():
     assert len(metadata2.reqs_to_fill) == 0
 
 
+def test_decode_bench_connector_prefill_at_register():
+    """Verify that register_kv_caches pre-fills the entire KV cache in place,
+    so that start_fill_kv can be a no-op at scheduler-step time.
+
+    This is the load-bearing property for high-concurrency benchmark
+    correctness: blocks that are never scheduled to any request should
+    still contain the fill value after registration.
+    """
+    block_size = 16
+    num_gpu_blocks = 100
+
+    runner = DecodeBenchTestRunner(block_size=block_size, num_gpu_blocks=num_gpu_blocks)
+
+    # No requests scheduled — entire cache should already be filled with
+    # the default fill_mean (0.015).
+    for layer_name, kv_cache in runner.kv_caches.items():
+        expected = torch.full_like(kv_cache, 0.015)
+        assert torch.allclose(kv_cache, expected), (
+            f"Layer {layer_name} not fully pre-filled at register time"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
