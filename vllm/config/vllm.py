@@ -1184,6 +1184,19 @@ class VllmConfig:
 
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
+        # Map the umbrella `parallel_config.sp_threshold` onto the compile-based
+        # SP pass (the eager in-forward SP path reads sp_threshold directly):
+        #   None  -> defer to the optimization-level default
+        #   0     -> force the pass off
+        #   N > 0 -> force the pass on with N as its min-token threshold
+        sp_threshold = self.parallel_config.sp_threshold
+        if sp_threshold == 0:
+            pass_config.enable_sp = False
+            pass_config.fuse_gemm_comms = False
+        elif sp_threshold is not None:
+            pass_config.enable_sp = True
+            if pass_config.sp_min_token_num is None:
+                pass_config.sp_min_token_num = sp_threshold
         if pass_config.fuse_gemm_comms:
             pass_config.enable_sp = True
         if pass_config.enable_sp:
@@ -1574,27 +1587,44 @@ class VllmConfig:
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 
-    def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
+    def update_sizes_for_sequence_parallelism(
+        self, possible_sizes: list, sp_capture_min_tokens: int | None = None
+    ) -> list:
         # remove the sizes that not multiple of tp_size when
         # enable sequence parallelism
-        removed_sizes = [
-            size
-            for size in possible_sizes
-            if size % self.parallel_config.tensor_parallel_size != 0
-        ]
+        tp_size = self.parallel_config.tensor_parallel_size
+        if sp_capture_min_tokens is None:
+            removed_sizes = [size for size in possible_sizes if size % tp_size != 0]
+        else:
+            removed_sizes = [
+                size
+                for size in possible_sizes
+                if size >= sp_capture_min_tokens and size % tp_size != 0
+            ]
         if removed_sizes:
-            logger.warning(
-                "Batch sizes %s are removed because they are not "
-                "multiple of tp_size %d when "
-                "sequence parallelism is enabled",
-                removed_sizes,
-                self.parallel_config.tensor_parallel_size,
-            )
+            if sp_capture_min_tokens is None:
+                logger.warning(
+                    "Batch sizes %s are removed because they are not "
+                    "multiple of tp_size %d when "
+                    "sequence parallelism is enabled",
+                    removed_sizes,
+                    tp_size,
+                )
+            else:
+                logger.warning(
+                    "Batch sizes %s are removed because they are not "
+                    "multiple of tp_size %d while at or above "
+                    "the sequence-parallelism capture threshold %d",
+                    removed_sizes,
+                    tp_size,
+                    sp_capture_min_tokens,
+                )
 
         return [
             size
             for size in possible_sizes
-            if size % self.parallel_config.tensor_parallel_size == 0
+            if size % tp_size == 0
+            or (sp_capture_min_tokens is not None and size < sp_capture_min_tokens)
         ]
 
     def _set_max_num_scheduled_tokens(self):
@@ -1760,7 +1790,8 @@ class VllmConfig:
                 and self.compilation_config.pass_config.enable_sp
             ):
                 cudagraph_capture_sizes = self.update_sizes_for_sequence_parallelism(
-                    cudagraph_capture_sizes
+                    cudagraph_capture_sizes,
+                    self.parallel_config.sp_threshold,
                 )
 
             # user-specific compilation_config.max_cudagraph_capture_size get

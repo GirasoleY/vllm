@@ -3418,12 +3418,23 @@ class GPUModelRunner(
         )
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
-        # Pad tokens to multiple of tensor_parallel_size when
-        # enabled collective fusion for SP
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
+        if self._requires_sequence_parallel_padding(num_scheduled_tokens):
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
+
+    def _requires_sequence_parallel_padding(self, num_scheduled_tokens: int) -> bool:
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if tp_size <= 1:
+            return False
+
+        sp_threshold = self.vllm_config.parallel_config.sp_threshold
+        if sp_threshold is not None:
+            return num_scheduled_tokens >= max(sp_threshold, tp_size)
+
+        # Preserve existing compile-SP behavior when the umbrella threshold is
+        # unset: compile-pass SP always pads dispatch sizes to a TP multiple.
+        return self.compilation_config.pass_config.enable_sp
 
     def _prepare_mm_inputs(
         self, num_tokens: int
@@ -3878,7 +3889,7 @@ class GPUModelRunner(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
         num_tokens_padded = batch_descriptor.num_tokens
-        if self.compilation_config.pass_config.enable_sp:
+        if self._requires_sequence_parallel_padding(batch_descriptor.num_tokens):
             assert (
                 batch_descriptor.num_tokens
                 % self.vllm_config.parallel_config.tensor_parallel_size
@@ -3915,6 +3926,17 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+                if self._requires_sequence_parallel_padding(
+                    batch_descriptor.num_tokens
+                ):
+                    assert (
+                        batch_descriptor.num_tokens
+                        % self.vllm_config.parallel_config.tensor_parallel_size
+                        == 0
+                    ), (
+                        "Sequence parallelism requires DP-synced num_tokens "
+                        "to be a TP multiple"
+                    )
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
