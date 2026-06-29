@@ -214,6 +214,7 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    block_table: torch.Tensor | None = None
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -638,6 +639,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            block_table=common_attn_metadata.block_table_tensor,
         )
 
         return attn_metadata

@@ -1248,6 +1248,13 @@ class DeepseekV4Model(nn.Module):
                     n = narrow_weight.shape[0]
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
+                    # Also populate the replicated full-head sink (shardq path),
+                    # if the layer registered one, from the unsharded weight.
+                    full_name = name.replace("attn_sink", "attn_sink_full")
+                    if full_name in params_dict:
+                        nf = loaded_weight.shape[0]
+                        params_dict[full_name][:nf].copy_(loaded_weight)
+                        loaded_params.add(full_name)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
