@@ -936,6 +936,12 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    page_sizes = {
+        group.kv_cache_spec.page_size_bytes for group in kv_cache_config.kv_cache_groups
+    }
+    assert len(page_sizes) == 1, (
+        f"KV cache groups have different page sizes: {sorted(page_sizes)}"
+    )
     num_blocks_per_request = sum(
         cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
