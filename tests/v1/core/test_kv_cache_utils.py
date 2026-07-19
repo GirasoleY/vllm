@@ -1493,12 +1493,11 @@ def test_get_max_concurrency_for_kv_cache_config():
         == 3
     )
 
-    # UniformTypeKVCacheSpecs group (worker config shape): the aggregated
-    # spec's memory/page ratio equals a single layer's page count, so the
-    # group needs 1024 blocks and the request 1153 in total. The previous
-    # formula normalized both groups' memory by the first group's page size,
-    # reporting 3459/1057 = 3.27 here instead of 3 — and a different value
-    # again for the scheduler-config shape below.
+    # Worker config shape: UniformTypeKVCacheSpecs aggregates four specs into
+    # one group-level page. Max memory and page size scale together, so the
+    # group still needs 1024 block IDs and the request needs 1153. The old
+    # formula normalized both groups by the first group's aggregate page size,
+    # reporting 3459/1057 = 3.27 here and a different scheduler-side value.
     uniform_full_spec = UniformTypeKVCacheSpecs(
         block_size=full_attention_spec.block_size,
         kv_cache_specs={f"layer_{i}": full_attention_spec for i in range(4)},
@@ -1588,10 +1587,11 @@ def test_get_max_concurrency_packed_kv_cache_config():
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
     )
-    # Per-request blocks: the MLA group needs cdiv(16384, 16) = 1024 pages;
-    # the SWA group cdiv(min(128 - 1 + 1024, 16384), 16) + 1 = 73. The
-    # previous formula normalized by the first group's page size and gave
-    # 1061 blocks per request instead of 1097.
+    # Both groups use 36,864-byte per-layer pages, but their aggregate group
+    # pages differ because packed groups keep their actual member counts: four
+    # MLA specs and two SWA specs. MLA needs 1024 block IDs and SWA needs 73.
+    # The old formula gave ceil((1024 * 4 + 73 * 2) / 4) = 1061 instead of the
+    # per-group total, 1024 + 73 = 1097.
     assert get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_packed
     ) == num_blocks / (1024 + 73)
