@@ -690,6 +690,75 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
         return True
 
+    def _build_stored_event(
+        self,
+        req_meta: ReqMeta,
+        start: int,
+        end: int,
+        group_idx: int,
+        key_hash: BlockHash,
+    ) -> BlockStored:
+        """Describe one stored object using its cache spec's semantics."""
+        spec = self.coord.kv_cache_groups[group_idx].kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+
+        db = self.token_databases[group_idx]
+        hash_block_size = db.hash_block_size
+        first_hash_idx = start // hash_block_size
+        last_hash_idx = end // hash_block_size
+
+        if isinstance(spec, MambaSpec):
+            # A Mamba snapshot is not downward closed: only the state at this
+            # boundary is reusable, and it summarizes the whole prefix.
+            block_hashes = [maybe_convert_block_hash(key_hash)]
+            parent_block_hash = None
+            token_start = 0
+            block_size = end
+        elif self.coord.enable_partial_hash_hits:
+            # Fine-grained groups expose every hash-sized segment as one
+            # hash chain.
+            block_hashes = [
+                maybe_convert_block_hash(block_hash)
+                for block_hash in req_meta.block_hashes[
+                    first_hash_idx:last_hash_idx
+                ]
+            ]
+            parent_block_hash = (
+                maybe_convert_block_hash(req_meta.block_hashes[first_hash_idx - 1])
+                if first_hash_idx > 0
+                else None
+            )
+            token_start = start
+            block_size = hash_block_size
+        else:
+            # Cache specs without fine-grained hash reuse describe the
+            # physical object as one block, keyed by its final hash.
+            block_hashes = [maybe_convert_block_hash(key_hash)]
+            parent_block_hash = (
+                maybe_convert_block_hash(req_meta.block_hashes[first_hash_idx - 1])
+                if first_hash_idx > 0
+                else None
+            )
+            token_start = start
+            block_size = end - start
+
+        token_ids = (
+            req_meta.token_ids[token_start:end]
+            if req_meta.token_ids is not None
+            else None
+        )
+        return BlockStored(
+            block_hashes=block_hashes,
+            parent_block_hash=parent_block_hash,
+            token_ids=token_ids,
+            block_size=block_size,
+            lora_id=None,
+            medium="cpu",
+            lora_name=None,
+            group_idx=group_idx,
+        )
+
     def _handle_request(self, req_meta: ReqMeta):
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
         # is also ``store_mask``'s precondition.
@@ -825,35 +894,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 addrs.extend(group_addrs)
                 sizes.extend(group_sizes)
 
-            # parent_block_hash chains live within a group, not across.
-            if self.enable_kv_event:
-                prev_key_per_group: dict[int, Any] = {}
-                new_block_hashes = [
-                    maybe_convert_block_hash(bh) for bh in kv_event_block_hashes
-                ]
-
             for idx, (s, e, g_idx) in enumerate(
                 zip(starts, ends, group_indices, strict=True)
             ):
-                db = self.token_databases[g_idx]
                 if self.enable_kv_event:
-                    token_ids = (
-                        req_meta.token_ids[s:e]
-                        if req_meta.token_ids is not None
-                        else None
+                    stored_events.append(
+                        self._build_stored_event(
+                            req_meta,
+                            s,
+                            e,
+                            g_idx,
+                            kv_event_block_hashes[idx],
+                        )
                     )
-                    stored_event = BlockStored(
-                        block_hashes=[new_block_hashes[idx]],
-                        parent_block_hash=prev_key_per_group.get(g_idx),
-                        token_ids=token_ids,
-                        block_size=db.block_size,
-                        lora_id=None,
-                        medium="cpu",
-                        lora_name=None,
-                        group_idx=g_idx,
-                    )
-                    stored_events.append(stored_event)
-                    prev_key_per_group[g_idx] = new_block_hashes[idx]
 
             if current_event is not None:
                 current_event.synchronize()
@@ -867,7 +920,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     sizes,
                     self.replicate_config,
                 )
-                failed = [i for i, v in enumerate(res) if v < 0]
+                failed = [i for i in range(len(keys)) if i >= len(res) or res[i] < 0]
                 self._record_operation(
                     "save_put",
                     put_start,
@@ -877,7 +930,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
-                    failed_codes = set(res[i] for i in failed)
+                    failed_codes = {res[i] for i in failed if i < len(res)}
+                    if len(res) < len(keys):
+                        failed_codes.add("missing_result")
                     logger.warning(
                         "batch_put failed: %d/%d keys failed "
                         "(codes=%s, batch_bytes=%d, num_keys=%d), "
@@ -887,7 +942,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         failed_codes,
                         batch_bytes,
                         len(keys),
-                        keys[0] if keys else "N/A",
+                        keys[0],
                     )
                     if (
                         MOONCAKE_NO_AVAILABLE_HANDLE in failed_codes
@@ -907,6 +962,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             "Mooncake CPU/disk offloading pressure cleared "
                             "after a successful store batch"
                         )
+                if self.enable_kv_event:
+                    successful_events = [
+                        event
+                        for event_idx, event in enumerate(stored_events)
+                        if event_idx < len(res) and res[event_idx] >= 0
+                    ]
+                    if successful_events:
+                        self.update_kv_event(successful_events)
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -916,10 +979,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     status="error",
                     num_failed_keys=len(keys),
                 )
-                logger.error("Failed to put key %s, error: %s", keys, e)
+                logger.error(
+                    "Failed to put Mooncake batch "
+                    "(num_keys=%d, batch_bytes=%d, first_key=%s): %s",
+                    len(keys),
+                    batch_bytes,
+                    keys[0],
+                    e,
+                )
 
-            if self.enable_kv_event and stored_events:
-                self.update_kv_event(stored_events)
         finally:
             self.dec_stored_request(req_id)
             self.request_queue.task_done()

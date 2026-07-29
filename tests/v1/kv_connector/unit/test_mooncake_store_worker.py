@@ -866,11 +866,30 @@ def test_store_sending_thread_releases_pin_on_batch_put_failure():
     store.batch_is_exist.return_value = [0, 0]
     store.batch_put_from_multi_buffers.side_effect = RuntimeError("rdma error")
     thread = _make_store_sending_thread(store)
+    thread.enable_kv_event = True
 
     thread.add_stored_request("req-a")
     thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
 
     assert thread.stored_requests["req-a"] == 0
+    assert thread.get_kv_events() == []
+
+
+def test_store_sending_thread_publishes_events_only_for_successful_puts():
+    from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, -5]
+    thread = _make_store_sending_thread(store)
+    thread.enable_kv_event = True
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    events = thread.get_kv_events()
+    assert len(events) == 1
+    assert events[0].block_hashes == [maybe_convert_block_hash(BlockHash(b"a0"))]
 
 
 def test_store_recving_thread_reports_failed_block_ids():
@@ -1547,6 +1566,7 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
 
 
 def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
+    from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -1574,76 +1594,7 @@ def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
         scheduler_block_size=32,
         hash_block_size=8,
     )
-
-    db_full = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
-        block_size=32,
-        hash_block_size=8,
-    )
-    db_full.set_kv_caches_base_addr([0x1000])
-    db_full.set_block_len([512])
-    db_swa = ChunkedTokenDatabase(
-        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
-        block_size=8,
-        hash_block_size=8,
-    )
-    db_swa.set_kv_caches_base_addr([0x2000])
-    db_swa.set_block_len([128])
-
-    thread = _make_store_sending_thread(
-        store,
-        coord=coord,
-        token_databases=[db_full, db_swa],
-        block_size=32,
-    )
-
-    hs = [bytes([i + 1]) * 4 for i in range(8)]
-    thread.add_stored_request("r0")
-    thread._saved_offset["r0"] = 32
-    thread._handle_request(
-        ReqMeta(
-            req_id="r0",
-            token_len_chunk=64,
-            block_ids=([0, 1], list(range(8))),
-            block_hashes=hs,
-            can_save=True,
-        )
-    )
-
-    keys = store.batch_put_from_multi_buffers.call_args.args[0]
-    full_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:0" in k]
-    swa_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:1" in k]
-    assert full_hashes == [hs[7].hex()]
-    assert swa_hashes == [hs[7].hex()]
-
-
-def test_store_sending_thread_kv_events_use_group_chunk_metadata():
-    from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        KVCacheGroupSpec,
-        SlidingWindowSpec,
-    )
-
-    store = MagicMock()
-    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.return_value = [256, 256]
-
-    full_spec = FullAttentionSpec(
-        block_size=32, num_kv_heads=8, head_size=64, dtype=None
-    )
-    swa_spec = SlidingWindowSpec(
-        block_size=8,
-        num_kv_heads=8,
-        head_size=64,
-        dtype=None,
-        sliding_window=8,
-    )
-    coord = mooncake_store_worker.MooncakeStoreCoordinator(
-        [KVCacheGroupSpec(["L0"], full_spec), KVCacheGroupSpec(["L1"], swa_spec)],
-        scheduler_block_size=32,
-        hash_block_size=8,
-    )
+    assert not coord.enable_partial_hash_hits
 
     db_full = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
@@ -1668,31 +1619,127 @@ def test_store_sending_thread_kv_events_use_group_chunk_metadata():
     )
     thread.enable_kv_event = True
 
-    hs = [bytes([i + 1]) * 4 for i in range(4)]
+    hs = [bytes([i + 1]) * 4 for i in range(8)]
     thread.add_stored_request("r0")
+    thread._saved_offset["r0"] = 32
     thread._handle_request(
         ReqMeta(
             req_id="r0",
-            token_len_chunk=32,
-            block_ids=([0], list(range(4))),
+            token_len_chunk=64,
+            block_ids=([0, 1], list(range(8))),
             block_hashes=hs,
             can_save=True,
-            token_ids=list(range(32)),
+            token_ids=list(range(64)),
         )
     )
+
+    keys = store.batch_put_from_multi_buffers.call_args.args[0]
+    full_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:0" in k]
+    swa_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:1" in k]
+    assert full_hashes == [hs[7].hex()]
+    assert swa_hashes == [hs[7].hex()]
 
     full_event, swa_event = thread.get_kv_events()
     assert full_event.group_idx == 0
     assert full_event.block_size == 32
-    assert full_event.token_ids == list(range(32))
-    # block_size=32 over hash_block_size=8 (scale 4): the chunk is keyed by its
-    # last sub-hash, not the concatenation of all four.
-    assert full_event.block_hashes == [maybe_convert_block_hash(BlockHash(hs[3]))]
+    assert full_event.token_ids == list(range(32, 64))
+    assert full_event.block_hashes == [
+        maybe_convert_block_hash(BlockHash(hs[7]))
+    ]
+    assert full_event.parent_block_hash == maybe_convert_block_hash(BlockHash(hs[3]))
 
     assert swa_event.group_idx == 1
     assert swa_event.block_size == 8
-    assert swa_event.token_ids == list(range(24, 32))
-    assert swa_event.block_hashes == [maybe_convert_block_hash(BlockHash(hs[3]))]
+    assert swa_event.token_ids == list(range(56, 64))
+    assert swa_event.block_hashes == [
+        maybe_convert_block_hash(BlockHash(hs[7]))
+    ]
+    assert swa_event.parent_block_hash == maybe_convert_block_hash(BlockHash(hs[6]))
+
+
+def test_store_sending_thread_kv_events_use_group_chunk_metadata():
+    from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+
+    full_spec = FullAttentionSpec(
+        block_size=32, num_kv_heads=8, head_size=64, dtype=None
+    )
+    mamba_spec = MambaSpec(
+        block_size=32,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [
+            KVCacheGroupSpec(["L0"], full_spec),
+            KVCacheGroupSpec(["L1"], mamba_spec),
+        ],
+        scheduler_block_size=32,
+        hash_block_size=8,
+    )
+
+    db_full = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+        block_size=32,
+        hash_block_size=8,
+    )
+    db_full.set_kv_caches_base_addr([0x1000])
+    db_full.set_block_len([512])
+    db_mamba = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+        block_size=32,
+        hash_block_size=8,
+    )
+    db_mamba.set_kv_caches_base_addr([0x2000])
+    db_mamba.set_block_len([128])
+
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=[db_full, db_mamba],
+        block_size=32,
+    )
+    thread.enable_kv_event = True
+
+    hs = [bytes([i + 1]) * 4 for i in range(8)]
+    thread.add_stored_request("r0")
+    thread._saved_offset["r0"] = 32
+    thread._handle_request(
+        ReqMeta(
+            req_id="r0",
+            token_len_chunk=64,
+            block_ids=([0, 1], [0, 1]),
+            block_hashes=hs,
+            can_save=True,
+            token_ids=list(range(64)),
+        )
+    )
+
+    full_event, mamba_event = thread.get_kv_events()
+    assert full_event.group_idx == 0
+    assert full_event.block_size == 8
+    assert full_event.token_ids == list(range(32, 64))
+    assert full_event.block_hashes == [
+        maybe_convert_block_hash(BlockHash(h)) for h in hs[4:8]
+    ]
+    assert full_event.parent_block_hash == maybe_convert_block_hash(BlockHash(hs[3]))
+
+    assert mamba_event.group_idx == 1
+    assert mamba_event.block_size == 64
+    assert mamba_event.token_ids == list(range(64))
+    assert mamba_event.block_hashes == [
+        maybe_convert_block_hash(BlockHash(hs[7]))
+    ]
+    assert mamba_event.parent_block_hash is None
 
 
 def _auto_set_ready_event(*args, **kwargs):
