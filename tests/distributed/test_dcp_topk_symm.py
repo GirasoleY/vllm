@@ -3,7 +3,6 @@
 """Exactness and CUDA-graph tests for owner-local symmetric-memory DCP top-k."""
 
 import os
-import socket
 
 import pytest
 import torch
@@ -13,12 +12,7 @@ import torch.multiprocessing as mp
 import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
-
-
-def _get_free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("localhost", 0))
-        return int(sock.getsockname()[1])
+from vllm.utils.network_utils import get_open_port
 
 
 def _make_inputs(
@@ -294,6 +288,6 @@ def test_dcp_topk_symm_matches_allgather_and_replays_graph() -> None:
         pytest.skip(f"Test requires {world_size} GPUs")
     mp.spawn(
         _worker,
-        args=(world_size, _get_free_port()),
+        args=(world_size, get_open_port()),
         nprocs=world_size,
     )

@@ -42,7 +42,6 @@ logger = init_logger(__name__)
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 DCP_TOPK_SYMM_MIN_DECODE_ROWS = 16
 DCP_TOPK_SYMM_MAX_DECODE_ROWS = 128
-_logged_dcp_topk_symm_rows: set[int] = set()
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -102,10 +101,6 @@ def _merge_dcp_topk_global(
     # (score, global_id) candidates on-device, all-gather, then the CuteDSL
     # stable-topk selector.
     _assert_cutedsl_dcp_merge_supported(logits, topk_indices, topk_tokens)
-    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
-        pack_dcp_topk_candidates_cutedsl,
-        stable_topk_from_gathered_candidates_cutedsl,
-    )
 
     rows = topk_indices.shape[0]
     use_symm = (
@@ -121,21 +116,9 @@ def _merge_dcp_topk_global(
         workspace = get_dcp_topk_symm_workspace(
             DCP_TOPK_SYMM_MAX_DECODE_ROWS,
             topk_indices.shape[1],
-            dcp_world_size,
+            get_dcp_group(),
         )
-        if workspace is None:
-            raise RuntimeError(
-                "DCP top-k symmetric-memory dispatch selected without a workspace."
-            )
-        # Keep one reachability marker for integration validation without
-        # synchronously logging each first-seen dynamic batch size.
-        if rows == 32 and rows not in _logged_dcp_topk_symm_rows:
-            _logged_dcp_topk_symm_rows.add(rows)
-            logger.info(
-                "Executing owner-sharded symmetric-memory DCP top-k merge "
-                "for decode rows=%d.",
-                rows,
-            )
+        logger.info_once("Executing owner-sharded symmetric-memory DCP top-k merge.")
         workspace.merge(
             logits,
             topk_indices,
@@ -146,6 +129,11 @@ def _merge_dcp_topk_global(
             row_starts,
         )
         return
+
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        pack_dcp_topk_candidates_cutedsl,
+        stable_topk_from_gathered_candidates_cutedsl,
+    )
 
     # Flag-off, prefill, and decode shapes outside the bounded direct-consumer
     # policy use the original explicit exchange. This is phase/shape routing,
@@ -830,15 +818,12 @@ class SparseAttnIndexer(CustomOp):
                 get_dcp_topk_symm_workspace,
             )
 
-            workspace = get_dcp_topk_symm_workspace(
+            # Initialize the process-owned workspace before model execution.
+            get_dcp_topk_symm_workspace(
                 DCP_TOPK_SYMM_MAX_DECODE_ROWS,
                 self.topk_tokens,
-                self.dcp_world_size,
+                get_dcp_group(),
             )
-            if workspace is None:
-                raise RuntimeError(
-                    "DCP top-k symmetric memory was enabled without a usable workspace."
-                )
 
     def forward_native(
         self,

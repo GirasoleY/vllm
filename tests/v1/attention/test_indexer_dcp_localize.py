@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 
@@ -13,6 +16,17 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import CPTritonContext, correct_attn_out
+
+
+def _install_fake_module(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    **attributes: object,
+) -> None:
+    module = ModuleType(name)
+    for attribute, value in attributes.items():
+        setattr(module, attribute, value)
+    monkeypatch.setitem(sys.modules, name, module)
 
 
 def _local_count(length: int, rank: int, world: int, interleave: int) -> int:
@@ -272,11 +286,6 @@ def test_dcp_topk_symm_serving_dispatch(
     is_prefill: bool,
     expected: str,
 ):
-    from vllm.model_executor.kernels.attention.dsa import (
-        dcp_indexer_cutedsl,
-        dcp_topk_symm,
-    )
-
     calls = []
 
     class FakeSymmWorkspace:
@@ -289,10 +298,10 @@ def test_dcp_topk_symm_serving_dispatch(
             calls.append("all_gather")
             return input_
 
-    def get_symm_workspace(max_rows: int, candidates: int, world: int):
+    def get_symm_workspace(max_rows: int, candidates: int, group: FakeDcpGroup):
         assert max_rows == sparse_indexer.DCP_TOPK_SYMM_MAX_DECODE_ROWS
         assert candidates == 4
-        assert world == 4
+        assert isinstance(group, FakeDcpGroup)
         calls.append("symm_init")
         return FakeSymmWorkspace()
 
@@ -302,6 +311,17 @@ def test_dcp_topk_symm_serving_dispatch(
     def stable_topk(*args, **kwargs):
         calls.append("stable_topk")
 
+    _install_fake_module(
+        monkeypatch,
+        "vllm.model_executor.kernels.attention.dsa.dcp_topk_symm",
+        get_dcp_topk_symm_workspace=get_symm_workspace,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl",
+        pack_dcp_topk_candidates_cutedsl=pack,
+        stable_topk_from_gathered_candidates_cutedsl=stable_topk,
+    )
     monkeypatch.setattr(
         sparse_indexer,
         "_assert_cutedsl_dcp_merge_supported",
@@ -309,21 +329,6 @@ def test_dcp_topk_symm_serving_dispatch(
     )
     monkeypatch.setattr(sparse_indexer.envs, "VLLM_DCP_TOPK_SYMM", enabled)
     monkeypatch.setattr(sparse_indexer, "get_dcp_group", lambda: FakeDcpGroup())
-    monkeypatch.setattr(
-        dcp_topk_symm,
-        "get_dcp_topk_symm_workspace",
-        get_symm_workspace,
-    )
-    monkeypatch.setattr(
-        dcp_indexer_cutedsl,
-        "pack_dcp_topk_candidates_cutedsl",
-        pack,
-    )
-    monkeypatch.setattr(
-        dcp_indexer_cutedsl,
-        "stable_topk_from_gathered_candidates_cutedsl",
-        stable_topk,
-    )
 
     logits = torch.zeros((rows, 8), dtype=torch.float32)
     topk_indices = torch.zeros((rows, 4), dtype=torch.int32)
@@ -349,32 +354,31 @@ def test_dcp_topk_symm_failure_is_fatal(
     monkeypatch: pytest.MonkeyPatch,
     failure_stage: str,
 ):
-    from vllm.model_executor.kernels.attention.dsa import dcp_topk_symm
-
     class FailingWorkspace:
         def merge(self, *args):
             raise RuntimeError("merge failed")
+
+    class FakeDcpGroup:
+        def all_gather(self, *args, **kwargs):
+            raise AssertionError("selected symmetric-memory failure must not recover")
 
     def get_symm_workspace(*args):
         if failure_stage == "initialization":
             raise RuntimeError("initialization failed")
         return FailingWorkspace()
 
-    def unexpected_recovery(*args, **kwargs):
-        raise AssertionError("selected symmetric-memory failure must not recover")
-
+    _install_fake_module(
+        monkeypatch,
+        "vllm.model_executor.kernels.attention.dsa.dcp_topk_symm",
+        get_dcp_topk_symm_workspace=get_symm_workspace,
+    )
     monkeypatch.setattr(
         sparse_indexer,
         "_assert_cutedsl_dcp_merge_supported",
         lambda *args: None,
     )
     monkeypatch.setattr(sparse_indexer.envs, "VLLM_DCP_TOPK_SYMM", True)
-    monkeypatch.setattr(sparse_indexer, "get_dcp_group", unexpected_recovery)
-    monkeypatch.setattr(
-        dcp_topk_symm,
-        "get_dcp_topk_symm_workspace",
-        get_symm_workspace,
-    )
+    monkeypatch.setattr(sparse_indexer, "get_dcp_group", FakeDcpGroup)
 
     logits = torch.zeros((32, 8), dtype=torch.float32)
     topk_indices = torch.zeros((32, 4), dtype=torch.int32)

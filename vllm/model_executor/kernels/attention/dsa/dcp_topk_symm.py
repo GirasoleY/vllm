@@ -21,8 +21,9 @@ This experimental path is fail-closed. It never falls back to an all-gather or
 to the symmetric-memory full-inbox implementation.
 """
 
+import functools
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -30,10 +31,13 @@ from torch.distributed import ProcessGroup
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
 logger = init_logger(__name__)
 
-_WRITE_SEQ = tl.constexpr(0)
-_READ_SEQ = tl.constexpr(1)
+_WRITE_SEQ = 0
+_READ_SEQ = 1
 _MAX_FENCE_SPINS = 100_000_000
 
 
@@ -369,66 +373,26 @@ def create_dcp_topk_symm_workspace_for_group(
     )
 
 
-def create_dcp_topk_symm_workspace(
+@functools.cache
+def get_dcp_topk_symm_workspace(
     max_rows: int,
     local_candidates: int,
+    dcp_group: "GroupCoordinator",
 ) -> DcpTopkSymmWorkspace:
-    """Collectively create an owner-local workspace for the DCP group."""
-    from vllm.distributed import get_dcp_group
-
-    dcp_group = get_dcp_group()
-    return create_dcp_topk_symm_workspace_for_group(
+    """Return the process-owned workspace for a DCP group and geometry."""
+    workspace = create_dcp_topk_symm_workspace_for_group(
         max_rows,
         local_candidates,
         dcp_group.device_group,
         dcp_group.device,
     )
-
-
-_workspace: DcpTopkSymmWorkspace | None = None
-_workspace_failed = False
-
-
-def get_dcp_topk_symm_workspace(
-    max_rows: int,
-    local_candidates: int,
-    dcp_world_size: int,
-) -> DcpTopkSymmWorkspace | None:
-    """Create or fetch the singleton symmetric workspace, with no fallback."""
-    global _workspace, _workspace_failed
-    if dcp_world_size <= 1:
-        return None
-    if _workspace_failed:
-        raise RuntimeError("DCP symmetric-memory top-k workspace is unavailable.")
-    if _workspace is not None:
-        if (
-            _workspace.max_rows < max_rows
-            or _workspace.local_candidates_count != local_candidates
-            or _workspace.world_size != dcp_world_size
-        ):
-            raise RuntimeError(
-                "DCP symmetric-memory workspace shape mismatch: "
-                f"workspace=({_workspace.max_rows}, "
-                f"{_workspace.local_candidates_count}, {_workspace.world_size}), "
-                f"request=({max_rows}, {local_candidates}, {dcp_world_size})."
-            )
-        return _workspace
-
-    try:
-        _workspace = create_dcp_topk_symm_workspace(max_rows, local_candidates)
-    except Exception as exc:
-        _workspace_failed = True
-        raise RuntimeError(
-            "DCP symmetric-memory top-k workspace initialization failed; "
-            "refusing to fall back to another exchange path."
-        ) from exc
     logger.info_once(
         "Using owner-local symmetric-memory DCP top-k workspace "
         "(max_rows=%d, candidates_per_rank=%d, logical_bytes_per_rank=%d, "
         "allocation_bytes_per_rank=%d).",
-        _workspace.max_rows,
-        _workspace.local_candidates_count,
-        _workspace.logical_bytes_per_rank,
-        _workspace.allocation_bytes_per_rank,
+        workspace.max_rows,
+        workspace.local_candidates_count,
+        workspace.logical_bytes_per_rank,
+        workspace.allocation_bytes_per_rank,
     )
-    return _workspace
+    return workspace
