@@ -291,6 +291,17 @@ class MooncakeStoreScheduler:
                         new_token_ids = unfinished_req.all_token_ids[
                             num_current_tokens : num_current_tokens + num_new_tokens
                         ]
+                        if request_tracker.token_ids is None:
+                            request_tracker.token_ids = list(
+                                unfinished_req.all_token_ids[:num_current_tokens]
+                            )
+                        elif len(request_tracker.token_ids) < num_current_tokens:
+                            request_tracker.token_ids.extend(
+                                unfinished_req.all_token_ids[
+                                    len(request_tracker.token_ids) : num_current_tokens
+                                ]
+                            )
+                        request_tracker.token_ids.extend(new_token_ids)
                         request_tracker.token_len += len(new_token_ids)
                     else:
                         raise ValueError(

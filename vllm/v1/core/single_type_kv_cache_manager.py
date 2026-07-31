@@ -472,6 +472,7 @@ class SingleTypeKVCacheManager(ABC):
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
+            kv_cache_spec=self.kv_cache_spec,
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
@@ -816,6 +817,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            kv_cache_spec=self.kv_cache_spec,
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1732,6 +1734,7 @@ class MambaManager(SingleTypeKVCacheManager):
             num_tokens=num_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            kv_cache_spec=self.kv_cache_spec,
         )
         if partial_hash is not None:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)

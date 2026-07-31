@@ -281,6 +281,8 @@ class KVCacheManager:
                         num_blocks,
                         block_size,
                         group_idx,
+                        kv_cache_spec=group.kv_cache_spec,
+                        cached_blocks=group_blocks,
                     )
 
         # The junction to pin is where the lagging sparse-retention group stops
@@ -693,8 +695,8 @@ class KVCacheManager:
                     "Group index `%s` not in KV cache metadata", event.group_idx
                 )
                 continue
-            # Annotate here so BlockPool can keep emitting structural cache
-            # events without owning semantic KV cache spec metadata.
+            # Keep group metadata canonical here for both legacy structural
+            # events and cache-spec-aware events emitted by BlockPool.
             kind, sliding_window = self.kv_cache_event_metadata[event.group_idx]
             event.kv_cache_spec_kind = kind
             event.kv_cache_spec_sliding_window = sliding_window

@@ -62,9 +62,9 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.kv_cache_event_utils import build_kv_cache_stored_event
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
-    maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -700,63 +700,22 @@ class KVCacheStoreSendingThread(KVTransferThread):
     ) -> BlockStored:
         """Describe one stored object using its cache spec's semantics."""
         spec = self.coord.kv_cache_groups[group_idx].kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = next(iter(spec.kv_cache_specs.values()))
-
         db = self.token_databases[group_idx]
-        hash_block_size = db.hash_block_size
-        first_hash_idx = start // hash_block_size
-        last_hash_idx = end // hash_block_size
-
-        if isinstance(spec, MambaSpec):
-            # A Mamba snapshot is not downward closed: only the state at this
-            # boundary is reusable, and it summarizes the whole prefix.
-            block_hashes = [maybe_convert_block_hash(key_hash)]
-            parent_block_hash = None
-            token_start = 0
-            block_size = end
-        elif self.coord.enable_partial_hash_hits:
-            # Fine-grained groups expose every hash-sized segment as one
-            # hash chain.
-            block_hashes = [
-                maybe_convert_block_hash(block_hash)
-                for block_hash in req_meta.block_hashes[
-                    first_hash_idx:last_hash_idx
-                ]
-            ]
-            parent_block_hash = (
-                maybe_convert_block_hash(req_meta.block_hashes[first_hash_idx - 1])
-                if first_hash_idx > 0
-                else None
+        if req_meta.token_ids is None:
+            raise ValueError(
+                f"Request {req_meta.req_id} has no token IDs for KV event reporting"
             )
-            token_start = start
-            block_size = hash_block_size
-        else:
-            # Cache specs without fine-grained hash reuse describe the
-            # physical object as one block, keyed by its final hash.
-            block_hashes = [maybe_convert_block_hash(key_hash)]
-            parent_block_hash = (
-                maybe_convert_block_hash(req_meta.block_hashes[first_hash_idx - 1])
-                if first_hash_idx > 0
-                else None
-            )
-            token_start = start
-            block_size = end - start
-
-        token_ids = (
-            req_meta.token_ids[token_start:end]
-            if req_meta.token_ids is not None
-            else None
-        )
-        return BlockStored(
-            block_hashes=block_hashes,
-            parent_block_hash=parent_block_hash,
-            token_ids=token_ids,
-            block_size=block_size,
-            lora_id=None,
-            medium="cpu",
-            lora_name=None,
+        return build_kv_cache_stored_event(
+            kv_cache_spec=spec,
+            token_ids=req_meta.token_ids,
+            request_block_hashes=req_meta.block_hashes,
+            key_hash=key_hash,
+            start=start,
+            end=end,
+            hash_block_size=db.hash_block_size,
             group_idx=group_idx,
+            medium="cpu",
+            enable_partial_hash_hits=self.coord.enable_partial_hash_hits,
         )
 
     def _handle_request(self, req_meta: ReqMeta):
@@ -878,7 +837,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             addrs: list[list[int]] = []
             sizes: list[list[int]] = []
-            stored_events: list[BlockStored] = []
             chunks_per_group: list[list[tuple[int, int]]] = [
                 [] for _ in self.token_databases
             ]
@@ -893,20 +851,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 addrs.extend(group_addrs)
                 sizes.extend(group_sizes)
-
-            for idx, (s, e, g_idx) in enumerate(
-                zip(starts, ends, group_indices, strict=True)
-            ):
-                if self.enable_kv_event:
-                    stored_events.append(
-                        self._build_stored_event(
-                            req_meta,
-                            s,
-                            e,
-                            g_idx,
-                            kv_event_block_hashes[idx],
-                        )
-                    )
 
             if current_event is not None:
                 current_event.synchronize()
@@ -962,14 +906,44 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             "Mooncake CPU/disk offloading pressure cleared "
                             "after a successful store batch"
                         )
+
                 if self.enable_kv_event:
-                    successful_events = [
-                        event
-                        for event_idx, event in enumerate(stored_events)
-                        if event_idx < len(res) and res[event_idx] >= 0
-                    ]
+                    successful_events: list[BlockStored] = []
+                    for event_idx, (start, end, group_idx) in enumerate(
+                        zip(starts, ends, group_indices, strict=True)
+                    ):
+                        if event_idx >= len(res) or res[event_idx] < 0:
+                            continue
+                        try:
+                            successful_events.append(
+                                self._build_stored_event(
+                                    req_meta,
+                                    start,
+                                    end,
+                                    group_idx,
+                                    kv_event_block_hashes[event_idx],
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to build Mooncake BlockStored event "
+                                "for request %s, group %d, range [%d, %d)",
+                                req_id,
+                                group_idx,
+                                start,
+                                end,
+                            )
                     if successful_events:
-                        self.update_kv_event(successful_events)
+                        try:
+                            self.update_kv_event(successful_events)
+                        except Exception:
+                            # Event reporting is observational and must not turn a
+                            # successful external store into a data-path failure.
+                            logger.exception(
+                                "Failed to publish Mooncake BlockStored events "
+                                "for request %s",
+                                req_id,
+                            )
             except Exception as e:
                 self._record_operation(
                     "save_put",

@@ -159,6 +159,7 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
         block_ids=([0, 1],),
         block_hashes=block_hashes,
         can_save=True,
+        token_ids=list(range(32)),
     )
 
 
@@ -890,6 +891,46 @@ def test_store_sending_thread_publishes_events_only_for_successful_puts():
     events = thread.get_kv_events()
     assert len(events) == 1
     assert events[0].block_hashes == [maybe_convert_block_hash(BlockHash(b"a0"))]
+
+
+def test_store_sending_thread_event_failure_does_not_fail_successful_put():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_store_sending_thread(store)
+    thread.enable_kv_event = True
+    thread._build_stored_event = MagicMock(side_effect=ValueError("bad metadata"))
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    store.batch_put_from_multi_buffers.assert_called_once()
+    assert thread._build_stored_event.call_count == 2
+    assert thread.stored_requests["req-a"] == 0
+    assert thread.get_kv_events() == []
+
+
+def test_store_sending_thread_publish_failure_is_reporting_only():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_store_sending_thread(store)
+    thread.enable_kv_event = True
+    thread.update_kv_event = MagicMock(side_effect=RuntimeError("publisher down"))
+    record_operation = MagicMock()
+    thread._record_operation_cb = record_operation
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    put_records = [
+        call.kwargs
+        for call in record_operation.call_args_list
+        if call.kwargs["operation"] == "save_put"
+    ]
+    assert len(put_records) == 1
+    assert put_records[0]["status"] == "ok"
+    assert thread.stored_requests["req-a"] == 0
 
 
 def test_store_recving_thread_reports_failed_block_ids():
@@ -1643,17 +1684,13 @@ def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
     assert full_event.group_idx == 0
     assert full_event.block_size == 32
     assert full_event.token_ids == list(range(32, 64))
-    assert full_event.block_hashes == [
-        maybe_convert_block_hash(BlockHash(hs[7]))
-    ]
+    assert full_event.block_hashes == [maybe_convert_block_hash(BlockHash(hs[7]))]
     assert full_event.parent_block_hash == maybe_convert_block_hash(BlockHash(hs[3]))
 
     assert swa_event.group_idx == 1
     assert swa_event.block_size == 8
     assert swa_event.token_ids == list(range(56, 64))
-    assert swa_event.block_hashes == [
-        maybe_convert_block_hash(BlockHash(hs[7]))
-    ]
+    assert swa_event.block_hashes == [maybe_convert_block_hash(BlockHash(hs[7]))]
     assert swa_event.parent_block_hash == maybe_convert_block_hash(BlockHash(hs[6]))
 
 
@@ -1736,10 +1773,9 @@ def test_store_sending_thread_kv_events_use_group_chunk_metadata():
     assert mamba_event.group_idx == 1
     assert mamba_event.block_size == 64
     assert mamba_event.token_ids == list(range(64))
-    assert mamba_event.block_hashes == [
-        maybe_convert_block_hash(BlockHash(hs[7]))
-    ]
+    assert mamba_event.block_hashes == [maybe_convert_block_hash(BlockHash(hs[7]))]
     assert mamba_event.parent_block_hash is None
+    assert mamba_event.kv_cache_spec_kind == "mamba"
 
 
 def _auto_set_ready_event(*args, **kwargs):

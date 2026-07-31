@@ -2114,6 +2114,96 @@ def test_kv_cache_events(blocks_to_cache: int):
     assert len(manager.block_pool.cached_block_hash_to_block) == 0
 
 
+def test_mamba_kv_cache_events_are_indivisible_prefix_snapshots():
+    hash_block_size = 8
+    mamba_block_size = 32
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    request = make_request(
+        "mamba-events",
+        prompt_token_ids=list(range(64)),
+        block_size=hash_block_size,
+        hash_fn=sha256,
+    )
+    blocks = pool.get_new_blocks(2)
+    spec = MambaSpec(
+        block_size=mamba_block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    pool.cache_full_blocks(
+        request=request,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=mamba_block_size,
+        kv_cache_group_id=0,
+        kv_cache_spec=spec,
+    )
+
+    events = pool.take_events()
+    assert len(events) == 2
+    first, second = events
+    assert isinstance(first, BlockStored)
+    assert first.parent_block_hash is None
+    assert first.token_ids == list(range(32))
+    assert first.block_size == 32
+    assert len(first.block_hashes) == 1
+    assert first.kv_cache_spec_kind == KVCacheSpecKind.MAMBA.value
+    assert isinstance(second, BlockStored)
+    assert second.parent_block_hash is None
+    assert second.token_ids == list(range(64))
+    assert second.block_size == 64
+    assert len(second.block_hashes) == 1
+    assert second.kv_cache_spec_kind == KVCacheSpecKind.MAMBA.value
+
+
+def test_mamba_full_report_reemits_indivisible_prefix_snapshots():
+    hash_block_size = 8
+    mamba_block_size = 32
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    request = make_request(
+        "mamba-full-report",
+        prompt_token_ids=list(range(64)),
+        block_size=hash_block_size,
+        hash_fn=sha256,
+    )
+    spec = MambaSpec(
+        block_size=mamba_block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    pool.emit_cached_block_events(
+        request=request,
+        num_cached_blocks=2,
+        block_size=mamba_block_size,
+        kv_cache_group_id=0,
+        kv_cache_spec=spec,
+    )
+
+    events = pool.take_events()
+    assert [event.token_ids for event in events] == [
+        list(range(32)),
+        list(range(64)),
+    ]
+    assert [event.block_size for event in events] == [32, 64]
+    assert all(len(event.block_hashes) == 1 for event in events)
+    assert all(event.parent_block_hash is None for event in events)
+
+
 def test_null_parent_block_hash():
     block_size = 1
     num_cached_blocks = 2

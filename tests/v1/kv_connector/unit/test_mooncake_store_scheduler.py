@@ -127,9 +127,32 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     assert req_meta.req_id == "req-0"
     assert req_meta.can_save is True
     assert req_meta.token_len_chunk == 48
+    assert req_meta.token_ids == list(range(48))
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.token_len == 48
     assert tracker.num_saved_tokens == 48
+    assert tracker.token_ids == list(range(48))
+
+
+def test_cached_request_reconstructs_full_token_prefix_after_external_load():
+    scheduler = _make_bare_scheduler()
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(48)),
+        block_hashes=[b"h0", b"h1", b"h2"],
+        prefill_end_tokens=48,
+    )
+    # Trackers created for requests loaded from Mooncake have a token length
+    # but no local token-prefix snapshot.
+    scheduler._request_trackers["req-0"].token_ids = None
+
+    meta = scheduler.build_connector_meta(
+        _make_scheduler_output(scheduled_spec_tokens=None)
+    )
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].token_ids == list(range(48))
+    assert scheduler._request_trackers["req-0"].token_ids == list(range(48))
 
 
 def test_preemption_resets_tracker_before_request_finished():

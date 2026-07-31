@@ -11,6 +11,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_event_utils import build_kv_cache_stored_event
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -24,6 +25,11 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
     resolve_block_hashes,
+)
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
 )
 from vllm.v1.request import Request
 
@@ -231,6 +237,7 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         block_mask: list[bool] | None = None,
+        kv_cache_spec: KVCacheSpec | None = None,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
@@ -255,6 +262,9 @@ class BlockPool:
                 consults a subset of blocks (e.g. SWA tail-window), so blocks
                 that can never serve a hit stay out of the prefix-cache hash
                 map.
+            kv_cache_spec: Optional cache spec used to construct semantic
+                residency events. Callers that omit it retain the generic
+                block-chain event shape.
         """
         if num_cached_blocks >= num_full_blocks:
             return
@@ -268,6 +278,11 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        is_mamba = (
+            kv_cache_spec is not None
+            and get_kv_cache_spec_kind(kv_cache_spec) == KVCacheSpecKind.MAMBA
+        )
+        mamba_event_inputs: list[tuple[int, BlockHash]] = []
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -295,10 +310,32 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
-            if new_hashes is not None:
+            if is_mamba:
+                mamba_event_inputs.append((num_cached_blocks + i, block_hash))
+            elif new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
-        if self.enable_kv_cache_events:
+        if self.enable_kv_cache_events and is_mamba:
+            assert kv_cache_spec is not None
+            for block_idx, block_hash in mamba_event_inputs:
+                block_start = block_idx * block_size
+                block_end = block_start + block_size
+                extra_keys, _ = generate_block_hash_extra_keys(
+                    request,
+                    block_start,
+                    block_end,
+                    -1 if block_start > 0 else 0,
+                )
+                self._append_spec_aware_stored_event(
+                    request=request,
+                    kv_cache_spec=kv_cache_spec,
+                    key_hash=block_hash,
+                    start=block_start,
+                    end=block_end,
+                    kv_cache_group_id=kv_cache_group_id,
+                    extra_keys=extra_keys,
+                )
+        elif self.enable_kv_cache_events:
             if num_cached_blocks == 0:
                 parent_block_hash: ExternalBlockHash | None = None
             else:
@@ -370,12 +407,44 @@ class BlockPool:
             group_idx=kv_cache_group_id,
         )
 
+    def _append_spec_aware_stored_event(
+        self,
+        *,
+        request: Request,
+        kv_cache_spec: KVCacheSpec,
+        key_hash: BlockHash,
+        start: int,
+        end: int,
+        kv_cache_group_id: int,
+        extra_keys: tuple[Any, ...] | None,
+    ) -> None:
+        self.kv_event_queue.append(
+            build_kv_cache_stored_event(
+                kv_cache_spec=kv_cache_spec,
+                token_ids=request.all_token_ids,
+                request_block_hashes=request.block_hashes,
+                key_hash=key_hash,
+                start=start,
+                end=end,
+                hash_block_size=self.hash_block_size,
+                group_idx=kv_cache_group_id,
+                medium=MEDIUM_GPU,
+                lora_id=(
+                    request.lora_request.adapter_id if request.lora_request else None
+                ),
+                lora_name=(request.lora_request.name if request.lora_request else None),
+                extra_keys=[extra_keys],
+            )
+        )
+
     def emit_cached_block_events(
         self,
         request: Request,
         num_cached_blocks: int,
         block_size: int,
         kv_cache_group_id: int,
+        kv_cache_spec: KVCacheSpec | None = None,
+        cached_blocks: Sequence[KVCacheBlock] | None = None,
     ) -> None:
         """Generate BlockStored events for blocks reused from prefix cache.
 
@@ -388,6 +457,9 @@ class BlockPool:
             num_cached_blocks: Number of blocks that were cache hits.
             block_size: Number of tokens per block.
             kv_cache_group_id: The KV cache group ID.
+            kv_cache_spec: Optional cache spec used for semantic event shape.
+            cached_blocks: Optional block list. For sparse cache types, null
+                entries identify boundaries that are not actually resident.
         """
         if not self.enable_kv_cache_events or num_cached_blocks == 0:
             return
@@ -395,6 +467,34 @@ class BlockPool:
         block_hashes = resolve_block_hashes(
             request.block_hashes, self.hash_block_size, block_size
         )
+        if (
+            kv_cache_spec is not None
+            and get_kv_cache_spec_kind(kv_cache_spec) == KVCacheSpecKind.MAMBA
+        ):
+            max_blocks = min(num_cached_blocks, len(block_hashes))
+            for block_idx in range(max_blocks):
+                if cached_blocks is not None and (
+                    block_idx >= len(cached_blocks) or cached_blocks[block_idx].is_null
+                ):
+                    continue
+                block_start = block_idx * block_size
+                block_end = block_start + block_size
+                extra_keys, _ = generate_block_hash_extra_keys(
+                    request,
+                    block_start,
+                    block_end,
+                    -1 if block_start > 0 else 0,
+                )
+                self._append_spec_aware_stored_event(
+                    request=request,
+                    kv_cache_spec=kv_cache_spec,
+                    key_hash=block_hashes[block_idx],
+                    start=block_start,
+                    end=block_end,
+                    kv_cache_group_id=kv_cache_group_id,
+                    extra_keys=extra_keys,
+                )
+            return
 
         # Collect external hashes and extra_keys for cached blocks.
         cached_hashes: list[ExternalBlockHash] = []
@@ -449,6 +549,7 @@ class BlockPool:
         num_tokens: int,
         kv_cache_group_id: int,
         block_size: int,
+        kv_cache_spec: KVCacheSpec | None = None,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -476,6 +577,8 @@ class BlockPool:
                 entry hash itself is always the prefix-chain hash at
                 ``num_tokens``; ``block_size`` is used to assert that the
                 entry is partial within the owning cache block.
+            kv_cache_spec: Optional cache spec used to construct semantic
+                residency events.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -524,23 +627,39 @@ class BlockPool:
             extra_keys, _ = generate_block_hash_extra_keys(
                 request, block_start, block_end, curr_mm_idx
             )
-            self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=[maybe_convert_block_hash(block_hash)],
-                    parent_block_hash=parent_block_hash,
-                    token_ids=request.all_token_ids[block_start:block_end],
-                    block_size=block_end - block_start,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
-                    medium=MEDIUM_GPU,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
-                    extra_keys=[extra_keys],
-                    group_idx=kv_cache_group_id,
+            if (
+                kv_cache_spec is not None
+                and get_kv_cache_spec_kind(kv_cache_spec) == KVCacheSpecKind.MAMBA
+            ):
+                self._append_spec_aware_stored_event(
+                    request=request,
+                    kv_cache_spec=kv_cache_spec,
+                    key_hash=block_hash,
+                    start=block_start,
+                    end=block_end,
+                    kv_cache_group_id=kv_cache_group_id,
+                    extra_keys=extra_keys,
                 )
-            )
+            else:
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[maybe_convert_block_hash(block_hash)],
+                        parent_block_hash=parent_block_hash,
+                        token_ids=request.all_token_ids[block_start:block_end],
+                        block_size=block_end - block_start,
+                        lora_id=(
+                            request.lora_request.adapter_id
+                            if request.lora_request
+                            else None
+                        ),
+                        medium=MEDIUM_GPU,
+                        lora_name=(
+                            request.lora_request.name if request.lora_request else None
+                        ),
+                        extra_keys=[extra_keys],
+                        group_idx=kv_cache_group_id,
+                    )
+                )
         return block_hash_with_group_id
 
     def _get_partial_block_hash(
