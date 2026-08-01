@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     AttentionState,
     BatchExecutionDescriptor,
@@ -40,6 +41,17 @@ def _prepare_dflash_inputs_to_capture(
 
     attn_metadata = None
     if not skip_attn:
+        dcp_local_seq_lens = None
+        if block_tables.cp_size > 1:
+            prepare_dcp_local_seq_lens(
+                input_buffers.dcp_local_seq_lens,
+                input_batch.seq_lens,
+                num_reqs,
+                block_tables.cp_size,
+                block_tables.cp_rank,
+                block_tables.cp_interleave,
+            )
+            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs]
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -55,6 +67,7 @@ def _prepare_dflash_inputs_to_capture(
             kv_cache_config=kv_cache_config,
             for_cudagraph_capture=True,
             causal=causal,
+            dcp_local_seq_lens=dcp_local_seq_lens,
         )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 

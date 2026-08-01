@@ -204,7 +204,7 @@ import itertools
 import math
 from abc import abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from math import lcm
 from typing import ClassVar, Generic, TypeVar, cast
@@ -225,6 +225,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_tp_group,
@@ -302,6 +303,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 
 logger = init_logger(__name__)
 
@@ -961,9 +963,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         : attn_metadata.num_decodes
                     ]
                 )
-                query_start_loc = attn_metadata.query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ]
+                query_start_loc = (
+                    attn_metadata.decode.dcp_virtual_query_start_loc
+                    if attn_metadata.decode is not None
+                    and attn_metadata.decode.dcp_virtual_query_start_loc is not None
+                    else attn_metadata.query_start_loc[: attn_metadata.num_decodes + 1]
+                )
                 attn_out = self.dcp_manager.combine(
                     attn_out,
                     lse,
@@ -1468,6 +1473,12 @@ class MLACommonDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     dcp_tot_seq_lens: torch.Tensor | None
+    # DCP causal speculative verification cannot use a conventional grouped
+    # q_len > 1 decode mask: ownership of consecutive global KV positions
+    # alternates across DCP ranks. Full CUDA graphs therefore expand each
+    # logical query block into virtual q_len=1 rows (RFC #50391 Strategy D).
+    dcp_virtual_query_len: int | None = field(default=None, kw_only=True)
+    dcp_virtual_query_start_loc: torch.Tensor | None = field(default=None, kw_only=True)
 
 
 D = TypeVar("D", bound=MLACommonDecodeMetadata)
@@ -1964,6 +1975,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
     # Whether this builder can flatten a non-causal query block into decode rows.
     supports_non_causal_multi_token_decode: ClassVar[bool] = False
+    # Whether this builder's decode implementation can flatten a causal DCP
+    # query block into virtual q_len=1 rows for full CUDA-graph replay.
+    supports_dcp_virtual_queries: ClassVar[bool] = False
 
     # The threshold for reordering the batch into decode and prefill requests.
     # If > 1, the batch will be reordered such that requests with
@@ -2088,10 +2102,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
 
         try:
-            self.dcp_world_size = get_dcp_group().world_size
+            dcp_group = get_dcp_group()
+            self.dcp_world_size = dcp_group.world_size
+            self.dcp_rank = dcp_group.rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
+            self.dcp_rank = 0
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -2147,11 +2164,123 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.reorder_batch_threshold, supports_spec_decode, supports_dcp_with_varlen
         )
 
+        self.use_dcp_virtual_queries = (
+            self.dcp_world_size > 1
+            and self.supports_dcp_virtual_queries
+            and self.compilation_config.cudagraph_mode.decode_mode()
+            == CUDAGraphMode.FULL
+        )
+        self._dcp_virtual_global_seq_lens: torch.Tensor | None = None
+        self._dcp_virtual_local_seq_lens: torch.Tensor | None = None
+        self._dcp_virtual_query_offsets: torch.Tensor | None = None
+        self._dcp_virtual_query_start_loc: torch.Tensor | None = None
+        if self.use_dcp_virtual_queries:
+            scheduler_config = vllm_config.scheduler_config
+            max_virtual_tokens = max(
+                scheduler_config.max_num_batched_tokens or 0,
+                self.compilation_config.max_cudagraph_capture_size or 0,
+            )
+            assert max_virtual_tokens > 0
+            self._dcp_virtual_global_seq_lens = torch.empty(
+                max_virtual_tokens, dtype=torch.int32, device=device
+            )
+            self._dcp_virtual_local_seq_lens = torch.empty(
+                max_virtual_tokens, dtype=torch.int32, device=device
+            )
+            self._dcp_virtual_query_offsets = torch.arange(
+                max_virtual_tokens, dtype=torch.int32, device=device
+            )
+            self._dcp_virtual_query_start_loc = torch.arange(
+                max_virtual_tokens + 1, dtype=torch.int32, device=device
+            )
+
         if self.query_len_support == QueryLenSupport.SINGLE_ONLY:
             assert self.reorder_batch_threshold == 1, (
                 f"reorder_batch_threshold must be 1 when query_len_support is "
                 f"SINGLE_ONLY, got {self.reorder_batch_threshold}"
             )
+
+    def _get_dcp_virtual_query_len(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> int | None:
+        """Return the uniform logical q_len eligible for Strategy-D decode."""
+        if (
+            not self.use_dcp_virtual_queries
+            or common_attn_metadata.causal is False
+            or common_attn_metadata.max_query_len <= 1
+        ):
+            return None
+
+        is_prefilling = common_attn_metadata.is_prefilling
+        if is_prefilling is None or bool(torch.any(is_prefilling)):
+            return None
+
+        query_lens = (
+            common_attn_metadata.query_start_loc_cpu[1:]
+            - common_attn_metadata.query_start_loc_cpu[:-1]
+        )
+        num_active_reqs = int(torch.count_nonzero(query_lens > 0))
+        if num_active_reqs == 0:
+            return None
+        query_len = int(query_lens[0])
+        uniform_active_queries = bool(
+            torch.all(query_lens[:num_active_reqs] == query_len)
+        )
+        trailing_graph_padding = bool(torch.all(query_lens[num_active_reqs:] == 0))
+        if not (
+            uniform_active_queries
+            and trailing_graph_padding
+            and query_len == common_attn_metadata.max_query_len
+            and common_attn_metadata.num_actual_tokens
+            == common_attn_metadata.num_reqs * query_len
+        ):
+            return None
+        return query_len
+
+    def _prepare_dcp_virtual_seq_lens(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        query_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Refresh persistent per-query global/local boundaries before replay."""
+        global_seq_lens = self._dcp_virtual_global_seq_lens
+        local_seq_lens = self._dcp_virtual_local_seq_lens
+        query_offsets = self._dcp_virtual_query_offsets
+        query_start_loc = self._dcp_virtual_query_start_loc
+        assert global_seq_lens is not None
+        assert local_seq_lens is not None
+        assert query_offsets is not None
+        assert query_start_loc is not None
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        assert num_tokens == num_reqs * query_len
+        assert num_tokens <= global_seq_lens.shape[0]
+
+        # For request final length L and logical query offset j, the visible
+        # global boundary is L - query_len + j + 1. Padded graph rows have
+        # L=0 and clamp to an empty boundary.
+        global_seq_lens_2d = global_seq_lens[:num_tokens].view(num_reqs, query_len)
+        torch.add(
+            common_attn_metadata.seq_lens[:num_reqs, None],
+            query_offsets[None, :query_len],
+            out=global_seq_lens_2d,
+        )
+        global_seq_lens_2d.sub_(query_len - 1).clamp_(min=0)
+
+        prepare_dcp_local_seq_lens(
+            local_seq_lens,
+            global_seq_lens,
+            num_tokens,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+        return (
+            global_seq_lens[:num_tokens],
+            local_seq_lens[:num_tokens],
+            query_start_loc[: num_tokens + 1],
+        )
 
     def _build_decode(
         self,
@@ -2182,7 +2311,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             "Make sure all cudagraph capture sizes <= max_num_seq."
         )
 
-        assert m.max_query_len <= self.reorder_batch_threshold  # decode only
+        non_causal_flattened_decode = (
+            m.causal is False
+            and self.supports_non_causal_multi_token_decode
+            and self.non_causal_multi_token_decode
+        )
+        dcp_virtual_query_len = self._get_dcp_virtual_query_len(m)
+        assert (
+            m.max_query_len <= self.reorder_batch_threshold
+            or non_causal_flattened_decode
+            or dcp_virtual_query_len is not None
+        ), (
+            "MLA full CUDAGraph capture requires an effective decode query "
+            "length supported by the backend."
+        )
 
         return self.build(0, m)
 
@@ -2210,7 +2352,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
         non_causal_decode = common_attn_metadata.causal is False
-        if non_causal_decode:
+        dcp_virtual_query_len = self._get_dcp_virtual_query_len(common_attn_metadata)
+        if dcp_virtual_query_len is not None:
+            # Preserve the logical request rows in metadata, but route the
+            # entire fixed-shape query block through decode. The backend
+            # expands it into virtual q_len=1 rows inside the captured graph.
+            num_decodes = num_reqs
+            num_prefills = 0
+            num_decode_tokens = num_tokens
+            num_prefill_tokens = 0
+        elif non_causal_decode:
             if not (
                 self.supports_non_causal_multi_token_decode
                 and self.non_causal_multi_token_decode
@@ -2299,9 +2450,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         decode_metadata = None
         if num_decodes > 0:
             dcp_tot_seq_lens_device = None
+            dcp_virtual_query_start_loc = None
             if self.dcp_world_size > 1:
-                dcp_tot_seq_lens_device = seq_lens[:num_decodes]
-                seq_lens = dcp_local_seq_lens
+                if dcp_virtual_query_len is not None:
+                    (
+                        dcp_tot_seq_lens_device,
+                        seq_lens,
+                        dcp_virtual_query_start_loc,
+                    ) = self._prepare_dcp_virtual_seq_lens(
+                        common_attn_metadata,
+                        dcp_virtual_query_len,
+                    )
+                else:
+                    dcp_tot_seq_lens_device = seq_lens[:num_decodes]
+                    seq_lens = dcp_local_seq_lens
 
                 # After DCP distribution, the maximum number of tokens for any rank is
                 # ceil(L / (N * I)) * I, where L is max_seq_len, N is dcp_world_size,
@@ -2313,15 +2475,22 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     (max_seq_len + num_partitions - 1) // num_partitions
                 ) * self.cp_kv_cache_interleave_size
 
+            decode_seq_lens = (
+                seq_lens[:num_decode_tokens]
+                if dcp_virtual_query_len is not None
+                else seq_lens[:num_decodes]
+            )
             decode_metadata = self._build_decode(
                 block_table_tensor=block_table_tensor[:num_decodes, ...],
-                seq_lens_device=seq_lens[:num_decodes],
+                seq_lens_device=decode_seq_lens,
                 max_seq_len=max_seq_len,
                 query_start_loc_cpu=query_start_loc_cpu[: num_decodes + 1],
                 query_start_loc_device=query_start_loc[: num_decodes + 1],
                 num_decode_tokens=num_decode_tokens,
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
             )
+            decode_metadata.dcp_virtual_query_len = dcp_virtual_query_len
+            decode_metadata.dcp_virtual_query_start_loc = dcp_virtual_query_start_loc
 
         attn_metadata = self.metadata_cls(
             num_reqs=common_attn_metadata.num_reqs,

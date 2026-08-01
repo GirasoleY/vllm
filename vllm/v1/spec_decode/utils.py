@@ -11,6 +11,40 @@ from vllm.v1.attention.backends.utils import (
 PADDING_SLOT_ID = -1
 
 
+def has_speculative_decode_layout(
+    num_scheduled_tokens: dict[str, int],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+    num_new_sampled_tokens_per_step: int,
+) -> bool:
+    """Whether every scheduled row is a target speculative-verification row."""
+    return bool(num_scheduled_tokens) and all(
+        num_tokens > num_new_sampled_tokens_per_step
+        and len(scheduled_spec_decode_tokens.get(req_id, ()))
+        == num_tokens - num_new_sampled_tokens_per_step
+        for req_id, num_tokens in num_scheduled_tokens.items()
+    )
+
+
+def get_speculative_cudagraph_uniform_token_count(
+    uniform_token_count: int | None,
+    num_scheduled_tokens: dict[str, int],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+    num_new_sampled_tokens_per_step: int,
+) -> int | None:
+    """Keep a FULL-graph shape key only for a real verifier batch."""
+    if (
+        uniform_token_count is not None
+        and uniform_token_count > num_new_sampled_tokens_per_step
+        and not has_speculative_decode_layout(
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            num_new_sampled_tokens_per_step,
+        )
+    ):
+        return None
+    return uniform_token_count
+
+
 def next_power_of_2(n: int) -> int:
     """Return the smallest power of 2 >= n."""
     if n <= 0:

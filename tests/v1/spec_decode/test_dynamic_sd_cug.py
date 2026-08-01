@@ -15,10 +15,23 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.v1.spec_decode.utils import (
+    get_speculative_cudagraph_uniform_token_count,
+    has_speculative_decode_layout,
+)
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)
+def _disable_cuda_graph_pool(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
 
 
 def _create_vllm_config_for_dsd(
@@ -82,6 +95,75 @@ def _create_vllm_config_for_dsd(
     vllm_config.speculative_config = speculative_config
 
     return vllm_config
+
+
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "fallback_mode"),
+    [
+        pytest.param(
+            "FULL_AND_PIECEWISE",
+            CUDAGraphMode.PIECEWISE,
+            id="piecewise-fallback",
+        ),
+        pytest.param(
+            "FULL_DECODE_ONLY",
+            CUDAGraphMode.NONE,
+            id="eager-fallback",
+        ),
+    ],
+)
+def test_same_shape_prefill_cannot_select_speculative_full_graph(
+    monkeypatch,
+    cudagraph_mode: str,
+    fallback_mode: CUDAGraphMode,
+):
+    """FULL verifier graphs require draft-token layout, not just q_len shape."""
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config_for_dsd(
+            max_num_seqs=2,
+            max_spec_tokens=7,
+            cudagraph_mode=cudagraph_mode,
+            use_dynamic_sd=False,
+        ),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode[cudagraph_mode],
+        decode_query_len=8,
+    )
+    manager._graphs_captured = True
+
+    scheduled = {"r0": 8, "r1": 8}
+    verifier_drafts = {"r0": [1] * 7, "r1": [2] * 7}
+    assert has_speculative_decode_layout(scheduled, verifier_drafts, 1)
+    verifier_uniform_token_count = get_speculative_cudagraph_uniform_token_count(
+        8, scheduled, verifier_drafts, 1
+    )
+    assert verifier_uniform_token_count == 8
+    verifier_desc = manager.dispatch(
+        num_reqs=2,
+        num_tokens=16,
+        uniform_token_count=verifier_uniform_token_count,
+        num_active_loras=0,
+    )
+    assert verifier_desc.cg_mode == CUDAGraphMode.FULL
+
+    for non_verifier_drafts in ({}, {"r0": [1] * 7}, {"r0": [1] * 6, "r1": [2] * 6}):
+        assert not has_speculative_decode_layout(scheduled, non_verifier_drafts, 1)
+        prefill_uniform_token_count = get_speculative_cudagraph_uniform_token_count(
+            8, scheduled, non_verifier_drafts, 1
+        )
+        assert prefill_uniform_token_count is None
+        prefill_desc = manager.dispatch(
+            num_reqs=2,
+            num_tokens=16,
+            uniform_token_count=prefill_uniform_token_count,
+            num_active_loras=0,
+        )
+        assert prefill_desc.cg_mode == fallback_mode
 
 
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):

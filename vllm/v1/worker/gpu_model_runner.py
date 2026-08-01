@@ -207,7 +207,10 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm.v1.spec_decode.utils import (
+    get_speculative_cudagraph_uniform_token_count,
+    update_num_computed_tokens_for_batch_change,
+)
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -4369,6 +4372,26 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            force_uniform_decode = None
+            if self.speculative_config is not None:
+                uniform_decode_candidate = (
+                    max_num_scheduled_tokens
+                    if max_num_scheduled_tokens == self.uniform_decode_query_len
+                    and num_tokens_unpadded == max_num_scheduled_tokens * num_reqs
+                    else None
+                )
+                if (
+                    uniform_decode_candidate is not None
+                    and get_speculative_cudagraph_uniform_token_count(
+                        uniform_decode_candidate,
+                        scheduler_output.num_scheduled_tokens,
+                        scheduler_output.scheduled_spec_decode_tokens,
+                        1,
+                    )
+                    is None
+                ):
+                    force_uniform_decode = False
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4381,6 +4404,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_uniform_decode=force_uniform_decode,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
