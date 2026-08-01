@@ -171,20 +171,14 @@ class DcpTopkSymmWorkspace:
     allocation_bytes_per_rank: int
     local_candidates: torch.Tensor | None
     local_flags: torch.Tensor | None
-    peer_candidates: (
-        tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-        ]
-        | None
-    )
+    peer_candidates: tuple[torch.Tensor, ...] | None
+    candidate_ptrs: torch.Tensor | None
     flag_ptrs: torch.Tensor | None
 
     @property
     def logical_bytes_per_rank(self) -> int:
-        return self.candidate_payload_bytes_per_rank + 2 * 8 + self.world_size * 8
+        pointer_table_bytes = 2 * self.world_size * 8
+        return self.candidate_payload_bytes_per_rank + 2 * 8 + pointer_table_bytes
 
     @property
     def candidate_payload_bytes_per_rank(self) -> int:
@@ -221,6 +215,7 @@ class DcpTopkSymmWorkspace:
         if (
             self.local_candidates is None
             or self.peer_candidates is None
+            or self.candidate_ptrs is None
             or self.flag_ptrs is None
         ):
             raise RuntimeError("DCP symmetric-memory workspace is closed.")
@@ -249,7 +244,7 @@ class DcpTopkSymmWorkspace:
             max_spins=_MAX_FENCE_SPINS,
         )
         stable_topk_from_peer_candidates_cutedsl(
-            self.peer_candidates,
+            self.candidate_ptrs,
             self.world_size,
             rows,
             self.local_candidates_count,
@@ -266,6 +261,7 @@ class DcpTopkSymmWorkspace:
             return
         torch.accelerator.synchronize(self.local_candidates.device)
         self.flag_ptrs = None
+        self.candidate_ptrs = None
         self.peer_candidates = None
         self.local_flags = None
         self.local_candidates = None
@@ -291,12 +287,10 @@ def create_dcp_topk_symm_workspace_for_group(
         raise RuntimeError(
             "DCP symmetric-memory workspace requires dcp_world_size > 1."
         )
-    if world_size != 4:
-        raise RuntimeError("DCP symmetric-memory peer-shard top-k requires DCP4.")
-    if (world_size * local_candidates) % 512 != 0:
+    if local_candidates % 512 != 0:
         raise RuntimeError(
-            "DCP symmetric-memory stable-topK requires total candidates to be "
-            f"a multiple of 512; got {world_size} * {local_candidates}."
+            "DCP symmetric-memory stable-topK requires each owner's candidate "
+            f"count to be a multiple of 512; got {local_candidates}."
         )
 
     local_candidates_tensor = symm_mem.empty(
@@ -324,34 +318,25 @@ def create_dcp_topk_symm_workspace_for_group(
         raise RuntimeError("DCP symmetric-memory rendezvous returned no handle.")
     candidate_handle.barrier()
     flag_handle.barrier()
-    peer_candidates = (
+    peer_candidates = tuple(
         candidate_handle.get_buffer(
-            0,
+            peer,
             (max_rows, local_candidates, 2),
             torch.float32,
-        ),
-        candidate_handle.get_buffer(
-            1,
-            (max_rows, local_candidates, 2),
-            torch.float32,
-        ),
-        candidate_handle.get_buffer(
-            2,
-            (max_rows, local_candidates, 2),
-            torch.float32,
-        ),
-        candidate_handle.get_buffer(
-            3,
-            (max_rows, local_candidates, 2),
-            torch.float32,
-        ),
+        )
+        for peer in range(world_size)
+    )
+    candidate_ptrs = torch.tensor(
+        [peer.data_ptr() for peer in peer_candidates],
+        dtype=torch.int64,
+        device=device,
     )
     flag_ptrs = torch.tensor(
         flag_handle.buffer_ptrs,
         dtype=torch.int64,
         device=device,
     )
-    if bool(flag_ptrs.eq(0).any()):
+    if bool(candidate_ptrs.eq(0).any()) or bool(flag_ptrs.eq(0).any()):
         raise RuntimeError("DCP symmetric-memory peer mapping contains a null pointer.")
 
     return DcpTopkSymmWorkspace(
@@ -364,11 +349,13 @@ def create_dcp_topk_symm_workspace_for_group(
         allocation_bytes_per_rank=(
             int(candidate_handle.buffer_size)
             + int(flag_handle.buffer_size)
+            + candidate_ptrs.numel() * candidate_ptrs.element_size()
             + flag_ptrs.numel() * flag_ptrs.element_size()
         ),
         local_candidates=local_candidates_tensor,
         local_flags=local_flags,
         peer_candidates=peer_candidates,
+        candidate_ptrs=candidate_ptrs,
         flag_ptrs=flag_ptrs,
     )
 

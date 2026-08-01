@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -187,6 +187,37 @@ def _run_persistent_topk(
     return indices
 
 
+@pytest.mark.parametrize(
+    ("max_num_seqs", "max_num_batched_tokens", "num_speculative_tokens", "expected"),
+    [
+        (256, 8192, 0, 256),
+        (256, 8192, 7, 2048),
+        (256, 1024, 7, 1024),
+    ],
+)
+def test_dcp_topk_symm_capacity_follows_decode_config(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    num_speculative_tokens: int,
+    expected: int,
+):
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+        ),
+        num_speculative_tokens=num_speculative_tokens,
+    )
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_current_vllm_config",
+        lambda: config,
+    )
+
+    assert sparse_indexer._get_dcp_topk_symm_max_decode_rows() == expected
+
+
 def _dcp_attention_from_local_topks(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -268,20 +299,21 @@ def _merge_local_topks_global_with_fake_dcp(
 
 
 @pytest.mark.parametrize(
-    ("enabled", "rows", "is_prefill", "expected"),
+    ("enabled", "capacity", "rows", "is_prefill", "expected"),
     [
-        (False, 32, False, "explicit"),
-        (True, 15, False, "explicit"),
-        (True, 16, False, "symm"),
-        (True, 32, False, "symm"),
-        (True, 128, False, "symm"),
-        (True, 129, False, "explicit"),
-        (True, 32, True, "explicit"),
+        (False, 320, 32, False, "explicit"),
+        (True, 320, 15, False, "explicit"),
+        (True, 320, 16, False, "symm"),
+        (True, 320, 128, False, "symm"),
+        (True, 320, 320, False, "symm"),
+        (True, 320, 321, False, "explicit"),
+        (True, 320, 32, True, "explicit"),
     ],
 )
 def test_dcp_topk_symm_serving_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     enabled: bool,
+    capacity: int,
     rows: int,
     is_prefill: bool,
     expected: str,
@@ -299,7 +331,7 @@ def test_dcp_topk_symm_serving_dispatch(
             return input_
 
     def get_symm_workspace(max_rows: int, candidates: int, group: FakeDcpGroup):
-        assert max_rows == sparse_indexer.DCP_TOPK_SYMM_MAX_DECODE_ROWS
+        assert max_rows == capacity
         assert candidates == 4
         assert isinstance(group, FakeDcpGroup)
         calls.append("symm_init")
@@ -328,6 +360,11 @@ def test_dcp_topk_symm_serving_dispatch(
         lambda *args: None,
     )
     monkeypatch.setattr(sparse_indexer.envs, "VLLM_DCP_TOPK_SYMM", enabled)
+    monkeypatch.setattr(
+        sparse_indexer,
+        "_get_dcp_topk_symm_max_decode_rows",
+        lambda: capacity,
+    )
     monkeypatch.setattr(sparse_indexer, "get_dcp_group", lambda: FakeDcpGroup())
 
     logits = torch.zeros((rows, 8), dtype=torch.float32)
@@ -378,6 +415,11 @@ def test_dcp_topk_symm_failure_is_fatal(
         lambda *args: None,
     )
     monkeypatch.setattr(sparse_indexer.envs, "VLLM_DCP_TOPK_SYMM", True)
+    monkeypatch.setattr(
+        sparse_indexer,
+        "_get_dcp_topk_symm_max_decode_rows",
+        lambda: 320,
+    )
     monkeypatch.setattr(sparse_indexer, "get_dcp_group", FakeDcpGroup)
 
     logits = torch.zeros((32, 8), dtype=torch.float32)

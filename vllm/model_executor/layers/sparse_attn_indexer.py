@@ -41,10 +41,20 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 DCP_TOPK_SYMM_MIN_DECODE_ROWS = 16
-DCP_TOPK_SYMM_MAX_DECODE_ROWS = 128
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _get_dcp_topk_symm_max_decode_rows() -> int:
+    """Return the configured upper bound on rows in a decode batch."""
+    vllm_config = get_current_vllm_config()
+    scheduler_config = vllm_config.scheduler_config
+    decode_query_len = 1 + vllm_config.num_speculative_tokens
+    return min(
+        scheduler_config.max_num_batched_tokens,
+        scheduler_config.max_num_seqs * decode_query_len,
+    )
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -103,18 +113,18 @@ def _merge_dcp_topk_global(
     _assert_cutedsl_dcp_merge_supported(logits, topk_indices, topk_tokens)
 
     rows = topk_indices.shape[0]
-    use_symm = (
-        envs.VLLM_DCP_TOPK_SYMM
-        and row_starts is None
-        and DCP_TOPK_SYMM_MIN_DECODE_ROWS <= rows <= DCP_TOPK_SYMM_MAX_DECODE_ROWS
-    )
+    max_decode_rows = 0
+    use_symm = envs.VLLM_DCP_TOPK_SYMM and row_starts is None
+    if use_symm:
+        max_decode_rows = _get_dcp_topk_symm_max_decode_rows()
+        use_symm = DCP_TOPK_SYMM_MIN_DECODE_ROWS <= rows <= max_decode_rows
     if use_symm:
         from vllm.model_executor.kernels.attention.dsa.dcp_topk_symm import (
             get_dcp_topk_symm_workspace,
         )
 
         workspace = get_dcp_topk_symm_workspace(
-            DCP_TOPK_SYMM_MAX_DECODE_ROWS,
+            max_decode_rows,
             topk_indices.shape[1],
             get_dcp_group(),
         )
@@ -818,12 +828,14 @@ class SparseAttnIndexer(CustomOp):
                 get_dcp_topk_symm_workspace,
             )
 
-            # Initialize the process-owned workspace before model execution.
-            get_dcp_topk_symm_workspace(
-                DCP_TOPK_SYMM_MAX_DECODE_ROWS,
-                self.topk_tokens,
-                get_dcp_group(),
-            )
+            max_decode_rows = _get_dcp_topk_symm_max_decode_rows()
+            if max_decode_rows >= DCP_TOPK_SYMM_MIN_DECODE_ROWS:
+                # Initialize the process-owned workspace before model execution.
+                get_dcp_topk_symm_workspace(
+                    max_decode_rows,
+                    self.topk_tokens,
+                    get_dcp_group(),
+                )
 
     def forward_native(
         self,

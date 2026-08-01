@@ -118,7 +118,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     )
     assert workspace.candidate_payload_bytes_per_rank == max_rows * topk * 2 * 4
     assert workspace.logical_bytes_per_rank == (
-        max_rows * topk * 2 * 4 + 16 + world_size * 8
+        max_rows * topk * 2 * 4 + 16 + 2 * world_size * 8
     )
     assert workspace.allocation_bytes_per_rank >= workspace.logical_bytes_per_rank
     assert workspace.peer_candidates is not None
@@ -282,8 +282,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 )
 @pytest.mark.skipif(envs.VLLM_TARGET_DEVICE != "cuda", reason="Only test on CUDA")
 @pytest.mark.skipif(not has_cutedsl(), reason="Requires CuTeDSL.")
-def test_dcp_topk_symm_matches_allgather_and_replays_graph() -> None:
-    world_size = 4
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_dcp_topk_symm_matches_allgather_and_replays_graph(world_size: int) -> None:
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs")
     mp.spawn(
