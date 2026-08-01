@@ -396,6 +396,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_interleave,
             )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
@@ -503,6 +506,9 @@ def _prepare_dflash_inputs_kernel(
     max_num_reqs,
     max_num_tokens,
     max_model_len,
+    dcp_size,
+    dcp_rank,
+    cp_interleave,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -537,14 +543,24 @@ def _prepare_dflash_inputs_kernel(
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
-    ctx_block_num = ctx_pos // block_size
+    virtual_block_size = block_size * dcp_size
+    ctx_virtual_offset = ctx_pos % virtual_block_size
+    ctx_is_local = ((ctx_virtual_offset // cp_interleave) % dcp_size) == dcp_rank
+    ctx_block_num = ctx_pos // virtual_block_size
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
         mask=is_ctx,
         other=0,
     ).to(tl.int64)
-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+    ctx_local_offset = (
+        ctx_virtual_offset // (dcp_size * cp_interleave)
+    ) * cp_interleave + (ctx_virtual_offset % cp_interleave)
+    ctx_slot = tl.where(
+        ctx_is_local,
+        ctx_block_id * block_size + ctx_local_offset,
+        PAD_SLOT_ID,
+    )
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
@@ -554,14 +570,23 @@ def _prepare_dflash_inputs_kernel(
     is_bonus = is_query & (query_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
 
-    q_block_num = query_pos // block_size
+    q_virtual_offset = query_pos % virtual_block_size
+    q_is_local = ((q_virtual_offset // cp_interleave) % dcp_size) == dcp_rank
+    q_block_num = query_pos // virtual_block_size
     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
     q_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + q_block_num,
         mask=is_query,
         other=0,
     ).to(tl.int64)
-    q_slot = q_block_id * block_size + (query_pos % block_size)
+    q_local_offset = (
+        q_virtual_offset // (dcp_size * cp_interleave)
+    ) * cp_interleave + (q_virtual_offset % cp_interleave)
+    q_slot = tl.where(
+        q_is_local,
+        q_block_id * block_size + q_local_offset,
+        PAD_SLOT_ID,
+    )
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
@@ -659,6 +684,9 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    cp_interleave: int = 1,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
@@ -699,6 +727,9 @@ def prepare_dflash_inputs(
         max_num_reqs,
         max_num_tokens,
         max_model_len,
+        dcp_size,
+        dcp_rank,
+        cp_interleave,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         BLOCK_SIZE=BLOCK_SIZE,

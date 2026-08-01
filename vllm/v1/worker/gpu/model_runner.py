@@ -56,6 +56,9 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.utils import (
+    get_speculative_cudagraph_uniform_token_count,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -1227,6 +1230,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+
+        if self.speculative_config is not None:
+            # FULL speculative-verification graphs capture model-wide branch
+            # topology (for example KDA recurrent decode), not just tensor
+            # shapes. Remove the shape key from a same-shape short prefill so
+            # it cannot select that graph (PIECEWISE/NONE remains available).
+            uniform_tok_count = get_speculative_cudagraph_uniform_token_count(
+                uniform_tok_count,
+                scheduler_output.num_scheduled_tokens,
+                scheduler_output.scheduled_spec_decode_tokens,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,

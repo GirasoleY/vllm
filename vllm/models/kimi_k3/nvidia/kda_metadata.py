@@ -280,7 +280,12 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_token_indx = None
             non_spec_token_indx = None
             spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            # A length-one strided view is considered contiguous by PyTorch,
+            # so .contiguous() can preserve the block-table row stride. The
+            # packed KDA decode kernel requires a physical stride of exactly 1.
+            non_spec_state_indices_tensor = block_table_tensor[:, 0].clone(
+                memory_format=torch.contiguous_format
+            )
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu

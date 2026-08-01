@@ -21,10 +21,12 @@ from tests.v1.attention.utils import (
     try_get_attention_backend,
 )
 from vllm import _custom_ops as ops
+from vllm.config import CUDAGraphMode
 from vllm.config.vllm import set_current_vllm_config
 from vllm.model_executor.layers.attention import mla_attention as mla_attention_module
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
+    MLACommonMetadata,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
     build_mla_chunked_context_metadata,
@@ -1051,6 +1053,140 @@ def test_flashmla_dcp_decode_metadata_uses_gathered_query_heads(
         assert metadata.scheduler_metadata.tile_scheduler_metadata is None
         assert metadata.scheduler_metadata.num_splits is None
         assert fp8_call is None
+
+
+@pytest.mark.parametrize(
+    ("causal", "query_len", "is_prefilling", "use_virtual_queries"),
+    [
+        pytest.param(True, 8, False, True, id="target-verifier"),
+        pytest.param(False, 7, False, False, id="dspark-draft"),
+    ],
+)
+def test_flashinfer_mla_dcp_dspark_full_graph_capture_uses_decode_metadata(
+    monkeypatch,
+    causal: bool,
+    query_len: int,
+    is_prefilling: bool,
+    use_virtual_queries: bool,
+):
+    """Build K3's DCP target and draft metadata for full decode capture."""
+    builder_cls, _ = try_get_attention_backend(AttentionBackendEnum.FLASHINFER_MLA)
+    builder = object.__new__(builder_cls)
+    builder.metadata_cls = MLACommonMetadata
+    builder.model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        get_head_size=lambda: 576,
+    )
+    builder.device = torch.device("cpu")
+    builder.page_size = 32
+    builder.use_pcp = False
+    builder.reorder_batch_threshold = 1
+    builder.dcp_world_size = 8
+    builder.dcp_rank = 1
+    builder.dcp_local_block_size = 4
+    builder.dcp_virtual_block_size = 32
+    builder.cp_kv_cache_interleave_size = 4
+    builder.non_causal_multi_token_decode = True
+    builder.use_dcp_virtual_queries = True
+    builder.compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    builder._dcp_virtual_global_seq_lens = torch.empty(64, dtype=torch.int32)
+    builder._dcp_virtual_local_seq_lens = torch.empty(64, dtype=torch.int32)
+    builder._dcp_virtual_query_offsets = torch.arange(64, dtype=torch.int32)
+    builder._dcp_virtual_query_start_loc = torch.arange(65, dtype=torch.int32)
+
+    seq_lens = [31 + query_len]
+    if use_virtual_queries:
+        seq_lens.append(0)
+    num_reqs = len(seq_lens)
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=seq_lens,
+            query_lens=(
+                [query_len] + [0] * (num_reqs - 1)
+                if use_virtual_queries
+                else [query_len] * num_reqs
+            ),
+        ),
+        block_size=32,
+        device=torch.device("cpu"),
+    )
+    if use_virtual_queries:
+        # FULL graph replay pads the model token dimension to B * query_len
+        # while padded request boundaries remain equal to the real token count.
+        common_attn_metadata.num_actual_tokens = num_reqs * query_len
+    common_attn_metadata.causal = causal
+    common_attn_metadata.is_prefilling = torch.full(
+        (num_reqs,), is_prefilling, dtype=torch.bool
+    )
+    common_attn_metadata.dcp_local_seq_lens = torch.tensor(
+        [7 if causal else 6] + [0] * (num_reqs - 1),
+        dtype=torch.int32,
+    )
+
+    def prepare_local_seq_lens(
+        output: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_reqs: int,
+        dcp_size: int,
+        dcp_rank: int,
+        interleave: int,
+    ):
+        virtual_block_size = dcp_size * interleave
+        for i, seq_len in enumerate(seq_lens[:num_reqs].tolist()):
+            full_blocks, remainder = divmod(seq_len, virtual_block_size)
+            output[i] = full_blocks * interleave + min(
+                max(remainder - dcp_rank * interleave, 0),
+                interleave,
+            )
+
+    monkeypatch.setattr(
+        mla_attention_module,
+        "prepare_dcp_local_seq_lens",
+        prepare_local_seq_lens,
+    )
+
+    assert builder.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    assert builder.reorder_batch_threshold == 1
+    actual = builder.build_for_cudagraph_capture(common_attn_metadata)
+
+    assert actual.num_decodes == num_reqs
+    assert actual.num_decode_tokens == num_reqs * query_len
+    assert actual.num_prefills == 0
+    assert actual.decode is not None
+    assert actual.decode.block_table.shape[0] == num_reqs
+    if use_virtual_queries:
+        assert actual.decode.dcp_virtual_query_len == query_len
+        assert actual.decode.dcp_virtual_query_start_loc.tolist() == list(
+            range(num_reqs * query_len + 1)
+        )
+        assert actual.decode.dcp_tot_seq_lens.tolist() == (
+            list(range(32, 32 + query_len)) + [0] * query_len
+        )
+        assert actual.decode.seq_lens.tolist() == [
+            4,
+            4,
+            4,
+            4,
+            4,
+            5,
+            6,
+            7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+    else:
+        assert actual.decode.dcp_virtual_query_len is None
+        assert actual.decode.dcp_virtual_query_start_loc is None
+        assert actual.decode.dcp_tot_seq_lens.tolist() == [31 + query_len]
+        assert actual.decode.seq_lens.tolist() == [6]
 
 
 def run_attention_backend(

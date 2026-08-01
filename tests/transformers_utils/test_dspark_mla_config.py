@@ -142,7 +142,7 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     assert speculative_config.draft_model_config.use_mla
 
 
-def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
+def test_dspark_mla_supports_decode_context_parallelism(tmp_path):
     target_path = tmp_path / "target"
     draft_path = tmp_path / "draft"
     _write_target_config(target_path)
@@ -151,15 +151,17 @@ def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
         model=str(target_path), tokenizer_mode="skip", max_model_len=32768
     )
 
-    with pytest.raises(ValueError, match="does not currently support decode context"):
-        SpeculativeConfig(
-            model=str(draft_path),
-            method="dspark",
-            num_speculative_tokens=8,
-            target_model_config=target_config,
-            target_parallel_config=ParallelConfig(
-                tensor_parallel_size=2,
-                decode_context_parallel_size=2,
-                distributed_executor_backend="external_launcher",
-            ),
-        )
+    speculative_config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=8,
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            distributed_executor_backend="external_launcher",
+        ),
+    )
+
+    assert speculative_config.parallel_drafting
+    assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]

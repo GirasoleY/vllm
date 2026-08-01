@@ -221,6 +221,27 @@ def test_mixed_regular_and_spec_decode_uses_packed_decode_metadata():
     )
 
 
+def test_no_scheduled_draft_tokens_have_contiguous_state_indices():
+    batch = BatchSpec(seq_lens=[40], query_lens=[1])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.tensor([False]))
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=False,
+    ).build(
+        0,
+        common_attn_metadata,
+        num_decode_draft_tokens_cpu=torch.tensor([0], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=DEVICE),
+    )
+
+    assert actual.non_spec_state_indices_tensor is not None
+    assert actual.non_spec_state_indices_tensor.shape == (1,)
+    assert actual.non_spec_state_indices_tensor.stride() == (1,)
+
+
 def test_mixed_regular_and_spec_decode_excludes_request_padding():
     batch = BatchSpec(seq_lens=[16, 65, 20], query_lens=[0, 1, 3])
     common_attn_metadata = create_common_attn_metadata(
