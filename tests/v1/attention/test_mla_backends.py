@@ -27,6 +27,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
+    build_mla_chunked_context_metadata,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
@@ -91,6 +92,47 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
     assert spec.kv_quant_mode == expected_quant_mode
     if cache_dtype == "fp8_ds_mla":
         assert spec.page_size_bytes == 64 * 656
+
+
+@pytest.mark.cpu_test
+def test_dcp_chunked_context_accepts_non_virtual_block_aligned_prefix():
+    context_lens_cpu = torch.tensor([65, 96], dtype=torch.int32)
+    prefill_query_start_loc_cpu = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+    metadata = build_mla_chunked_context_metadata(
+        context_lens_cpu=context_lens_cpu,
+        prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
+        num_prefills=2,
+        chunked_prefill_workspace=torch.empty(0),
+        chunked_prefill_workspace_size=128,
+        block_size=64,
+        align_chunk_to_block=True,
+        device=torch.device("cpu"),
+        dcp_world_size=4,
+        dcp_local_block_size=1,
+        dcp_virtual_block_size=4,
+    )
+
+    assert metadata is not None
+    assert metadata.seq_lens.tolist() == [[64, 64], [1, 32]]
+    assert metadata.starts.tolist() == [[0, 0], [16, 16]]
+    assert metadata.local_context_lens_allranks == [
+        [17, 16, 16, 16],
+        [24, 24, 24, 24],
+    ]
+    assert metadata.padded_local_chunk_seq_lens == [[16, 16], [1, 8]]
+    assert metadata.padded_local_cu_seq_lens is not None
+    assert metadata.padded_local_cu_seq_lens.tolist() == [
+        [0, 16, 32],
+        [0, 1, 9],
+    ]
+    assert metadata.cu_seq_lens.tolist() == [
+        [0, 64, 128],
+        [0, 1, 33],
+    ]
+    assert metadata.chunk_total_token == [128, 33]
+    assert metadata.seq_tot == [32, 9]
+    assert metadata.chunk_size == 16
 
 
 # Remove sm100 backends from the list if not using sm100
