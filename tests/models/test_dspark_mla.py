@@ -63,6 +63,85 @@ def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("fused", [False, True])
+def test_dspark_context_precompute_uses_single_tensor_rope(
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+):
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    cos_sin_cache = object()
+    rotary_emb = SimpleNamespace(
+        head_size=2,
+        cos_sin_cache=cos_sin_cache,
+        is_neox_style=True,
+    )
+    rotary_calls = []
+
+    def rotary_embedding(positions, query, key, head_size, cache, is_neox):
+        rotary_calls.append(
+            (positions.clone(), query.shape, key, head_size, cache, is_neox)
+        )
+
+    monkeypatch.setattr(dspark_mla.ops, "rotary_embedding", rotary_embedding)
+
+    if fused:
+        model._context_kv_fusion_available = True
+        model._num_context_layers = 1
+        model._context_kv_width = 4
+        model._context_kv_lora_rank = 2
+        model._context_rope_dim = 2
+        model._context_rms_norm_eps = 1e-6
+        model._fused_context_kv_weight = torch.arange(12, dtype=torch.float32).view(
+            4, 3
+        )
+        model._context_kv_norm_weights = torch.ones(1, 2)
+        model._context_positions_repeated = torch.empty(2, dtype=torch.int64)
+        model.layers = [
+            SimpleNamespace(self_attn=SimpleNamespace(rotary_emb=rotary_emb))
+        ]
+        monkeypatch.setattr(
+            dspark_mla.ops,
+            "rms_norm",
+            lambda output, inputs, weight, eps: output.copy_(inputs),
+        )
+    else:
+        model._context_kv_fusion_available = False
+
+        def project_context(context_states):
+            values = torch.arange(
+                context_states.shape[0] * 5, dtype=context_states.dtype
+            ).view(context_states.shape[0], 5)
+            return values, None
+
+        model.layers = [
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    fused_qkv_a_proj=project_context,
+                    q_lora_rank=1,
+                    kv_lora_rank=2,
+                    qk_rope_head_dim=2,
+                    kv_a_layernorm=lambda value: value,
+                    rotary_emb=rotary_emb,
+                )
+            )
+        ]
+
+    context_states = torch.arange(6, dtype=torch.float32).view(2, 3)
+    positions = torch.tensor([2, 5])
+    model.precompute_and_store_context_kv(context_states, positions)
+
+    assert len(rotary_calls) == 1
+    actual_positions, query_shape, key, head_size, cache, is_neox = rotary_calls[0]
+    torch.testing.assert_close(actual_positions, positions)
+    assert query_shape == (2, 1, 2)
+    assert key is None
+    assert head_size == 2
+    assert cache is cos_sin_cache
+    assert is_neox
+
+
+@pytest.mark.cpu_test
 def test_dspark_markov_head_is_replicated(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -135,7 +214,8 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
             draft_model_config=SimpleNamespace(hf_config=config)
-        )
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
     )
 
     K3DSparkModel(vllm_config=vllm_config, start_layer_id=0, prefix="model")
