@@ -492,6 +492,35 @@ def test_cudagraph_sizes_post_init(
         )
 
 
+def test_allreduce_fusion_compile_ranges_include_topology_defaults():
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config.tensor_parallel_size = 8
+    vllm_config.model_config = MagicMock(
+        dtype=torch.bfloat16,
+        get_hidden_size=MagicMock(return_value=7168),
+    )
+    vllm_config.compilation_config = CompilationConfig(
+        pass_config=PassConfig(fuse_allreduce_rms=True),
+    )
+
+    with (
+        patch(
+            "vllm._aiter_ops.rocm_aiter_ops.is_custom_all_reduce_enabled",
+            return_value=False,
+        ),
+        patch.object(
+            PassConfig,
+            "flashinfer_max_size",
+            side_effect=[2 * 1024**2, 16 * 1024**2],
+        ),
+    ):
+        vllm_config._set_compile_ranges()
+
+    assert {146, 1170}.issubset(
+        vllm_config.compilation_config.compile_ranges_endpoints or []
+    )
+
+
 @pytest.mark.skipif(
     not current_platform.support_static_graph_mode(),
     reason="Skip if not cudagraph mode supported",

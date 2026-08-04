@@ -91,7 +91,9 @@ def _promote_max_token_num_for_standalone(
         world_size,
         backend,
         group,
-    ) or PassConfig.default_fi_allreduce_fusion_max_size_mb().get(world_size)
+    ) or PassConfig.default_fi_allreduce_fusion_max_size_mb(
+        use_mnnvl_tuning=backend == "mnnvl" and get_node_count() == 1,
+    ).get(world_size)
     if max_size_mb is None:
         return max_token_num
     element_size = torch.empty((), dtype=dtype, device="cpu").element_size()

@@ -16,8 +16,10 @@ numerically identical to the unfused model path.
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
+    get_node_count,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -52,12 +54,19 @@ except (ImportError, AttributeError):
 _FI_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 
-def _max_token_num(tp_size: int, hidden_size: int, dtype: torch.dtype) -> int | None:
+def _max_token_num(
+    tp_size: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    use_mnnvl_tuning: bool = False,
+) -> int | None:
     """Workspace token budget for flashinfer fused all-reduce, or None if the
     current world size / device is unsupported. Mirrors ``FlashInferAllReduce``."""
     from vllm.config.compilation import PassConfig
 
-    max_size_mb = PassConfig.default_fi_allreduce_fusion_max_size_mb().get(tp_size)
+    max_size_mb = PassConfig.default_fi_allreduce_fusion_max_size_mb(
+        use_mnnvl_tuning=use_mnnvl_tuning,
+    ).get(tp_size)
     if not max_size_mb:
         return None
     element_size = torch.tensor([], dtype=dtype).element_size()
@@ -81,7 +90,17 @@ def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool
         return False, 0
 
     num_tokens, hidden_size = hidden_states.shape
-    max_token_num = _max_token_num(tp_size, hidden_size, hidden_states.dtype)
+    group = get_tp_group().cpu_group
+    single_node = get_node_count() == 1
+    use_mnnvl_tuning = (
+        single_node and envs.VLLM_FLASHINFER_ALLREDUCE_BACKEND != "trtllm"
+    )
+    max_token_num = _max_token_num(
+        tp_size,
+        hidden_size,
+        hidden_states.dtype,
+        use_mnnvl_tuning,
+    )
     if max_token_num is None or num_tokens > max_token_num:
         return False, 0
 
@@ -93,10 +112,17 @@ def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool
         max_token_num=max_token_num,
         hidden_dim=hidden_size,
         dtype=hidden_states.dtype,
-        group=get_tp_group().cpu_group,
+        group=group,
     )
     if workspace is None:
         return False, 0
+    actual_mnnvl_tuning = single_node and workspace.backend == "mnnvl"
+    if use_mnnvl_tuning != actual_mnnvl_tuning:
+        max_token_num = _max_token_num(
+            tp_size, hidden_size, hidden_states.dtype, actual_mnnvl_tuning
+        )
+        if max_token_num is None or num_tokens > max_token_num:
+            return False, 0
     return True, max_token_num
 
 

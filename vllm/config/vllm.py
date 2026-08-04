@@ -1964,7 +1964,8 @@ class VllmConfig:
             from vllm._aiter_ops import rocm_aiter_ops
 
             max_size: int | None = None
-            if rocm_aiter_ops.is_custom_all_reduce_enabled():
+            use_aiter = rocm_aiter_ops.is_custom_all_reduce_enabled()
+            if use_aiter:
                 from vllm.distributed.device_communicators.aiter_custom_all_reduce import (  # noqa: E501
                     AiterCustomAllreduce,
                 )
@@ -1985,6 +1986,26 @@ class VllmConfig:
                         "Max num batched tokens below allreduce-rms fusion threshold, "
                         "allreduce-rms fusion will be enabled for all num_tokens."
                     )
+
+            if not use_aiter:
+                tuned_size = compilation_config.pass_config.flashinfer_max_size(
+                    tp_size, use_mnnvl_tuning=True
+                )
+                if (
+                    tuned_size is not None
+                    and tuned_size != max_size
+                    and self.model_config is not None
+                ):
+                    assert isinstance(self.model_config.dtype, torch.dtype)
+                    max_token_num = tuned_size // (
+                        self.model_config.get_hidden_size()
+                        * self.model_config.dtype.itemsize
+                    )
+                    if (
+                        compile_range_end is not None
+                        and max_token_num < compile_range_end
+                    ):
+                        computed_compile_ranges_endpoints.append(max_token_num)
 
         # Add the compile ranges for sequence parallelism
         if compilation_config.pass_config.enable_sp:

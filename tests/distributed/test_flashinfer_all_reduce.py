@@ -38,7 +38,7 @@ def _mock_sm103_tp8_mnnvl(
     monkeypatch.setattr(
         flashinfer_all_reduce.PassConfig,
         "default_fi_allreduce_fusion_max_size_mb",
-        lambda: {8: 2},
+        lambda *, use_mnnvl_tuning=False: {8: 16 if use_mnnvl_tuning else 2},
     )
     return group, group_node_count
 
@@ -151,7 +151,7 @@ def test_primary_initialization_promotes_shared_workspace(
     )
 
 
-def test_non_tuned_fusion_first_promotes_only_to_default_capacity(
+def test_single_node_fusion_first_promotes_to_mnnvl_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group, _ = _mock_sm103_tp8_mnnvl(monkeypatch, node_count=1)
@@ -175,7 +175,7 @@ def test_non_tuned_fusion_first_promotes_only_to_default_capacity(
         "mnnvl",
         8,
         0,
-        146,
+        1170,
         7168,
         torch.bfloat16,
         group,

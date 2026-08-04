@@ -184,7 +184,12 @@ class PassConfig:
 
     # TODO(luka) better pass enabling system.
 
-    def flashinfer_max_size(self, world_size: int) -> int | None:
+    def flashinfer_max_size(
+        self,
+        world_size: int,
+        *,
+        use_mnnvl_tuning: bool = False,
+    ) -> int | None:
         """
         Returns the max communication size in bytes for flashinfer
         allreduce fusion for the given world size. Returns None if world size
@@ -197,12 +202,17 @@ class PassConfig:
             return None
         max_size_mb = self.fi_allreduce_fusion_max_size_mb
         if max_size_mb is None:
-            max_size_mb = self.default_fi_allreduce_fusion_max_size_mb().get(world_size)
+            max_size_mb = self.default_fi_allreduce_fusion_max_size_mb(
+                use_mnnvl_tuning=use_mnnvl_tuning,
+            ).get(world_size)
 
         return int(max_size_mb * MiB) if max_size_mb is not None else None
 
     @staticmethod
-    def default_fi_allreduce_fusion_max_size_mb() -> dict[int, float]:
+    def default_fi_allreduce_fusion_max_size_mb(
+        *,
+        use_mnnvl_tuning: bool = False,
+    ) -> dict[int, float]:
         from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
             FI_ALLREDUCE_FUSION_MAX_SIZE_MB,
         )
@@ -213,7 +223,12 @@ class PassConfig:
         capability = current_platform.get_device_capability()
         if capability is None:
             return {}
-        return FI_ALLREDUCE_FUSION_MAX_SIZE_MB.get(capability.to_int(), {})
+        capability_int = capability.to_int()
+        defaults = FI_ALLREDUCE_FUSION_MAX_SIZE_MB.get(capability_int, {})
+        # Full-glue measurements on one SM103 TP8 node favor 16 MiB.
+        if use_mnnvl_tuning and capability_int == 103:
+            defaults = defaults | {8: 16}
+        return defaults
 
     def compute_hash(self) -> str:
         """

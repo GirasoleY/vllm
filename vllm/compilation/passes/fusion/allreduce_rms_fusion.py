@@ -10,6 +10,7 @@ import torch.fx as fx
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
+import vllm.envs as envs
 import vllm.ir.ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.passes.fusion.rms_quant_fusion import (
@@ -19,6 +20,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
+    get_node_count,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -1012,8 +1014,12 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                 "skipping allreduce fusion pass"
             )
             return
-        max_size = config.compilation_config.pass_config.flashinfer_max_size(
-            self.tp_size
+        pass_config = config.compilation_config.pass_config
+        single_node = get_node_count() == 1
+        max_size = pass_config.flashinfer_max_size(
+            self.tp_size,
+            use_mnnvl_tuning=single_node
+            and envs.VLLM_FLASHINFER_ALLREDUCE_BACKEND != "trtllm",
         )
         if max_size is None:
             # Flashinfer doesn't support current world size
@@ -1030,13 +1036,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.max_token_num = min(
             self.max_token_num, config.scheduler_config.max_num_batched_tokens
         )
-        logger.debug_once(
-            f"Flashinfer max size: {max_size // (1024 * 1024)} MB,"
-            "Maximal number of tokens used by "
-            f"Flashinfer Allreduce Fusion: {self.max_token_num}",
-            scope="global",
-        )
-
         workspace_kwargs = dict(
             world_size=self.tp_size,
             rank=rank,
@@ -1045,12 +1044,31 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             dtype=self.model_dtype,
             group=self.group,
         )
-        if get_fi_ar_workspace(**workspace_kwargs) is None:
+        workspace = get_fi_ar_workspace(**workspace_kwargs)
+        if workspace is None:
             logger.warning_once(
                 "Failed to initialize Flashinfer allreduce workspace. "
                 "Flashinfer allreduce-norm fusion will be disabled."
             )
             return
+
+        max_size = pass_config.flashinfer_max_size(
+            self.tp_size,
+            use_mnnvl_tuning=single_node and workspace.backend == "mnnvl",
+        )
+        assert max_size is not None
+        self.max_token_num = min(
+            max_size // (self.hidden_dim * element_size),
+            config.scheduler_config.max_num_batched_tokens,
+        )
+        workspace_kwargs["max_token_num"] = self.max_token_num
+
+        logger.debug_once(
+            f"Flashinfer max size: {max_size // (1024 * 1024)} MB,"
+            "Maximal number of tokens used by "
+            f"Flashinfer Allreduce Fusion: {self.max_token_num}",
+            scope="global",
+        )
 
         self.supports_quant_fusion = (
             get_fi_ar_quant_workspace(**workspace_kwargs) is not None
