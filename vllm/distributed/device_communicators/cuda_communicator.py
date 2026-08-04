@@ -47,25 +47,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
-        if "tp" not in unique_name:
-            # custom allreduce or torch symm mem can be used only by tp
+        is_tp_group = "tp" in unique_name
+        if not is_tp_group:
+            # Optimized all-reduce backends can be used only by TP groups.
             use_custom_allreduce = False
             use_torch_symm_mem = False
-            use_flashinfer_allreduce = False
             use_aiter_allreduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
-            use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
             use_aiter_allreduce = use_custom_allreduce and bool(
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
-        self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
 
         # lazy import to avoid documentation build error
@@ -102,7 +100,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if self.use_flashinfer_allreduce and self.world_size > 1:
+        if is_tp_group and self.world_size > 1:
             self.fi_ar_comm = FlashInferAllReduce(
                 group=self.cpu_group,
                 device=self.device,
@@ -209,23 +207,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def _log_all_reduce_backend_selection(self) -> None:
         """Log the all-reduce backends that are active for this group.
 
-        The dispatch chain in ``all_reduce`` tries backends in this order and
-        falls through to the next one if the current backend rejects the
-        input (size/dtype gates) or is disabled. The list of "enabled"
-        backends below is the subset of potential backends that may be
-        chosen at dispatch time for this group; the actual per-call choice
-        depends on the input tensor.
+        The dispatch chain tries backends in this order and falls through when
+        a backend rejects an input based on size or dtype.
         """
         all_potential_ar_backends = [
+            "FLASHINFER",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
-            "FLASHINFER",
             "AITER_CUSTOM",
             "CUSTOM",
             "SYMM_MEM",
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
+            enabled_ar_backends.append("FLASHINFER")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
         # VLLM_BATCH_INVARIANT off, NCCL symm mem enabled, world_size meets
         # min_world_size, and world_size either has a tuned entry in
@@ -252,8 +248,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
-        if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
-            enabled_ar_backends.append("FLASHINFER")
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
         if self.ca_comm is not None and not self.ca_comm.disabled:
@@ -273,6 +267,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # Prefer standalone FlashInfer all-reduce whenever it supports the
+        # input. Other backends remain fallbacks.
+        fi_ar_comm = self.fi_ar_comm
+        if (
+            fi_ar_comm is not None
+            and not fi_ar_comm.disabled
+            and fi_ar_comm.should_use_fi_ar(input_)
+        ):
+            out = fi_ar_comm.all_reduce(input_)
+            assert out is not None
+            return out
+
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -281,8 +287,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        # always try quick reduce first, then flashinfer, then the AITER or vLLM
-        # custom allreduce, and then pynccl. (quick reduce just for ROCM MI3*)
+        # Quick reduce is only available on ROCm MI3*.
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -290,15 +295,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and qr_comm.should_quick_allreduce(input_)
         ):
             out = qr_comm.quick_all_reduce(input_)
-            assert out is not None
-            return out
-        fi_ar_comm = self.fi_ar_comm
-        if (
-            fi_ar_comm is not None
-            and not fi_ar_comm.disabled
-            and fi_ar_comm.should_use_fi_ar(input_)
-        ):
-            out = fi_ar_comm.all_reduce(input_)
             assert out is not None
             return out
         aiter_ar_comm = self.aiter_ar_comm

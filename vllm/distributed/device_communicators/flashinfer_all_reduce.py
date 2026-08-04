@@ -14,7 +14,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm.config.compilation import PassConfig
-from vllm.distributed.parallel_state import get_node_count
+from vllm.distributed.parallel_state import _node_count, get_node_count
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -22,6 +22,24 @@ logger = init_logger(__name__)
 
 # The empirical value for small batch
 PDL_ADVANCE_LAUNCH_TOKENS = 16
+
+MiB = 1024 * 1024
+
+# Standalone FlashInfer all-reduce supports these dtypes. Fusion patterns have
+# their own, narrower dtype checks.
+FI_ALLREDUCE_SUPPORTED_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+)
+
+# Full-glue measurements on two GB300 nodes in one NVL72 domain. The values
+# are per-rank input payload limits and intentionally apply only to standalone
+# kAllReduce with the MNNVL backend. At the boundary NCCL symmetric memory is
+# faster, so the comparison is strict (< max size).
+FI_MNNVL_TWO_NODE_ALLREDUCE_MAX_SIZE_MB: dict[int, dict[int, float]] = {
+    103: {8: 84},
+}
 
 fi_ar_available = False
 try:
@@ -34,13 +52,51 @@ try:
 except ImportError:
     pass
 
-# Workspace for standalone allreduce and non-quant ar+rms fusion
+# Workspace shared by standalone all-reduce and non-quant ar+rms fusion.
+# It is sized for the larger standalone dispatch limit on first creation so
+# captured graphs can retain the same pointer for the lifetime of the engine.
 _fi_ar_workspace = None
 # Extra workspace for quant fusion patterns. This may use either the primary
 # allreduce backend or a fallback backend when the primary workspace is not
 # available on the current topology.
 _fi_ar_quant_workspace = None
 _fi_ar_workspace_groups: dict[int, ProcessGroup] = {}
+
+
+def _get_tuned_standalone_max_size_mb(
+    world_size: int,
+    backend: str,
+    group: ProcessGroup,
+) -> float | None:
+    if backend != "mnnvl" or _node_count(group) != 2:
+        return None
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return None
+    return FI_MNNVL_TWO_NODE_ALLREDUCE_MAX_SIZE_MB.get(capability.to_int(), {}).get(
+        world_size
+    )
+
+
+def _promote_max_token_num_for_standalone(
+    max_token_num: int,
+    world_size: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    backend: str,
+    group: ProcessGroup,
+) -> int:
+    """Make a first workspace allocation safe for standalone all-reduce."""
+    max_size_mb = _get_tuned_standalone_max_size_mb(
+        world_size,
+        backend,
+        group,
+    ) or PassConfig.default_fi_allreduce_fusion_max_size_mb().get(world_size)
+    if max_size_mb is None:
+        return max_token_num
+    element_size = torch.empty((), dtype=dtype, device="cpu").element_size()
+    standalone_max_token_num = int(max_size_mb * MiB) // (hidden_dim * element_size)
+    return max(max_token_num, standalone_max_token_num)
 
 
 def _create_workspace(
@@ -147,11 +203,12 @@ def get_fi_ar_workspace(
     group: ProcessGroup,
 ):
     """
-    Return the allreduce workspace for non-quant patterns, initializing if needed.
+    Return the shared standalone/non-quant workspace, initializing if needed.
 
-    Used by AllReduceFusionPass (non-quant patterns) and FlashInferAllReduce
-    for standalone allreduce. Backend is controlled by
-    VLLM_FLASHINFER_ALLREDUCE_BACKEND env var.
+    The workspace is always allocated for at least the standalone all-reduce
+    dispatch limit. This keeps its address stable when fusion initializes it
+    before standalone all-reduce. Fusion eligibility remains controlled by the
+    fusion pass's own, generally smaller, token limit.
     """
     global _fi_ar_workspace
     if _fi_ar_workspace is not None:
@@ -164,6 +221,15 @@ def get_fi_ar_workspace(
             "Flashinfer allreduce is not supported for multi-node allreduce with "
             "'trtllm' backend. Please use 'mnnvl' backend instead."
         )
+
+    max_token_num = _promote_max_token_num_for_standalone(
+        max_token_num,
+        world_size,
+        hidden_dim,
+        dtype,
+        backend,
+        group,
+    )
 
     def _get_or_create(be: str):
         # Reuse the quant workspace if it was already created with the same backend
@@ -184,12 +250,11 @@ def get_fi_ar_workspace(
 
     if _fi_ar_workspace is not None:
         logger.info_once(
-            "Initialized FlashInfer Allreduce norm fusion workspace "
-            f"with backend={backend}"
+            f"Initialized shared FlashInfer all-reduce workspace with backend={backend}"
         )
     else:
         logger.warning_once(
-            "Failed to initialize FlashInfer Allreduce norm fusion workspace "
+            "Failed to initialize shared FlashInfer all-reduce workspace "
             f"with backend={backend}"
         )
 
@@ -346,20 +411,27 @@ class FlashInferAllReduce:
         if self.world_size == 1:
             return
 
-        # Use the same threshold as the allreduce-rms fusion pass
-        # TODO: tune the threshold
-        MiB = 1024 * 1024
-        max_workspace_size = PassConfig.default_fi_allreduce_fusion_max_size_mb().get(
-            self.world_size, None
+        default_max_size_mb = PassConfig.default_fi_allreduce_fusion_max_size_mb().get(
+            self.world_size
         )
-        if not max_workspace_size:
+        if not default_max_size_mb:
             logger.warning(
                 "FlashInfer All Reduce is disabled because it "
                 "is not supported for world_size=%d.",
                 self.world_size,
             )
             return
-        self.max_workspace_size = max_workspace_size * MiB
+
+        backend, _ = _resolve_fi_ar_backend()
+        tuned_max_size_mb = _get_tuned_standalone_max_size_mb(
+            self.world_size,
+            backend,
+            self.group,
+        )
+        max_workspace_size_mb = tuned_max_size_mb or default_max_size_mb
+        assert max_workspace_size_mb is not None
+        self.max_workspace_size = int(max_workspace_size_mb * MiB)
+        self.max_size_is_exclusive = tuned_max_size_mb is not None
         self.max_num_tokens = 0
         self.disabled = False
 
@@ -394,6 +466,15 @@ class FlashInferAllReduce:
         if len(input_tensor.shape) != 2:
             return False
 
+        if input_tensor.dtype not in FI_ALLREDUCE_SUPPORTED_DTYPES:
+            return False
+
+        if input_tensor.nbytes > self.max_workspace_size or (
+            self.max_size_is_exclusive
+            and input_tensor.nbytes >= self.max_workspace_size
+        ):
+            return False
+
         num_tokens, hidden_dim = input_tensor.shape
         if not self.max_num_tokens:
             element_size = torch.tensor([], dtype=input_tensor.dtype).element_size()
@@ -423,5 +504,4 @@ class FlashInferAllReduce:
         )
 
     def destroy(self):
-        if not self.disabled:
-            destroy_fi_ar_workspace()
+        destroy_fi_ar_workspace()
