@@ -1425,3 +1425,40 @@ def test_dcp_full_report_events_use_effective_and_partial_spans():
     ]
     assert full_events[-1].parent_block_hash is not None
     assert mamba_events[-1].parent_block_hash is not None
+
+
+@pytest.mark.parametrize("failed_group", ["full", "mamba"])
+def test_hybrid_invalid_blocks_retry_from_zero(failed_group: str):
+    manager = make_full_mamba_manager(
+        dcp_world_size=2,
+        hash_block_size=4,
+        full_block_size=4,
+        mamba_block_size=4,
+    )
+    request = make_request("hybrid-invalid", list(range(24)), 4, sha256)
+    assert manager.allocate_slots(request, 16) is not None
+    request.num_computed_tokens = 16
+    full_block_ids, mamba_block_ids = manager.get_block_ids(request.request_id)
+    null_block_id = manager.block_pool.null_block.block_id
+    assert all(block_id != null_block_id for block_id in full_block_ids[:2])
+    assert mamba_block_ids[:3] == [null_block_id] * 3
+    assert mamba_block_ids[3] != null_block_id
+    failed_block_id = (
+        full_block_ids[1] if failed_group == "full" else mamba_block_ids[3]
+    )
+    scheduler = SimpleNamespace(kv_cache_manager=manager)
+
+    affected, num_affected_tokens, blocks_to_evict = (
+        Scheduler._update_requests_with_invalid_blocks(
+            scheduler,
+            [request],
+            {failed_block_id},
+            num_scheduled_tokens={},
+            evict_blocks=False,
+        )
+    )
+
+    assert affected == {request.request_id}
+    assert request.num_computed_tokens == 0
+    assert num_affected_tokens == 16
+    assert blocks_to_evict == set()

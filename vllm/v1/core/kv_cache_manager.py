@@ -819,13 +819,13 @@ class KVCacheManager:
         """Re-record the request's blocks from start_token onwards for
         zeroing, e.g. blocks a failed async KV load left unwritten.
 
-        start_token must be block-aligned: zeroing a partially-valid block
-        would wipe its valid prefix.
+        If start_token is inside a block, preserve that overlapping block: its
+        valid prefix must not be wiped, and local recomputation overwrites the
+        suffix before it can be read.
         """
         for mgr in self.coordinator.single_type_managers:
             if mgr.records_new_block_ids:
-                assert start_token % mgr.block_size == 0
-                start_idx = start_token // mgr.block_size
+                start_idx = cdiv(start_token, mgr.block_size)
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 

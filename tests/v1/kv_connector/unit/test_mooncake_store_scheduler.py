@@ -22,6 +22,9 @@ def _make_bare_scheduler(
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
     scheduler.enable_partial_hash_hits = enable_partial_hash_hits
+    scheduler._cache_hit_alignment_tokens = (
+        hash_block_size if enable_partial_hash_hits else scheduler._block_size
+    )
     scheduler.load_specs = {}
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
@@ -127,9 +130,64 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     assert req_meta.req_id == "req-0"
     assert req_meta.can_save is True
     assert req_meta.token_len_chunk == 48
+    assert req_meta.token_ids == list(range(48))
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.token_len == 48
     assert tracker.num_saved_tokens == 48
+    assert tracker.token_ids == list(range(48))
+
+
+def test_cached_prefill_without_new_blocks_crosses_save_boundary():
+    scheduler = _make_bare_scheduler()
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(32)),
+        block_hashes=[b"h0", b"h1"],
+        prefill_end_tokens=32,
+    )
+    tracker = scheduler._request_trackers["req-0"]
+    tracker.token_len = 8
+    tracker.allocated_block_ids = ([0],)
+    tracker.num_saved_tokens = 0
+    tracker.token_ids = list(range(8))
+
+    out = _make_scheduler_output(scheduled_spec_tokens=None)
+    out.scheduled_cached_reqs.new_block_ids = [None]
+    out.scheduled_cached_reqs.num_computed_tokens = [8]
+    out.num_scheduled_tokens["req-0"] = 8
+
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    req_meta = meta.requests[0]
+    assert req_meta.can_save is True
+    assert req_meta.token_len_chunk == 16
+    assert req_meta.block_ids == ([0],)
+    assert tracker.token_len == 16
+    assert tracker.num_saved_tokens == 16
+    assert tracker.token_ids == list(range(16))
+    assert tracker.allocated_block_ids == ([0],)
+
+
+def test_cached_request_reconstructs_token_prefix_after_external_load():
+    scheduler = _make_bare_scheduler()
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(48)),
+        block_hashes=[b"h0", b"h1", b"h2"],
+        prefill_end_tokens=48,
+    )
+    # Trackers created for requests loaded from Mooncake have a token length
+    # but no local token-prefix snapshot.
+    scheduler._request_trackers["req-0"].token_ids = None
+
+    meta = scheduler.build_connector_meta(
+        _make_scheduler_output(scheduled_spec_tokens=None)
+    )
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].token_ids == list(range(48))
+    assert scheduler._request_trackers["req-0"].token_ids == list(range(48))
 
 
 def test_preemption_resets_tracker_before_request_finished():
@@ -682,6 +740,7 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert req_meta.can_save is True
     assert req_meta.token_len_chunk == 0
     assert req_meta.partial_tail_offloads == [(1, 7, 12)]
+    assert req_meta.token_ids == list(range(12))
     assert req_meta.num_prompt_tokens == 12
     assert req_meta.block_ids == ([0],)
     tracker = scheduler._request_trackers["req-0"]

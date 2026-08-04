@@ -66,8 +66,14 @@ class MooncakeStoreScheduler:
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_config.kv_cache_groups, self._hash_block_size
+            kv_cache_config.kv_cache_groups,
+            self._hash_block_size,
+            dcp_world_size=dcp_world_size,
+        )
+        self._cache_hit_alignment_tokens = (
+            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
 
         # Per-request state
@@ -88,9 +94,7 @@ class MooncakeStoreScheduler:
         """
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
-        align = (
-            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
-        )
+        align = self._cache_hit_alignment_tokens
         if request.num_tokens < align:
             return 0, False
 
@@ -218,12 +222,14 @@ class MooncakeStoreScheduler:
             self._request_trackers[request.req_id] = request_tracker
 
             last_chunk_tokens_num = (
-                len(prefill_tokens) // self._block_size * self._block_size
+                len(prefill_tokens)
+                // self._cache_hit_alignment_tokens
+                * self._cache_hit_alignment_tokens
             )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                self._block_size,
+                self._cache_hit_alignment_tokens,
                 load_spec=load_spec,
                 skip_save=force_skip_save,
                 block_hashes=request_real.block_hashes,
@@ -237,12 +243,12 @@ class MooncakeStoreScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
-                    continue
 
                 req_meta = None
                 if req_id in cached_reqs.resumed_req_ids:
                     # Resumed after preemption
+                    if not new_block_ids:
+                        continue
                     if isinstance(new_block_ids, tuple):
                         new_block_ids = tuple(b.copy() for b in new_block_ids)
                     else:
@@ -268,11 +274,13 @@ class MooncakeStoreScheduler:
                     self._request_trackers[req_id] = request_tracker
 
                     last_chunk_tokens_num = (
-                        len(prefill_tokens) // self._block_size * self._block_size
+                        len(prefill_tokens)
+                        // self._cache_hit_alignment_tokens
+                        * self._cache_hit_alignment_tokens
                     )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._cache_hit_alignment_tokens,
                         load_spec=load_spec,
                         skip_save=force_skip_save,
                         block_hashes=request_real.block_hashes,
@@ -283,6 +291,12 @@ class MooncakeStoreScheduler:
                 else:
                     # Decode/chunked request
                     request_tracker = self._request_trackers[req_id]
+                    num_computed_token = cached_reqs.num_computed_tokens[i]
+                    # Use the tracker's snapshot of the prefill range so resumed
+                    # requests keep saving past the original prompt boundary.
+                    prefill_end = request_tracker.prefill_end_tokens
+                    if num_computed_token >= prefill_end:
+                        continue
                     num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
                     req_tuple = self._unfinished_requests.get(req_id)
                     if req_tuple:
@@ -291,25 +305,33 @@ class MooncakeStoreScheduler:
                         new_token_ids = unfinished_req.all_token_ids[
                             num_current_tokens : num_current_tokens + num_new_tokens
                         ]
+                        if request_tracker.token_ids is None:
+                            request_tracker.token_ids = list(
+                                unfinished_req.all_token_ids[:num_current_tokens]
+                            )
+                        elif len(request_tracker.token_ids) < num_current_tokens:
+                            request_tracker.token_ids.extend(
+                                unfinished_req.all_token_ids[
+                                    len(request_tracker.token_ids) : num_current_tokens
+                                ]
+                            )
+                        request_tracker.token_ids.extend(new_token_ids)
                         request_tracker.token_len += len(new_token_ids)
                     else:
                         raise ValueError(
                             f"Request {req_id} is not in _unfinished_requests"
                         )
-                    num_computed_token = cached_reqs.num_computed_tokens[i]
-                    # Use the tracker's snapshot of the prefill range so resumed
-                    # requests keep saving past the original prompt boundary.
-                    prefill_end = request_tracker.prefill_end_tokens
-                    if num_computed_token >= prefill_end:
-                        continue
-                    request_tracker.update(new_block_ids)
+                    if new_block_ids:
+                        request_tracker.update(new_block_ids)
 
                     last_chunk_tokens_num = (
-                        prefill_end // self._block_size * self._block_size
+                        prefill_end
+                        // self._cache_hit_alignment_tokens
+                        * self._cache_hit_alignment_tokens
                     )
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._cache_hit_alignment_tokens,
                         load_spec=None,
                         skip_save=force_skip_save,
                         block_hashes=unfinished_req.block_hashes,
@@ -341,7 +363,7 @@ class MooncakeStoreScheduler:
                 self._request_trackers[request_id] = request_tracker
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
-                    self._block_size,
+                    self._cache_hit_alignment_tokens,
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,
@@ -382,6 +404,7 @@ class MooncakeStoreScheduler:
                         block_ids=tracker.allocated_block_ids,
                         block_hashes=req_tuple[0].block_hashes,
                         can_save=True,
+                        token_ids=tracker.token_ids,
                         num_prompt_tokens=tracker.prefill_end_tokens,
                         partial_tail_offloads=groups,
                     )

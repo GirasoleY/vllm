@@ -2780,55 +2780,50 @@ class Scheduler(SchedulerInterface):
         marked_invalid_block_ids: set[int] = set()
         for request in requests:
             is_affected = False
-            marked_invalid_block = False
+            truncate_boundary: int | None = None
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
+            block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
+            managers = self.kv_cache_manager.coordinator.single_type_managers
+            for req_block_ids, manager in zip(
+                block_ids_by_group, managers, strict=True
+            ):
+                for idx, block_id in enumerate(req_block_ids):
+                    boundary = idx * manager.block_size
+                    if boundary >= req_num_computed_tokens:
+                        break
+                    if block_id not in invalid_block_ids:
+                        continue
 
-                is_affected = True
+                    is_affected = True
+                    if block_id in marked_invalid_block_ids:
+                        # A previous request will recompute this shared block.
+                        continue
 
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
+                    marked_invalid_block_ids.add(block_id)
+                    truncate_boundary = (
+                        boundary
+                        if truncate_boundary is None
+                        else min(truncate_boundary, boundary)
+                    )
 
-                marked_invalid_block_ids.add(block_id)
+                    # Collect the invalid block and dependent blocks in the
+                    # same cache group.
+                    if evict_blocks:
+                        blocks_to_evict.update(req_block_ids[idx:])
 
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
-                )
-                total_affected_tokens += num_affected_tokens
-
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+            if is_affected and self.kv_cache_manager.kv_cache_config.has_mamba_layers:
+                # A hybrid external load materializes only the endpoint Mamba
+                # snapshot, so no earlier failure boundary is proven valid.
+                truncate_boundary = 0
 
             if is_affected:
-                if not marked_invalid_block:
+                if truncate_boundary is None:
                     # All invalid blocks of this request are shared with
                     # previous requests and will be recomputed by them.
                     # Revert to considering only cached tokens as computed.
@@ -2838,6 +2833,9 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens - req_num_computed_tokens
                     )
                     request.num_computed_tokens = req_num_computed_tokens
+                else:
+                    request.num_computed_tokens = truncate_boundary
+                    total_affected_tokens += req_num_computed_tokens - truncate_boundary
 
                 affected_req_ids.add(request.request_id)
 
