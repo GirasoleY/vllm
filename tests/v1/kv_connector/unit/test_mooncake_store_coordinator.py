@@ -8,6 +8,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
+    partial_hash_hits_enabled,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     chunk_hashes_for_block_size,
@@ -30,7 +31,13 @@ def _mamba_align(block_size=32):
     )
 
 
-def _make_coord(groups, hash_block_size, use_eagle=False, retention_interval=None):
+def _make_coord(
+    groups,
+    hash_block_size,
+    use_eagle=False,
+    retention_interval=None,
+    dcp_world_size=1,
+):
     """Construct a coordinator using the natural LCM of group block sizes as
     the scheduler block size — mirrors ``resolve_kv_cache_block_sizes`` for
     the test fixtures."""
@@ -42,6 +49,7 @@ def _make_coord(groups, hash_block_size, use_eagle=False, retention_interval=Non
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
         retention_interval=retention_interval,
+        dcp_world_size=dcp_world_size,
     )
 
 
@@ -249,6 +257,74 @@ def test_coordinator_fine_grained_clips_when_one_group_missing_tail():
         hs, max_length=64, cached_block_pool=cmap
     )
     assert hit == 32
+
+
+def test_dcp_full_mamba_joint_hit_uses_hash_alignment():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(8)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(4)),
+    ]
+    coord = _make_coord(groups, hash_block_size=4, dcp_world_size=2)
+    hs = _hashes(4)
+    exists = {
+        (0, bytes(hs[1])),
+        (0, bytes(hs[2])),
+        (1, bytes(hs[2])),
+    }
+
+    masks, hit = coord.find_longest_cache_hit(
+        hs, max_length=12, cached_block_pool=ExternalCachedBlockPool(4, exists)
+    )
+
+    assert coord.enable_partial_hash_hits
+    assert coord.cache_hit_alignment_tokens == 4
+    assert hit == 12
+    assert masks == ([True, True], [False, False, True])
+
+
+def test_dcp_enables_hash_alignment_when_raw_group_sizes_equal_hash_size():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(32)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(32)),
+    ]
+
+    assert partial_hash_hits_enabled(groups, 32, dcp_world_size=8)
+
+
+def test_dcp_partial_hit_policy_matches_raw_and_effective_group_sizes():
+    raw_groups = [
+        KVCacheGroupSpec(["full"], _full(4)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(8)),
+    ]
+    effective_groups = [
+        KVCacheGroupSpec(["full"], _full(8)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(8)),
+    ]
+
+    assert partial_hash_hits_enabled(raw_groups, 8, dcp_world_size=2)
+    assert partial_hash_hits_enabled(effective_groups, 8, dcp_world_size=2)
+
+
+def test_dcp_full_mamba_joint_hit_requires_exact_reconciled_key():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(16)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(4)),
+    ]
+    coord = _make_coord(groups, hash_block_size=4, dcp_world_size=2)
+    hs = _hashes(3)
+    exists = {
+        (0, bytes(hs[0])),
+        (0, bytes(hs[2])),
+        (1, bytes(hs[0])),
+        (1, bytes(hs[1])),
+    }
+
+    masks, hit = coord.find_longest_cache_hit(
+        hs, max_length=12, cached_block_pool=ExternalCachedBlockPool(4, exists)
+    )
+
+    assert hit == 4
+    assert masks == ([True], [True])
 
 
 # ----- store_mask -----

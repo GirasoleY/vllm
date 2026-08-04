@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+from .coordinator import is_simple_full_mamba_hybrid
 from .data import MooncakeStoreConnectorMetadata
 from .metrics import MooncakeStoreConnectorStats, MooncakeStorePromMetrics
 from .scheduler import MooncakeStoreScheduler
@@ -116,9 +117,16 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 )
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
         dcp = vllm_config.parallel_config.decode_context_parallel_size
-        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
+        if len(kv_cache_config.kv_cache_groups) > 1 and pcp > 1:
+            unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+        if (
+            len(kv_cache_config.kv_cache_groups) > 1
+            and dcp > 1
+            and not is_simple_full_mamba_hybrid(kv_cache_config.kv_cache_groups)
+        ):
             unsupported.append(
-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+                "DCP > 1 with a non-simple hybrid layout; only one "
+                "FullAttentionSpec plus one align-mode MambaSpec is supported"
             )
         if unsupported:
             raise ValueError(
