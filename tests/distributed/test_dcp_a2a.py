@@ -615,53 +615,90 @@ def _distributed_direct_a2a_worker(env: dict[str, str]) -> None:
         cases = ((1, False), (17, False), (5, True), (17, True))
         for iteration, (num_tokens, padded) in enumerate(cases):
             check(num_tokens, iteration, padded)
-        generator = torch.Generator(device=device)
-        generator.manual_seed(4321 + rank)
-        partial_output_storage = torch.randn(
-            5,
-            128,
-            head_dim,
-            device=device,
-            dtype=dtype,
-            generator=generator,
-        )
-        partial_lse_storage = torch.randn(
-            5,
-            128,
-            device=device,
-            dtype=torch.float32,
-            generator=generator,
-        )
-        partial_output = partial_output_storage[:, :total_heads, :]
-        partial_lse = partial_lse_storage[:, :total_heads]
-        assert not partial_output.is_contiguous()
-        assert not partial_lse.is_contiguous()
-        torch.accelerator.synchronize()
-        active_ubatch[0] = 1
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = workspace.lse_reduce(partial_output, partial_lse, is_lse_base_on_e)
-        for _ in range(3):
-            graph.replay()
+        graph_cases = []
+        for ubatch in range(2):
+            generator = torch.Generator(device=device)
+            generator.manual_seed(4321 + rank + ubatch * world_size)
+            partial_output_storage = torch.randn(
+                5,
+                128,
+                head_dim,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            partial_lse_storage = torch.randn(
+                5,
+                128,
+                device=device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            partial_output = partial_output_storage[:, :total_heads, :]
+            partial_lse = partial_lse_storage[:, :total_heads]
+            assert not partial_output.is_contiguous()
+            assert not partial_lse.is_contiguous()
+            torch.accelerator.synchronize()
+            active_ubatch[0] = ubatch
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = workspace.lse_reduce(
+                    partial_output, partial_lse, is_lse_base_on_e
+                )
+            graph_cases.append(
+                (
+                    graph,
+                    actual,
+                    partial_output_storage,
+                    partial_lse_storage,
+                    partial_output,
+                    partial_lse,
+                    generator,
+                )
+            )
+
+        for replay_order in ((0, 1), (1, 0), (0, 1)):
+            for ubatch in replay_order:
+                (
+                    graph,
+                    _actual,
+                    partial_output_storage,
+                    partial_lse_storage,
+                    _partial_output,
+                    _partial_lse,
+                    generator,
+                ) = graph_cases[ubatch]
+                partial_output_storage.normal_(generator=generator)
+                partial_lse_storage.normal_(generator=generator)
+                graph.replay()
         torch.accelerator.synchronize()
 
-        reference_output = partial_output.contiguous()
-        reference_lse = partial_lse.contiguous()
-        gathered_output = [
-            torch.empty_like(reference_output) for _ in range(world_size)
-        ]
-        gathered_lse = [torch.empty_like(reference_lse) for _ in range(world_size)]
-        dist.all_gather(gathered_output, reference_output)
-        dist.all_gather(gathered_lse, reference_lse)
         head_slice = slice(rank * heads_per_rank, (rank + 1) * heads_per_rank)
-        outputs = torch.stack(
-            [value[:, head_slice, :] for value in gathered_output]
-        ).float()
-        lses = torch.stack([value[:, head_slice] for value in gathered_lse])
-        expected = _lse_weighted_combine(
-            outputs, lses, is_lse_base_on_e=is_lse_base_on_e
-        )
-        _assert_packed_a2a_close(actual, expected, dtype)
+        for (
+            _graph,
+            actual,
+            _partial_output_storage,
+            _partial_lse_storage,
+            partial_output,
+            partial_lse,
+            _generator,
+        ) in graph_cases:
+            reference_output = partial_output.contiguous()
+            reference_lse = partial_lse.contiguous()
+            gathered_output = [
+                torch.empty_like(reference_output) for _ in range(world_size)
+            ]
+            gathered_lse = [torch.empty_like(reference_lse) for _ in range(world_size)]
+            dist.all_gather(gathered_output, reference_output)
+            dist.all_gather(gathered_lse, reference_lse)
+            outputs = torch.stack(
+                [value[:, head_slice, :] for value in gathered_output]
+            ).float()
+            lses = torch.stack([value[:, head_slice] for value in gathered_lse])
+            expected = _lse_weighted_combine(
+                outputs, lses, is_lse_base_on_e=is_lse_base_on_e
+            )
+            _assert_packed_a2a_close(actual, expected, dtype)
     finally:
         dist.destroy_process_group()
 
