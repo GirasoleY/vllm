@@ -583,6 +583,8 @@ class WorkerProcHandle:
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
+    MQ_READY_STR = "MQ_READY"
+    MQ_ATTACHED_STR = "MQ_ATTACHED"
     READY_STR = "READY"
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
@@ -629,6 +631,7 @@ class WorkerProc:
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
+        mq_ready_callback: Callable[[MessageQueue, list[Handle]], None] | None = None,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
@@ -658,11 +661,14 @@ class WorkerProc:
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
 
-        # Message queue init must come after init_device() so that
-        # _INNER_DP_WORLD is initialized for multi-node setups
-        # (nnodes_within_dp > 1), but before a long model load so readers
-        # attach while the POSIX shared-memory name is still available.
-        self._init_message_queues(input_shm_handle, vllm_config)
+        # Multiproc workers can hand their handles to the parent immediately,
+        # so create and attach both queue directions before a long model load.
+        # Ray initializes actors through a separate RPC and cannot complete
+        # that handshake concurrently; retain its post-load queue order.
+        if mq_ready_callback is not None:
+            self._init_message_queues(input_shm_handle, vllm_config)
+            assert self.worker_response_mq is not None
+            mq_ready_callback(self.worker_response_mq, self.peer_response_handles)
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
@@ -683,6 +689,9 @@ class WorkerProc:
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
 
+        if mq_ready_callback is None:
+            self._init_message_queues(input_shm_handle, vllm_config)
+
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -700,7 +709,10 @@ class WorkerProc:
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
-        ready_reader, ready_writer = context.Pipe(duplex=False)
+        # The worker publishes response-queue handles before model loading and
+        # waits for an attachment acknowledgement from the parent. A duplex
+        # pipe makes that pre-load barrier explicit.
+        ready_reader, ready_writer = context.Pipe(duplex=True)
         # Death pipe to let child detect parent process exit
         death_reader, death_writer = context.Pipe(duplex=False)
         if inherited_fds is not None:
@@ -771,6 +783,9 @@ class WorkerProc:
         )
 
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
+        mq_ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
+            unready_proc_handles
+        )
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
         )
@@ -778,24 +793,52 @@ class WorkerProc:
             ready = multiprocessing.connection.wait(pipes.keys())
             for pipe in ready:
                 assert isinstance(pipe, Connection)
+                close_pipe = False
                 try:
-                    # Wait until the WorkerProc is ready.
-                    unready_proc_handle = pipes.pop(pipe)
+                    unready_proc_handle = pipes[pipe]
                     response: dict[str, Any] = pipe.recv()
-                    if response["status"] != "READY":
-                        raise e
-
+                    status = response.get("status")
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
-                    ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
-                        response, unready_proc_handle
-                    )
+
+                    if status == WorkerProc.MQ_READY_STR:
+                        if mq_ready_proc_handles[idx] is not None:
+                            raise e
+                        # Attach the parent-side response queues before the
+                        # worker begins a potentially long model load. POSIX
+                        # shm names may be unlinked after attachment without
+                        # invalidating the existing mappings, but a delayed
+                        # attachment cannot recover once the name is gone.
+                        mq_ready_proc_handles[idx] = (
+                            WorkerProc.wait_for_response_handle_ready(
+                                response, unready_proc_handle
+                            )
+                        )
+                        # Do not let the worker enter model loading until its
+                        # parent has opened every response queue represented by
+                        # this message. This removes the final send/attach race.
+                        pipe.send({"status": WorkerProc.MQ_ATTACHED_STR})
+                        continue
+
+                    if status != WorkerProc.READY_STR:
+                        raise e
+                    proc_handle = mq_ready_proc_handles[idx]
+                    if proc_handle is None:
+                        raise e
+                    ready_proc_handles[idx] = proc_handle
+                    pipes.pop(pipe)
+                    close_pipe = True
                 except EOFError:
+                    pipes.pop(pipe, None)
+                    close_pipe = True
                     e.__suppress_context__ = True
                     raise e from None
-
+                except Exception:
+                    pipes.pop(pipe, None)
+                    close_pipe = True
+                    raise
                 finally:
-                    # Close connection.
-                    pipe.close()
+                    if close_pipe:
+                        pipe.close()
 
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
@@ -894,21 +937,33 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
-            worker = WorkerProc(*args, **kwargs)
+            def notify_mq_ready(
+                worker_response_mq: MessageQueue,
+                peer_response_handles: list[Handle],
+            ) -> None:
+                ready_writer.send(
+                    {
+                        "status": WorkerProc.MQ_READY_STR,
+                        "handle": worker_response_mq.export_handle(),
+                        "peer_response_handles": peer_response_handles,
+                    }
+                )
+                response = ready_writer.recv()
+                if response.get("status") != WorkerProc.MQ_ATTACHED_STR:
+                    raise RuntimeError(
+                        "parent did not acknowledge message-queue attachment"
+                    )
+
+            worker = WorkerProc(*args, mq_ready_callback=notify_mq_ready, **kwargs)
             assert worker.worker_response_mq is not None
             if kwargs["vllm_config"].parallel_config.numa_bind:
                 numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
-            # Send READY once we know everything is loaded
-            ready_writer.send(
-                {
-                    "status": WorkerProc.READY_STR,
-                    "handle": worker.worker_response_mq.export_handle(),
-                    "peer_response_handles": worker.peer_response_handles,
-                }
-            )
+            # The parent already attached response queues after MQ_READY.
+            # Send final READY only once model loading has completed.
+            ready_writer.send({"status": WorkerProc.READY_STR})
 
             # Ensure message queues are ready. Will deadlock if re-ordered.
             # Must be kept consistent with the Executor
