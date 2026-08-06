@@ -642,6 +642,13 @@ class WorkerProc:
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
+
+        # Message queue init must come after init_device() so that
+        # _INNER_DP_WORLD is initialized for multi-node setups
+        # (nnodes_within_dp > 1), but before a long model load so readers
+        # attach while the POSIX shared-memory name is still available.
+        self._init_message_queues(input_shm_handle, vllm_config)
+
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
         else:
@@ -660,10 +667,6 @@ class WorkerProc:
 
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
-
-        # Initialize message queues after init_device() since multi-node setups
-        # (nnodes_within_dp > 1) require distributed groups to be initialized
-        self._init_message_queues(input_shm_handle, vllm_config)
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
