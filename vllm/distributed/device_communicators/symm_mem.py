@@ -23,6 +23,10 @@ logger = init_logger(__name__)
 
 
 class SymmMemCommunicator:
+    _LOW_SM_DEVICE_CAPABILITIES = ("10.0", "10.3")
+    _LOW_SM_WORLD_SIZE = 8
+    _LOW_SM_SEMAPHORE_SLOTS = 4
+    _LOW_SM_SEMAPHORE_BYTES = 128
     _WORLD_SIZES_MULTIMEM = {
         "9.0": [4, 6, 8],
         "10.0": [6, 8],
@@ -39,6 +43,9 @@ class SymmMemCommunicator:
         max_size_override: int | None = None,
     ):
         self.disabled = True
+        self._buffer_mc_ptr = 0
+        self._low_sm_semaphore: torch.Tensor | None = None
+        self._low_sm_semaphore_mc_ptr = 0
 
         if not symm_mem_available:
             return
@@ -54,6 +61,7 @@ class SymmMemCommunicator:
         self.dtype = torch.bfloat16
         self.device = device
         self.group = group
+        self.rank = dist.get_rank(self.group)
         self.world_size = dist.get_world_size(self.group)
         capability = current_platform.get_device_capability()
         if capability is None:
@@ -103,12 +111,14 @@ class SymmMemCommunicator:
                 str(e),
             )
             return
-        if handle.multicast_ptr == 0:
+        self._buffer_mc_ptr = int(handle.multicast_ptr)
+        if self._buffer_mc_ptr == 0:
             logger.warning(
                 "SymmMemCommunicator: symmetric memory "
                 "multicast operations are not supported."
             )
             return
+        self._initialize_low_sm_semaphore()
         self.force_multimem = force_multimem
         self.disabled = False
         if envs.VLLM_BATCH_INVARIANT:
@@ -123,6 +133,118 @@ class SymmMemCommunicator:
         if inp_size % 4 != 0:
             return False
         return inp_size <= self.max_size
+
+    def _initialize_low_sm_semaphore(self) -> None:
+        if (
+            envs.VLLM_KIMI_K3_LATENT_AR_OVERLAP_MAX_TOKENS <= 0
+            or envs.VLLM_BATCH_INVARIANT
+            or self.device_capability not in self._LOW_SM_DEVICE_CAPABILITIES
+            or self.world_size != self._LOW_SM_WORLD_SIZE
+            or not hasattr(torch.ops._C, "kimi_k3_low_sm_all_reduce_")
+        ):
+            return
+        try:
+            semaphore = torch_symm_mem.empty(
+                self._LOW_SM_SEMAPHORE_SLOTS * self._LOW_SM_SEMAPHORE_BYTES,
+                device=self.device,
+                dtype=torch.uint8,
+            )
+            handle = torch_symm_mem.rendezvous(semaphore, self.group.group_name)
+        except RuntimeError as e:
+            logger.warning_once(
+                "SymmMemCommunicator: low-SM semaphore initialization failed: %s",
+                str(e),
+            )
+            return
+        semaphore.zero_()
+        torch.accelerator.synchronize()
+        dist.barrier(group=self.group)
+        semaphore_mc_ptr = int(handle.multicast_ptr)
+        if semaphore_mc_ptr == 0:
+            logger.warning(
+                "SymmMemCommunicator: low-SM semaphore does not have a "
+                "multicast mapping."
+            )
+            return
+        self._low_sm_semaphore = semaphore
+        self._low_sm_semaphore_mc_ptr = semaphore_mc_ptr
+
+    def has_low_sm_all_reduce(self) -> bool:
+        """Return whether the multicast all-reduce is available.
+
+        This is intentionally stricter than :meth:`should_use_symm_mem`:
+        the overlap-oriented path must use the low-occupancy multimem kernel
+        and must never fall back to the two-shot kernel.
+        """
+        if self.disabled:
+            return False
+        return self._low_sm_semaphore is not None and self._low_sm_semaphore_mc_ptr != 0
+
+    def _validate_low_sm_all_reduce_input(self, inp: torch.Tensor) -> None:
+        if not self.has_low_sm_all_reduce():
+            capability = getattr(self, "device_capability", "unknown")
+            world_size = getattr(self, "world_size", "unknown")
+            raise RuntimeError(
+                "Low-SM symmetric-memory all-reduce is unavailable for "
+                f"compute capability {capability} and world size {world_size}."
+            )
+        if inp.device != self.device:
+            raise ValueError(
+                "Low-SM symmetric-memory all-reduce requires input on "
+                f"{self.device}, but got {inp.device}."
+            )
+        if inp.dtype != self.dtype:
+            raise ValueError(
+                "Low-SM symmetric-memory all-reduce requires "
+                f"{self.dtype}, but got {inp.dtype}."
+            )
+        if not inp.is_contiguous():
+            raise ValueError(
+                "Low-SM symmetric-memory all-reduce requires contiguous input."
+            )
+        if inp.numel() == 0 or inp.numel() % 8 != 0:
+            raise ValueError(
+                "Low-SM symmetric-memory all-reduce requires a non-empty "
+                "input whose element count is divisible by 8."
+            )
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size > self.max_size:
+            raise ValueError(
+                "Low-SM symmetric-memory all-reduce input is too large: "
+                f"{inp_size} bytes exceeds the {self.max_size}-byte workspace."
+            )
+
+    def stage_low_sm_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """Copy ``inp`` once into the persistent symmetric destination.
+
+        The communicator owns one data workspace, so callers must finish the
+        corresponding all-reduce and its consumers before staging another
+        tensor on this communicator.
+        """
+        self._validate_low_sm_all_reduce_input(inp)
+        stage = self.buffer[: inp.numel()].view_as(inp)
+        stage.copy_(inp)
+        return stage
+
+    def all_reduce_low_sm(self, inp: torch.Tensor) -> torch.Tensor:
+        """All-reduce a staged symmetric input in place using four CTAs."""
+        self._validate_low_sm_all_reduce_input(inp)
+        if inp.data_ptr() != self.buffer.data_ptr():
+            raise ValueError(
+                "Low-SM all-reduce input must be the prefix of the communicator's "
+                "symmetric buffer. Call stage_low_sm_all_reduce() first."
+            )
+        semaphore = self._low_sm_semaphore
+        assert semaphore is not None
+        torch.ops._C.kimi_k3_low_sm_all_reduce_(
+            inp.view(-1),
+            self._buffer_mc_ptr,
+            semaphore,
+            self._low_sm_semaphore_mc_ptr,
+            self.rank,
+            self.world_size,
+        )
+        return inp
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: torch.Tensor | None = None

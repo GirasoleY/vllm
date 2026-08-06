@@ -1,25 +1,177 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import ray
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import vllm.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
+import vllm.models.kimi_k3.nvidia.latent_moe_runner as latent_moe_runner
 from tests.utils import (
     init_test_distributed_environment,
     multi_gpu_test,
     multi_process_parallel,
 )
 from vllm.distributed import get_tp_group
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
+from vllm.models.kimi_k3.nvidia.latent_moe_runner import LatentMoERunner
 from vllm.models.kimi_k3.nvidia.ops.latent_moe_tail import KimiK3LatentMoETailOp
 from vllm.platforms import current_platform
 
 HIDDEN_SIZE = 7168
 LATENT_SIZE = 3584
 EPS = 0.1
+
+
+class _SharedExpertsOrderStub:
+    def __init__(self, order: SharedExpertsOrder) -> None:
+        self.order = order
+
+    def _determine_shared_experts_order(
+        self, hidden_states: torch.Tensor
+    ) -> SharedExpertsOrder:
+        return self.order
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "dtype", "order", "expected"),
+    [
+        (256, torch.bfloat16, SharedExpertsOrder.NO_OVERLAP, False),
+        (257, torch.bfloat16, SharedExpertsOrder.NO_OVERLAP, True),
+        (512, torch.bfloat16, SharedExpertsOrder.NO_OVERLAP, True),
+        (513, torch.bfloat16, SharedExpertsOrder.NO_OVERLAP, False),
+        (448, torch.float32, SharedExpertsOrder.NO_OVERLAP, False),
+        (448, torch.bfloat16, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED, False),
+    ],
+)
+def test_latent_allreduce_overlap_window(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    dtype: torch.dtype,
+    order: SharedExpertsOrder,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "256")
+    runner = object.__new__(LatentMoERunner)
+    runner.__dict__["_latent_ar_overlap_max_tokens"] = 512
+    runner.__dict__["_shared_experts"] = _SharedExpertsOrderStub(order)
+    runner.__dict__["moe_config"] = SimpleNamespace(
+        tp_size=8, dp_size=1, ep_size=1, pcp_size=1
+    )
+    runner.__dict__["enable_k3_latent_moe_tail_fusion"] = False
+    hidden_states = torch.empty(num_tokens, 1, dtype=dtype)
+    assert runner._use_latent_allreduce_overlap(hidden_states) is expected
+
+
+def test_latent_allreduce_overlap_runner_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeline: list[str] = []
+
+    class SharedExpertsStub(_SharedExpertsOrderStub):
+        output: torch.Tensor
+
+        def __call__(
+            self, hidden_states: torch.Tensor, order: SharedExpertsOrder
+        ) -> None:
+            assert order is SharedExpertsOrder.NO_OVERLAP
+            timeline.append("shared")
+            self.output = hidden_states + 1
+
+    class RoutedExpertsStub:
+        def forward_monolithic(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+            timeline.append("routed")
+            return x * 3
+
+    class TPGroupStub:
+        def stage_low_sm_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+            timeline.append("stage")
+            return tensor.clone()
+
+        def all_reduce_low_sm(self, tensor: torch.Tensor) -> torch.Tensor:
+            timeline.append("latent_ar")
+            return tensor.mul_(2)
+
+    class IdentityNorm:
+        def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+            timeline.append("latent_norm")
+            return tensor.clone()
+
+    def execute_aux_first(default_fn, aux_fns, *args, **kwargs):
+        aux_results = [fn() for fn in aux_fns]
+        return default_fn(), aux_results
+
+    def primary_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+        timeline.append("final_ar")
+        return tensor * 2
+
+    monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "256")
+    monkeypatch.setattr(latent_moe_runner, "get_tp_group", lambda: TPGroupStub())
+    monkeypatch.setattr(latent_moe_runner, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(latent_moe_runner, "aux_stream", object)
+    monkeypatch.setattr(latent_moe_runner, "execute_in_parallel", execute_aux_first)
+    monkeypatch.setattr(
+        latent_moe_runner,
+        "tensor_model_parallel_all_reduce",
+        primary_all_reduce,
+    )
+    monkeypatch.setattr(
+        moe_runner,
+        "tensor_model_parallel_all_reduce",
+        primary_all_reduce,
+    )
+
+    runner = object.__new__(LatentMoERunner)
+    runner.__dict__.update(
+        _latent_ar_overlap_max_tokens=512,
+        _shared_experts=SharedExpertsStub(SharedExpertsOrder.NO_OVERLAP),
+        _overlap_events=(object(), object()),
+        routed_experts=RoutedExpertsStub(),
+        routed_output_transform=SimpleNamespace(
+            norm=IdentityNorm(),
+            up_proj=SimpleNamespace(weight=torch.eye(8, dtype=torch.bfloat16)),
+        ),
+        moe_config=SimpleNamespace(
+            tp_size=8,
+            dp_size=1,
+            ep_size=1,
+            pcp_size=1,
+            skip_final_all_reduce=False,
+            is_sequence_parallel=False,
+        ),
+        enable_k3_latent_moe_tail_fusion=False,
+        _fused_output_is_reduced=False,
+    )
+    hidden_states = torch.ones(257, 8, dtype=torch.bfloat16)
+    shared_input = torch.full_like(hidden_states, 2)
+
+    shared_output, fused_output = runner._apply_quant_method(
+        hidden_states,
+        torch.empty(257, 1, dtype=torch.bfloat16),
+        shared_input,
+    )
+    actual = runner._shard_up_proj_tail(
+        fused_output, shared_output, None, latent_is_reduced=True
+    )
+
+    expected = (shared_input + 1) * 2
+    expected[:, :1].add_(hidden_states[:, :1] * 12)
+    torch.testing.assert_close(actual, expected)
+    assert timeline == [
+        "routed",
+        "stage",
+        "latent_ar",
+        "latent_norm",
+        "shared",
+        "final_ar",
+    ]
 
 
 @ray.remote(num_gpus=1, max_calls=1)

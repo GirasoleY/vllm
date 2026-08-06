@@ -340,6 +340,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_low_sm(self, input_: torch.Tensor) -> torch.Tensor:
+        """Run the in-place low-SM symmetric-memory all-reduce."""
+        symm_mem_comm = self.symm_mem_comm
+        if symm_mem_comm is None:
+            raise RuntimeError("Low-SM symmetric-memory all-reduce is unavailable")
+        return symm_mem_comm.all_reduce_low_sm(input_)
+
+    def stage_low_sm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """Copy once into the low-SM all-reduce's symmetric destination."""
+        symm_mem_comm = self.symm_mem_comm
+        if symm_mem_comm is None:
+            raise RuntimeError("Low-SM symmetric-memory all-reduce is unavailable")
+        return symm_mem_comm.stage_low_sm_all_reduce(input_)
+
+    def low_sm_all_reduce_max_size(self) -> int:
+        symm_mem_comm = self.symm_mem_comm
+        if symm_mem_comm is None or not symm_mem_comm.has_low_sm_all_reduce():
+            return 0
+        return symm_mem_comm.max_size
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:

@@ -15,6 +15,7 @@ from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 from vllm.distributed.parallel_state import (
     get_tp_group,
     init_distributed_environment,
@@ -29,6 +30,13 @@ torch.manual_seed(42)
 random.seed(44)
 
 test_size_elements = 1024 * 1024
+
+
+@pytest.mark.skip_global_cleanup
+def test_disabled_symm_mem_has_no_low_sm_all_reduce():
+    communicator = SymmMemCommunicator.__new__(SymmMemCommunicator)
+    communicator.disabled = True
+    assert not communicator.has_low_sm_all_reduce()
 
 
 def symm_mem_allreduce_worker(local_rank: int, world_size: int, q: mp.Queue):
@@ -94,6 +102,73 @@ def symm_mem_allreduce_worker(local_rank: int, world_size: int, q: mp.Queue):
         )
 
 
+def low_sm_symm_mem_allreduce_worker(local_rank: int, world_size: int, q: mp.Queue):
+    monkeypatch = pytest.MonkeyPatch()
+    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world_size))
+
+    with monkeypatch.context() as m, set_current_vllm_config(config):
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.accelerator.set_device_index(device)
+        torch.set_default_device(device)
+        torch.set_default_dtype(torch.bfloat16)
+        update_environment_variables(
+            {
+                "RANK": str(local_rank),
+                "LOCAL_RANK": str(local_rank),
+                "WORLD_SIZE": str(world_size),
+                "MASTER_ADDR": "localhost",
+                "MASTER_PORT": "12346",
+                "VLLM_ALLREDUCE_USE_SYMM_MEM": "1",
+                "VLLM_KIMI_K3_LATENT_AR_OVERLAP_MAX_TOKENS": "512",
+            }
+        )
+
+        init_distributed_environment()
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
+
+        tp_group = get_tp_group()
+        if tp_group.low_sm_all_reduce_max_size() == 0:
+            # can't use skip under multiprocessing
+            q.put("Low-SM symmetric-memory all-reduce is not available.")
+            return
+
+        rank = tp_group.rank_in_group
+        inp = torch.randn((448, 3584), dtype=torch.bfloat16, device=device)
+        expected = inp.clone()
+        dist.all_reduce(expected, group=tp_group.device_group)
+
+        staged = tp_group.stage_low_sm_all_reduce(inp)
+        assert staged.data_ptr() != inp.data_ptr()
+        result = tp_group.all_reduce_low_sm(staged)
+        assert result.data_ptr() == staged.data_ptr()
+        torch.testing.assert_close(result, expected, atol=4e-2, rtol=2e-2)
+
+        # The specialized path must not silently accept an unsupported dtype.
+        with pytest.raises(ValueError, match="requires torch.bfloat16"):
+            tp_group.all_reduce_low_sm(torch.ones(8, dtype=torch.float32))
+        with pytest.raises(ValueError, match="must be the prefix"):
+            tp_group.all_reduce_low_sm(torch.ones(8, dtype=torch.bfloat16))
+
+        # Capture and replay the copy plus the in-place persistent-buffer path.
+        static_input = torch.full(
+            (512, 3584), rank + 1, dtype=torch.bfloat16, device=device
+        )
+        graph = torch.cuda.CUDAGraph()
+        torch.accelerator.synchronize()
+        with torch.cuda.graph(graph):
+            graph_stage = tp_group.stage_low_sm_all_reduce(static_input)
+            graph_result = tp_group.all_reduce_low_sm(graph_stage)
+        assert graph_result.data_ptr() == graph_stage.data_ptr()
+
+        for replay in range(4):
+            static_input.fill_(rank + replay + 1)
+            graph.replay()
+            torch.accelerator.synchronize()
+            expected_value = world_size * (world_size + 1) // 2 + replay * world_size
+            assert torch.all(graph_result == expected_value).cpu().item()
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="SymmMemAllreduce is only available for CUDA platforms.",
@@ -109,6 +184,31 @@ def test_symm_mem_allreduce(
         pytest.skip("Not enough GPUs to run the test.")
     q = mp.get_context("spawn").Queue()
     mp.spawn(symm_mem_allreduce_worker, args=(world_size, q), nprocs=world_size)
+    try:
+        val = q.get(timeout=1)
+    except queue.Empty:
+        val = None
+    finally:
+        cleanup_dist_env_and_memory()
+        if val is not None:
+            pytest.skip(val)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Low-SM symmetric-memory all-reduce is CUDA-only.",
+)
+@pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda"], reason="Only test on CUDA")
+def test_low_sm_symm_mem_allreduce():
+    world_size = 8
+    if world_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    q = mp.get_context("spawn").Queue()
+    mp.spawn(
+        low_sm_symm_mem_allreduce_worker,
+        args=(world_size, q),
+        nprocs=world_size,
+    )
     try:
         val = q.get(timeout=1)
     except queue.Empty:

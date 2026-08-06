@@ -688,6 +688,48 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
+    def all_reduce_low_sm(self, input_: torch.Tensor) -> torch.Tensor:
+        """Run an in-place all-reduce designed for compute overlap."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        if not isinstance(self.device_communicator, CudaCommunicator):
+            raise RuntimeError("Low-SM all-reduce requires CUDA")
+        return self.device_communicator.all_reduce_low_sm(input_)
+
+    def stage_low_sm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """Stage an input into the low-SM all-reduce's symmetric buffer."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        if not isinstance(self.device_communicator, CudaCommunicator):
+            raise RuntimeError("Low-SM all-reduce requires CUDA")
+        return self.device_communicator.stage_low_sm_all_reduce(input_)
+
+    def low_sm_all_reduce_max_size(self) -> int:
+        if self.device_communicator is None:
+            return 0
+
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        if not isinstance(self.device_communicator, CudaCommunicator):
+            return 0
+        return self.device_communicator.low_sm_all_reduce_max_size()
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
