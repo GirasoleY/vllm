@@ -294,19 +294,25 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
+        n = idx_mapping.shape[0]
         if not isinstance(num_sampled, int):
             # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
             # kernel skips them rather than scattering with a host-side gather.
-            n = idx_mapping.shape[0]
             if n:
                 _scatter_num_accepted_kernel[(n,)](
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
                 )
         else:
-            # Fill with single value.
-            self.num_accepted_tokens_gpu.index_fill_(
-                0, idx_mapping, max(num_sampled, 1)
-            )
+            # The V2 InputBatch mapping is int32 and can contain -1 sentinels
+            # for filtered PP rows. torch.index_fill_ requires int64 indices
+            # and would treat -1 as the last slot, so use a sentinel-aware GPU
+            # kernel without allocating or synchronizing on the host.
+            if n:
+                _fill_num_accepted_kernel[(n,)](
+                    idx_mapping,
+                    self.num_accepted_tokens_gpu,
+                    max(num_sampled, 1),
+                )
 
         # Align: save the running state to the block-aligned position when
         # spec-decode acceptance leaves the sequence non-block-aligned (mirrors
@@ -340,3 +346,16 @@ def _scatter_num_accepted_kernel(
         return
     num_sampled = tl.load(num_sampled_ptr + row)
     tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))
+
+
+@triton.jit
+def _fill_num_accepted_kernel(
+    idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
+    num_accepted_ptr,  # [max_num_reqs]
+    value: tl.constexpr,
+):
+    row = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + row)
+    if req_state_idx < 0:
+        return
+    tl.store(num_accepted_ptr + req_state_idx, value)
