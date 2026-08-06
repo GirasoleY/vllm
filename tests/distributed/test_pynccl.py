@@ -15,6 +15,7 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
 from vllm.distributed.parallel_state import (
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
     get_tp_group,
     get_world_group,
@@ -163,6 +164,105 @@ def worker_fn_with_cudagraph():
         graph.replay()
         torch.accelerator.synchronize()
         assert torch.all(a_out == pynccl_comm.world_size).cpu().item()
+
+
+@worker_fn_wrapper
+def multistream_allreduce_with_cudagraph_worker_fn():
+    """Capture side-AR, compute, then primary-AR on two communicators."""
+    with torch.no_grad():
+        primary_comm = PyNcclCommunicator(
+            get_world_group().cpu_group, device=get_world_group().device
+        )
+        side_comm = PyNcclCommunicator(
+            get_world_group().cpu_group, device=get_world_group().device
+        )
+        device = primary_comm.device
+        rank = primary_comm.rank
+        aux_stream = torch.cuda.Stream(device=device)
+
+        graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        inputs: dict[int, torch.Tensor] = {}
+        outputs: dict[int, torch.Tensor] = {}
+        fork_event = torch.cuda.Event()
+        join_event = torch.cuda.Event()
+        for rows in (448, 512):
+            graph = torch.cuda.CUDAGraph()
+            static_input = torch.full(
+                (rows, 7168), rank + 1, dtype=torch.bfloat16, device=device
+            )
+            with torch.cuda.graph(graph):
+                shared_partial = static_input * 2
+                main_stream = torch.cuda.current_stream()
+                shared_partial.record_stream(aux_stream)
+                fork_event.record()
+                with torch.cuda.stream(aux_stream):
+                    fork_event.wait()
+                    shared_output = side_comm.all_reduce(
+                        shared_partial, out_tensor=shared_partial
+                    )
+                    assert shared_output.data_ptr() == shared_partial.data_ptr()
+                    join_event.record()
+
+                routed_output = static_input + 3
+                join_event.wait()
+                shared_output.record_stream(main_stream)
+                routed_output = primary_comm.all_reduce(
+                    routed_output, out_tensor=routed_output
+                )
+                output = shared_output + routed_output
+
+            graphs[rows] = graph
+            inputs[rows] = static_input
+            outputs[rows] = output
+
+        world_size = primary_comm.world_size
+        for replay in range(32):
+            rows = (448, 512)[replay % 2]
+            inputs[rows].fill_(rank + replay + 1)
+            graphs[rows].replay()
+            torch.accelerator.synchronize()
+
+            rank_sum = world_size * (world_size + 1 + 2 * replay) // 2
+            expected = 3 * rank_sum + 3 * world_size
+            assert torch.all(outputs[rows] == expected).cpu().item()
+
+        # CUDA graphs retain captured NCCL communicators. Release the graph
+        # objects before explicitly destroying either communicator.
+        graphs.clear()
+        del graph
+        side_comm.destroy()
+        primary_comm.destroy()
+
+
+@worker_fn_wrapper
+def k3_shared_expert_group_allreduce_worker_fn():
+    """Exercise the production TP-group wiring at K3 payload sizes."""
+    os.environ["VLLM_KIMI_K3_SHARED_EXPERT_AR_MAX_TOKENS"] = "512"
+    with ensure_current_vllm_config():
+        ensure_model_parallel_initialized(8, 1)
+
+    tp_group = get_tp_group()
+    assert tp_group.has_shared_expert_pynccl()
+    device = tp_group.device
+    rank = tp_group.rank_in_group
+
+    for iteration, num_tokens in enumerate((257, 448, 512)):
+        torch.manual_seed(100 * iteration + rank + 1)
+        actual = torch.randn(
+            num_tokens,
+            7168,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        expected = actual.clone()
+        torch.distributed.all_reduce(expected, group=tp_group.device_group)
+
+        pointer = actual.data_ptr()
+        result = tp_group.all_reduce_shared_expert_pynccl(actual)
+        assert result.data_ptr() == pointer
+        torch.testing.assert_close(result, expected, atol=4e-2, rtol=2e-2)
+
+    destroy_model_parallel()
 
 
 @worker_fn_wrapper
@@ -364,6 +464,22 @@ def test_pynccl_reduce_scatterv():
 )
 def test_pynccl_with_cudagraph():
     distributed_run(worker_fn_with_cudagraph, 2)
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+)
+def test_pynccl_multistream_allreduce_with_cudagraph():
+    distributed_run(multistream_allreduce_with_cudagraph_worker_fn, 2)
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 8
+    or torch.cuda.get_device_capability(0)[0] != 10,
+    reason="Need eight SM100-family GPUs to run the K3 TP-group test.",
+)
+def test_k3_shared_expert_group_allreduce():
+    distributed_run(k3_shared_expert_group_allreduce_worker_fn, 8)
 
 
 @worker_fn_wrapper

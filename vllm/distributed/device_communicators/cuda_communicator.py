@@ -82,11 +82,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
+        self.shared_expert_pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
+            pynccl_group = (
+                self.cpu_group if tcp_store_group is None else tcp_store_group
+            )
             self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
+                group=pynccl_group,
                 device=self.device,
             )
+            if (
+                envs.VLLM_KIMI_K3_SHARED_EXPERT_AR_MAX_TOKENS > 0
+                and envs.VLLM_KIMI_K3_SHARED_EXPERT_AR_MAX_TOKENS
+                > envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                and not envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+                and current_platform.is_cuda()
+                and unique_name.split(":", 1)[0] == "tp"
+                and self.world_size == 8
+                and current_platform.is_device_capability_family(100)
+            ):
+                # The side-stream collective needs its own communicator so
+                # graph replay cannot race eager collectives on the primary TP
+                # communicator.
+                self.shared_expert_pynccl_comm = PyNcclCommunicator(
+                    group=pynccl_group,
+                    device=self.device,
+                )
             if is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
@@ -340,6 +361,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_shared_expert_pynccl(self, input_: torch.Tensor) -> torch.Tensor:
+        """In-place all-reduce on K3's dedicated side-stream communicator."""
+        if not input_.is_contiguous():
+            raise ValueError(
+                "Shared-expert PyNccl all-reduce requires contiguous input"
+            )
+        pynccl_comm = self.shared_expert_pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError("Shared-expert PyNccl communicator is unavailable")
+        out = pynccl_comm.all_reduce(input_, out_tensor=input_)
+        assert out is not None
+        return out
+
+    def has_shared_expert_pynccl(self) -> bool:
+        pynccl_comm = self.shared_expert_pynccl_comm
+        return pynccl_comm is not None and not pynccl_comm.disabled
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:
@@ -570,6 +608,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self.shared_expert_pynccl_comm is not None:
+            self.shared_expert_pynccl_comm.destroy()
+            self.shared_expert_pynccl_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

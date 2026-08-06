@@ -688,6 +688,34 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
+    def all_reduce_shared_expert_pynccl(self, input_: torch.Tensor) -> torch.Tensor:
+        """Reduce K3 shared-expert output on its dedicated communicator."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        if not isinstance(self.device_communicator, CudaCommunicator):
+            raise RuntimeError("Shared-expert all-reduce requires CUDA")
+        return self.device_communicator.all_reduce_shared_expert_pynccl(input_)
+
+    def has_shared_expert_pynccl(self) -> bool:
+        if self.device_communicator is None:
+            return False
+
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        return (
+            isinstance(self.device_communicator, CudaCommunicator)
+            and self.device_communicator.has_shared_expert_pynccl()
+        )
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.

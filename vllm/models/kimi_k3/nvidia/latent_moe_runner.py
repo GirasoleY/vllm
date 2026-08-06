@@ -5,16 +5,24 @@ from enum import IntEnum
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner, _unpack
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.platforms import current_platform
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.multi_stream_utils import (
+    execute_in_parallel,
+    maybe_execute_in_parallel,
+)
 from vllm.utils.torch_utils import aux_stream
 
 logger = init_logger(__name__)
@@ -116,6 +124,61 @@ class LatentMoERunner(MoERunner):
             )
             self._k3_latent_moe_tail_op = op
 
+        requested_ar_max_tokens = envs.VLLM_KIMI_K3_SHARED_EXPERT_AR_MAX_TOKENS
+        shared_ar_min_tokens = max(
+            envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD + 1,
+            1,
+        )
+        if requested_ar_max_tokens < 0:
+            raise ValueError(
+                "VLLM_KIMI_K3_SHARED_EXPERT_AR_MAX_TOKENS must be non-negative."
+            )
+        if 0 < requested_ar_max_tokens < shared_ar_min_tokens:
+            raise ValueError(
+                "VLLM_KIMI_K3_SHARED_EXPERT_AR_MAX_TOKENS must be zero or "
+                f"at least {shared_ar_min_tokens}."
+            )
+        self._shared_expert_ar_max_tokens = 0
+        can_overlap_shared_ar = (
+            requested_ar_max_tokens >= shared_ar_min_tokens
+            and use_fused_path
+            and self.moe_config.tp_size == 8
+            and self.moe_config.dp_size == 1
+            and self.moe_config.ep_size == 1
+            and self.moe_config.pcp_size == 1
+            and self._quant_method.is_monolithic
+            and self._shared_experts is not None
+            and not self.enable_dbo
+            and not envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+            and get_tp_group().has_shared_expert_pynccl()
+        )
+        if can_overlap_shared_ar:
+            if is_breakable_cudagraph_enabled():
+                raise ValueError(
+                    "K3 shared-expert all-reduce overlap currently requires "
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH=0."
+                )
+            vllm_config = get_current_vllm_config()
+            if vllm_config.parallel_config.use_ubatching:
+                raise ValueError(
+                    "K3 shared-expert all-reduce overlap does not support ubatching."
+                )
+            transform = self.routed_output_transform
+            assert transform is not None
+            if transform.up_proj.weight.dtype != torch.bfloat16:
+                raise ValueError(
+                    "K3 shared-expert all-reduce overlap requires bfloat16."
+                )
+            self._shared_expert_ar_max_tokens = requested_ar_max_tokens
+        elif requested_ar_max_tokens >= shared_ar_min_tokens:
+            logger.warning_once(
+                "K3 shared-expert all-reduce overlap was requested but is not "
+                "supported by this parallelism, quantization, or platform "
+                "configuration. Falling back to the default MoE schedule."
+            )
+
     def _get_zero_residual(
         self,
         hidden_states: torch.Tensor,
@@ -151,6 +214,86 @@ class LatentMoERunner(MoERunner):
             and not self._fused_output_is_reduced
             and not self.moe_config.is_sequence_parallel
         )
+
+    def _use_shared_expert_allreduce_overlap(
+        self,
+        shared_experts_input: torch.Tensor,
+    ) -> bool:
+        num_tokens = shared_experts_input.shape[0]
+        config = self.moe_config
+        if (
+            self._shared_expert_ar_max_tokens == 0
+            or config.tp_size != 8
+            or config.dp_size != 1
+            or config.ep_size != 1
+            or config.pcp_size != 1
+            or num_tokens <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            or num_tokens > self._shared_expert_ar_max_tokens
+            or shared_experts_input.dtype != torch.bfloat16
+        ):
+            return False
+        if self.enable_k3_latent_moe_tail_fusion and (
+            num_tokens <= self._k3_latent_moe_tail_op.contract.max_num_tokens
+        ):
+            return False
+
+        shared_experts = self._shared_experts
+        assert shared_experts is not None
+        return (
+            shared_experts._determine_shared_experts_order(shared_experts_input)
+            == SharedExpertsOrder.NO_OVERLAP
+        )
+
+    def _apply_quant_method(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        if shared_experts_input is None or not (
+            self._use_shared_expert_allreduce_overlap(shared_experts_input)
+        ):
+            return super()._apply_quant_method(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        shared_experts = self._shared_experts
+        assert shared_experts is not None
+
+        # These expert GEMMs consume nearly the full per-SM shared-memory
+        # budget and cannot co-reside. Run shared compute first, then overlap
+        # only its low-SM collective with the routed BMM.
+        self._maybe_apply_shared_experts(
+            shared_experts_input,
+            SharedExpertsOrder.NO_OVERLAP,
+        )
+        shared_partial = shared_experts.output
+        stream = aux_stream()
+        assert stream is not None
+
+        fused_output, shared_outputs = execute_in_parallel(
+            lambda: self.routed_experts.forward_monolithic(
+                x=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            ),
+            [
+                lambda: get_tp_group().all_reduce_shared_expert_pynccl(
+                    shared_partial
+                )
+            ],
+            self._shared_ar_events[0],
+            [self._shared_ar_events[1]],
+            [stream],
+            enable=True,
+        )
+        shared_output = shared_outputs[0]
+        assert isinstance(shared_output, torch.Tensor)
+        return shared_output, fused_output
 
     def _select_tail_tier(
         self,
@@ -267,6 +410,29 @@ class LatentMoERunner(MoERunner):
             shared_output, trunc_size, output_is_reduced=False
         )
 
+    def _shared_allreduce_tail(
+        self,
+        fused_output: torch.Tensor,
+        shared_output: torch.Tensor,
+        trunc_size: int | None,
+    ) -> torch.Tensor:
+        """Finish after the shared all-reduce overlapped routed experts."""
+        transform = self.routed_output_transform
+        assert transform is not None
+
+        if transform.norm is not None:
+            fused_latent = self.allreduce_norm_latent_out(
+                fused_output, transform.norm
+            )
+        else:
+            fused_latent = tensor_model_parallel_all_reduce(fused_output)
+
+        result = torch.mm(fused_latent, transform.up_proj.weight.t())
+        result.add_(shared_output)
+        return self._maybe_reduce_final_output(
+            result, trunc_size, output_is_reduced=True
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -297,6 +463,10 @@ class LatentMoERunner(MoERunner):
             hidden_states, shared_experts_input = self.apply_routed_input_transform(
                 hidden_states
             )
+        assert shared_experts_input is not None
+        shared_output_is_reduced = self._use_shared_expert_allreduce_overlap(
+            shared_experts_input
+        )
         hidden_states, og_hidden_dim_pre_xform, og_hidden_dim_post_xform = (
             self._maybe_pad_hidden_states(
                 shared_experts_input,
@@ -321,13 +491,16 @@ class LatentMoERunner(MoERunner):
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-        tier = self._select_tail_tier(fused_output, shared_output)
-        if tier is LatentTailTier.TAIL_FUSION:
-            latent_tail = self._small_batch_tail
-        elif tier is LatentTailTier.ALLREDUCE_OVERLAP:
-            latent_tail = self._overlap_allreduce_tail
+        if shared_output_is_reduced:
+            latent_tail = self._shared_allreduce_tail
         else:
-            latent_tail = self._shard_up_proj_tail
+            tier = self._select_tail_tier(fused_output, shared_output)
+            if tier is LatentTailTier.TAIL_FUSION:
+                latent_tail = self._small_batch_tail
+            elif tier is LatentTailTier.ALLREDUCE_OVERLAP:
+                latent_tail = self._overlap_allreduce_tail
+            else:
+                latent_tail = self._shard_up_proj_tail
 
         result = latent_tail(fused_output, shared_output, og_hidden_dim_post_xform)
 
