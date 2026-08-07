@@ -1021,6 +1021,21 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
+                if self.needs_kv_cache_zeroing and num_external_computed_tokens:
+                    # A connector owns the externally supplied token range.
+                    # Do not wipe those freshly allocated attention rows before
+                    # start_load_kv() runs. This is required for both async
+                    # transfers and synchronous resident-KV connectors such as
+                    # DecodeBenchConnector; locally computed suffix blocks are
+                    # still zeroed normally.
+                    self._skip_zero_block_ids.update(
+                        self.kv_cache_manager.get_zeroing_block_ids_in_range(
+                            request.request_id,
+                            num_new_local_computed_tokens,
+                            num_computed_tokens,
+                        )
+                    )
+
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
@@ -1048,16 +1063,6 @@ class Scheduler(SchedulerInterface):
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
                     self._inflight_prefills.add(request)
-                    if self.needs_kv_cache_zeroing:
-                        # Skip zeroing of the blocks the async load will
-                        # overwrite; the zeroing could race the write.
-                        self._skip_zero_block_ids.update(
-                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
-                                request.request_id,
-                                num_new_local_computed_tokens,
-                                num_computed_tokens,
-                            )
-                        )
                     continue
 
                 self.running.append(request)
