@@ -29,6 +29,11 @@ Usage:
         - fill_mean (float): Mean value for random normal fill (default: 0.015)
         - fill_std (float): Standard deviation for random fill (default: 0.0)
           Set to 0 for constant values, >0 for random sampling
+        - synthetic_request_id_prefix (str | None): If set, only request IDs
+          beginning with this prefix are reported as externally cached. This
+          is intended for a primer-only DecodeBench fallback behind a real
+          external-cache connector in MultiConnector. Requests outside the
+          primer cohort report no synthetic hit (default: None).
 """
 
 from dataclasses import dataclass
@@ -45,7 +50,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionMetadata
 
 if TYPE_CHECKING:
@@ -61,17 +65,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class DecodeBenchConnectorMetadata(KVConnectorMetadata):
-    """Metadata for DecodeBenchConnector.
-
-    Contains information about which requests need their KV cache filled
-    with dummy values for benchmarking purposes.
-    """
-
-    # request_id -> (block_ids_per_group, num_tokens_to_fill)
-    # block_ids_per_group is a tuple of lists, one per KV cache group
-    # For standard attention: single group, e.g., ([1, 2, 3],)
-    # For MLA: multiple groups, e.g., ([1, 2], [1, 2])
-    reqs_to_fill: dict[str, tuple[tuple[list[int], ...], int]]
+    """Empty metadata: all worker cache tensors are filled at startup."""
 
 
 class DecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
@@ -184,16 +178,22 @@ class DecodeBenchConnectorScheduler:
 
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
-        self.block_size = vllm_config.cache_config.block_size
 
-        # Track which requests have already been filled
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        self.synthetic_request_id_prefix = kv_transfer_config.get_from_extra_config(
+            "synthetic_request_id_prefix", None
+        )
+        if self.synthetic_request_id_prefix is not None and (
+            not isinstance(self.synthetic_request_id_prefix, str)
+            or not self.synthetic_request_id_prefix
+        ):
+            raise ValueError(
+                "synthetic_request_id_prefix must be a non-empty string or null"
+            )
+
+        # Track which requests have already reported a synthetic hit.
         self._filled_requests: set[str] = set()
-
-        # Track pending fills for the current scheduler step
-        # request_id -> (block_ids_per_group, num_tokens_to_fill)
-        # Note: _pending_fills doesn't need explicit cleanup - it's cleared
-        # after build_connector_meta() is called in the same scheduler step
-        self._pending_fills: dict[str, tuple[tuple[list[int], ...], int]] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -201,8 +201,7 @@ class DecodeBenchConnectorScheduler:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """
-        For new requests, return the number of tokens that should be filled
-        with dummy KV cache values.
+        Report a synthetic external hit for an eligible new request.
 
         Returns:
             (num_tokens_to_fill, is_async)
@@ -212,8 +211,16 @@ class DecodeBenchConnectorScheduler:
         """
         req_id = request.request_id
 
-        # Only fill once per request on first scheduling
+        # Only report once per request on first scheduling.
         if req_id in self._filled_requests:
+            return 0, False
+
+        # In a MultiConnector primer, this makes DecodeBench fail closed for
+        # every measured request. A Mooncake miss therefore computes cold
+        # instead of silently falling through to synthetic KV.
+        if self.synthetic_request_id_prefix is not None and not req_id.startswith(
+            self.synthetic_request_id_prefix
+        ):
             return 0, False
 
         # Calculate how many tokens we need to fill
@@ -225,70 +232,22 @@ class DecodeBenchConnectorScheduler:
         if num_tokens_to_fill == 0:
             return 0, False
 
-        # Return False for synchronous operation - the fill is fast enough
-        # that async overhead isn't worth it
+        # The worker pool was filled at startup, so the blocks are immediately
+        # usable once allocated.
         return num_tokens_to_fill, False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        """
-        Called after blocks are allocated. Store the block IDs so we can
-        fill them with dummy values.
-
-        Supports both standard attention (single KV cache group) and MLA
-        (multiple KV cache groups).
-        """
-        req_id = request.request_id
-
+        """Mark a request after its pre-filled blocks have been allocated."""
         if num_external_tokens == 0:
             return
-
-        # Get the block IDs that were allocated
-        # block_groups is a tuple of lists, one per KV cache group
-        # For standard attention: 1 group
-        # For MLA: multiple groups (one per attention type)
-        block_groups = blocks.get_block_ids()
-
-        # Calculate how many blocks we need to fill
-        # num_external_tokens are the tokens we said we'd provide
-        num_blocks_to_fill = cdiv(num_external_tokens, self.block_size)
-
-        # Extract the first num_blocks_to_fill blocks from each group
-        # All groups should have the same block IDs for the same request
-        block_ids_per_group = tuple(
-            group_blocks[:num_blocks_to_fill] for group_blocks in block_groups
-        )
-
-        # Store the blocks to fill for all group. _pending_fills doesn't need cleanup
-        # as it's cleared after build_connector_meta
-        self._pending_fills[req_id] = (
-            block_ids_per_group,
-            num_external_tokens,
-        )
-        self._filled_requests.add(req_id)
-
-        logger.debug(
-            "DecodeBenchConnector: Allocated %d blocks across %d KV cache groups "
-            "for request %s",
-            num_blocks_to_fill,
-            len(block_groups),
-            req_id,
-        )
+        self._filled_requests.add(request.request_id)
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> KVConnectorMetadata:
-        """
-        Build metadata containing information about which blocks to fill
-        with dummy KV values.
-        """
-        meta = DecodeBenchConnectorMetadata(reqs_to_fill=self._pending_fills.copy())
-
-        # Clear pending fills after building metadata
-        self._pending_fills.clear()
-
-        return meta
+        return DecodeBenchConnectorMetadata()
 
     def request_finished(self, request: "Request"):
         """
