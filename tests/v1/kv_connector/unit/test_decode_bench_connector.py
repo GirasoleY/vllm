@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the benchmark-only DecodeBenchConnector."""
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
@@ -10,6 +12,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
     DecodeBenchConnector,
     DecodeBenchConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
 )
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
@@ -140,6 +145,34 @@ def test_primer_prefix_accepts_only_primer_request_ids():
     assert scheduler_output.num_scheduled_tokens[primer.request_id] == 1
     assert scheduler_output.num_scheduled_tokens[measured_warm.request_id] == 48
     assert scheduler_output.num_scheduled_tokens[measured_cold.request_id] == 48
+
+
+def test_mooncake_first_decode_bench_fallback_is_primer_only():
+    runner = DecodeBenchTestRunner(
+        block_size=16,
+        num_gpu_blocks=100,
+        synthetic_request_id_prefix="cmpl-seed-warm-",
+    )
+    primer = runner.new_request([1] * 48, "cmpl-seed-warm-0001-0-random")
+    measured_warm = runner.new_request([2] * 48, "cmpl-measure-warm-0001-0-random")
+    measured_cold = runner.new_request([3] * 48, "cmpl-measure-cold-0001-0-random")
+
+    mooncake = MagicMock()
+    mooncake.get_num_new_matched_tokens.side_effect = (
+        lambda request, _: (32, False)
+        if request.request_id.startswith("cmpl-measure-warm-")
+        else (0, False)
+    )
+    multi = object.__new__(MultiConnector)
+    multi._connectors = [mooncake, runner.scheduler_connector]
+    multi._requests_to_connector = {}
+
+    assert multi.get_num_new_matched_tokens(primer, 0) == (47, False)
+    assert multi._requests_to_connector[primer.request_id] == 1
+    assert multi.get_num_new_matched_tokens(measured_warm, 0) == (32, False)
+    assert multi._requests_to_connector[measured_warm.request_id] == 0
+    assert multi.get_num_new_matched_tokens(measured_cold, 0) == (0, False)
+    assert measured_cold.request_id not in multi._requests_to_connector
 
 
 @pytest.mark.parametrize("prefix", ["", 1, False, []])
