@@ -17,6 +17,11 @@ from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
 from vllm.v1.request import Request
 
 from .utils import create_model_runner_output, create_scheduler, create_vllm_config
@@ -173,6 +178,27 @@ def test_explicit_warm_and_cold_boundaries_schedule_exact_suffixes():
         assert all(block_id != 0 for block_id in block_ids)
 
 
+def test_sync_external_attention_blocks_are_not_zeroed():
+    runner = DecodeBenchTestRunner(require_explicit_cache_spec=True)
+    runner.scheduler.needs_kv_cache_zeroing = True
+    manager = runner.scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    manager._record_new_block_ids = True
+    warm = runner.new_request([1] * 48, num_cached_tokens=32, cache_salt="unique-warm")
+    cold = runner.new_request([2] * 48, num_cached_tokens=0, cache_salt="unique-cold")
+
+    scheduler_output, _ = runner.run_single_step()
+
+    warm_ids = runner.last_allocated_block_ids[warm.request_id][0]
+    cold_ids = runner.last_allocated_block_ids[cold.request_id][0]
+    # Warm blocks 0 and 1 hold the synchronous external prefix and retain the
+    # startup fill. Its locally computed suffix block, plus every cold block,
+    # still follows K3's normal zero-before-compute path.
+    assert set(scheduler_output.new_block_ids_to_zero or []) == {
+        warm_ids[2],
+        *cold_ids,
+    }
+
+
 def test_explicit_boundary_returns_only_tokens_beyond_local_hit():
     runner = DecodeBenchTestRunner()
     request = runner.new_request([1] * 48, num_cached_tokens=32)
@@ -276,6 +302,51 @@ def test_startup_fill_preserves_null_block_for_hybrid_state_tensors():
     for cache in (attention, *states):
         assert torch.count_nonzero(cache[0]) == 0
         assert torch.allclose(cache[1:], torch.full_like(cache[1:], 0.015))
+
+
+def test_startup_fill_unpacks_raw_mamba_pages_and_preserves_padding():
+    vllm_config = create_vllm_config(
+        block_size=16,
+        kv_connector="DecodeBenchConnector",
+        kv_connector_extra_config={"require_explicit_cache_spec": True},
+    )
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 3), (4,)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=32,
+        mamba_cache_mode="align",
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["mamba"], spec)],
+    )
+    connector = DecodeBenchConnector(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        kv_cache_config,
+    )
+    raw_pages = torch.full((4, 1, 1, spec.page_size_bytes), -1, dtype=torch.int8)
+
+    connector.register_kv_caches({"mamba": raw_pages})
+
+    pages = raw_pages.squeeze(dim=(1, 2))
+    first_state_bytes = 2 * 3 * torch.tensor([], dtype=torch.bfloat16).element_size()
+    second_state_bytes = 4 * torch.tensor([], dtype=torch.float32).element_size()
+    first_state = pages[1:, :first_state_bytes].view(torch.bfloat16).view(3, 2, 3)
+    second_state = (
+        pages[1:, first_state_bytes : first_state_bytes + second_state_bytes]
+        .view(torch.float32)
+        .view(3, 4)
+    )
+
+    assert torch.count_nonzero(pages[0]) == 0
+    assert torch.allclose(
+        first_state.float(), torch.full_like(first_state.float(), 0.015), atol=0.001
+    )
+    assert torch.allclose(second_state, torch.full_like(second_state, 0.015), atol=1e-6)
+    assert torch.count_nonzero(pages[1:, first_state_bytes + second_state_bytes :]) == 0
 
 
 def test_startup_fill_preserves_null_block_for_uint8_fp8_storage():

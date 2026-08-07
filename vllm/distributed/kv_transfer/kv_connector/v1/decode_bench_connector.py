@@ -48,6 +48,7 @@ prompt token because that token must be computed to produce logits.
 """
 
 from dataclasses import dataclass
+from math import prod
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -61,7 +62,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.kv_cache_interface import MambaSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -105,7 +108,9 @@ class DecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = DecodeBenchConnectorScheduler(vllm_config)
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = DecodeBenchConnectorWorker(vllm_config)
+            self.connector_worker = DecodeBenchConnectorWorker(
+                vllm_config, kv_cache_config
+            )
 
     # ==============================
     # Worker-side methods
@@ -296,7 +301,7 @@ class DecodeBenchConnectorScheduler:
 class DecodeBenchConnectorWorker:
     """Worker-side implementation for DecodeBenchConnector."""
 
-    def __init__(self, vllm_config: "VllmConfig"):
+    def __init__(self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
 
@@ -317,6 +322,14 @@ class DecodeBenchConnectorWorker:
 
         # Will be populated via register_kv_caches.
         self.kv_caches: dict[str, Any] | None = None
+        self.layer_specs = {}
+        for group in kv_cache_config.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            specs_by_layer = getattr(group_spec, "kv_cache_specs", {})
+            for layer_name in group.layer_names:
+                self.layer_specs[layer_name] = specs_by_layer.get(
+                    layer_name, group_spec
+                )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Pre-fill every usable physical cache block once.
@@ -337,6 +350,24 @@ class DecodeBenchConnectorWorker:
         num_tensors = 0
 
         for layer_name, cache_or_states in kv_caches.items():
+            layer_spec = self.layer_specs.get(layer_name)
+            if isinstance(layer_spec, MambaSpec):
+                if not isinstance(cache_or_states, torch.Tensor):
+                    raise TypeError(
+                        "DecodeBenchConnector expected the raw Mamba cache page "
+                        f"for layer {layer_name!r}, got "
+                        f"{type(cache_or_states).__name__}"
+                    )
+                staging = self._fill_mamba_pages(
+                    layer_name,
+                    cache_or_states,
+                    layer_spec,
+                    staging,
+                    chunk_elems,
+                )
+                num_tensors += len(layer_spec.shapes)
+                continue
+
             caches: tuple[torch.Tensor, ...]
             if isinstance(cache_or_states, torch.Tensor):
                 caches = (cache_or_states,)
@@ -384,6 +415,53 @@ class DecodeBenchConnectorWorker:
             self.fill_mean,
             self.fill_std,
         )
+
+    def _fill_mamba_pages(
+        self,
+        layer_name: str,
+        cache: torch.Tensor,
+        spec: MambaSpec,
+        staging: torch.Tensor | None,
+        chunk_elems: int,
+    ) -> torch.Tensor | None:
+        """Fill logical Mamba states inside raw block-major int8 pages.
+
+        GPUModelRunner exposes each Mamba/KDA layer as
+        ``[num_blocks, 1, 1, page_size_bytes]`` int8 storage. Logical states
+        can have different floating-point dtypes, so writing the raw int8 page
+        directly would corrupt them. Keep the whole page zeroed first, then
+        reinterpret and fill only the non-null blocks' logical state slices;
+        any page padding therefore remains zero as well.
+        """
+        if (
+            cache.dtype != torch.int8
+            or cache.ndim != 4
+            or tuple(cache.shape[1:3]) != (1, 1)
+            or cache.shape[3] != spec.page_size_bytes
+        ):
+            raise ValueError(
+                "DecodeBenchConnector expected raw Mamba cache layer "
+                f"{layer_name!r} to have dtype int8 and shape "
+                f"[num_blocks, 1, 1, {spec.page_size_bytes}], got "
+                f"dtype={cache.dtype}, shape={tuple(cache.shape)}"
+            )
+
+        with torch.no_grad():
+            cache.zero_()
+        pages = cache.squeeze(dim=(1, 2))
+        offset = 0
+        for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True):
+            num_bytes = prod(shape) * get_dtype_size(dtype)
+            end = offset + num_bytes
+            if end > spec.page_size_bytes:
+                raise ValueError(
+                    f"DecodeBenchConnector Mamba states for layer {layer_name!r} "
+                    f"exceed page_size_bytes={spec.page_size_bytes}"
+                )
+            state = pages[1:, offset:end].view(dtype).view(-1, *shape)
+            staging = self._fill_tensor(state, staging, chunk_elems)
+            offset = end
+        return staging
 
     def _fill_tensor(
         self,
