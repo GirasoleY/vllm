@@ -1527,7 +1527,23 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            # A synchronous external hit allocates its boundary state before
+            # allocate_new_blocks(). If same-step local work advances into a
+            # later Mamba page, that method also allocates a distinct running
+            # state. The first-request clamp above accounts for the running and
+            # speculative states, but not the external boundary state. Async
+            # loads do not cross a page during their load-only step, so they do
+            # not need this extra reservation.
+            needs_external_boundary_state = (
+                total_computed_tokens > num_local_computed_tokens
+                and cdiv(num_tokens, self.block_size)
+                > cdiv(total_computed_tokens, self.block_size)
+            )
+            return (
+                num_new_blocks
+                + num_evictable_computed_blocks
+                + int(needs_external_boundary_state)
+            )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
