@@ -14,11 +14,13 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    MambaManager,
     RSWAManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    MambaSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
@@ -518,6 +520,83 @@ def test_evictable_cached_blocks_not_double_allocated():
     )
     assert len(new_blocks) == 1
     assert len(manager.req_to_blocks[request_id]) == 2
+
+
+@pytest.mark.parametrize(
+    ("external_tokens", "total_tokens", "expected_real_blocks"),
+    [
+        (16, 16, 1),
+        (16, 32, 2),
+        (17, 31, 1),
+        (17, 33, 2),
+    ],
+)
+def test_mamba_align_predicts_sync_external_boundary_state(
+    external_tokens: int,
+    total_tokens: int,
+    expected_real_blocks: int,
+):
+    """Admission must include the external boundary and a later running state.
+
+    DecodeBench supplies its synthetic hit synchronously. If the locally
+    computed suffix crosses into a later Mamba page, align mode temporarily
+    owns two real state blocks in the same step. The predictor must count both
+    so an exact-fit pool is rejected cleanly instead of failing inside
+    get_new_blocks().
+    """
+    block_size = 16
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    pool = BlockPool(
+        num_gpu_blocks=100,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    request_id = "sync-external"
+
+    predicted = manager.get_num_blocks_to_allocate(
+        request_id=request_id,
+        num_tokens=total_tokens,
+        new_computed_blocks=[],
+        total_computed_tokens=external_tokens,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=total_tokens,
+    )
+    assert predicted == expected_real_blocks
+
+    free_before = pool.get_num_free_blocks()
+    manager.add_local_computed_blocks(
+        request_id,
+        [],
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=external_tokens,
+    )
+    manager.allocate_external_computed_blocks(
+        request_id,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=external_tokens,
+    )
+    manager.allocate_new_blocks(
+        request_id,
+        num_tokens=total_tokens,
+        num_tokens_main_model=total_tokens,
+    )
+
+    request_blocks = manager.req_to_blocks[request_id]
+    real_blocks = [block for block in request_blocks if not block.is_null]
+    assert len(real_blocks) == expected_real_blocks
+    assert free_before - pool.get_num_free_blocks() == expected_real_blocks
 
 
 def test_chunked_local_attention_get_num_blocks_to_allocate():
