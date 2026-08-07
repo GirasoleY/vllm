@@ -2486,7 +2486,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 # FP8 path: gather cache without dequantization
                 ops.cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace,
+                    dst=workspace[:toks],
                     block_table=prefill_metadata.block_table,
                     cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
                     batch_size=attn_metadata.num_prefills,
@@ -2619,7 +2619,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             else:
                 ops.cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace,
+                    dst=workspace[:toks],
                     block_table=prefill_metadata.block_table,
                     cu_seq_lens=padded_local_cu_seq_lens,
                     batch_size=attn_metadata.num_prefills,
