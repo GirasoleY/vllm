@@ -1162,6 +1162,9 @@ class AsyncMPClient(MPClient):
     async def is_scheduler_paused_async(self) -> bool:
         return await self.call_utility_async("is_scheduler_paused")
 
+    async def get_request_queue_snapshot_async(self) -> dict[str, object]:
+        return await self.call_utility_async("get_request_queue_snapshot")
+
     async def profile_async(
         self, is_start: bool = True, profile_prefix: str | None = None
     ) -> None:

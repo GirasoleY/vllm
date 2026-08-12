@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -51,6 +52,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.shape_manifest import SchedulerShapeManifestRecorder
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -355,6 +357,18 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+        shape_manifest_path = envs.VLLM_SCHEDULER_SHAPE_MANIFEST_PATH
+        self._shape_manifest_recorder = (
+            SchedulerShapeManifestRecorder(shape_manifest_path)
+            if shape_manifest_path
+            else None
+        )
+        if self._shape_manifest_recorder is not None:
+            logger.info(
+                "Writing scheduler shape manifest to %s",
+                self._shape_manifest_recorder.path,
+            )
+
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
@@ -448,6 +462,10 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        shape_manifest_recorder = self._shape_manifest_recorder
+        if shape_manifest_recorder is not None:
+            queues_before = self._shape_manifest_queues()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -1134,6 +1152,14 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Construct the scheduler output.
+        admission_by_request_id = None
+        if shape_manifest_recorder is not None:
+            admission_by_request_id = {
+                **{request.request_id: "cached" for request in scheduled_running_reqs},
+                **{request.request_id: "resumed" for request in scheduled_resumed_reqs},
+                **{request.request_id: "new" for request in scheduled_new_reqs},
+            }
+
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
@@ -1254,8 +1280,52 @@ class Scheduler(SchedulerInterface):
             self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
+            if shape_manifest_recorder is not None and num_scheduled_tokens:
+                assert admission_by_request_id is not None
+                scheduled = []
+                for request_id, scheduled_tokens in num_scheduled_tokens.items():
+                    request = self.requests[request_id]
+                    # Connector prefix matching has updated this value, but
+                    # _update_after_schedule has not advanced it for this step.
+                    request_computed_before = request.num_computed_tokens
+                    scheduled.append(
+                        {
+                            "request_id": request_id,
+                            "prompt_len": request.num_prompt_tokens,
+                            "computed_before": request_computed_before,
+                            "scheduled_tokens": scheduled_tokens,
+                            "phase": (
+                                "prefill"
+                                if request_computed_before < request.num_prompt_tokens
+                                else "decode"
+                            ),
+                            "admission": admission_by_request_id[request_id],
+                        }
+                    )
+                preempted_request_ids = [
+                    request.request_id for request in preempted_reqs
+                ]
+                reset_preempted_req_ids = scheduler_output.preempted_req_ids or set()
+                preempted_request_ids.extend(
+                    sorted(set(reset_preempted_req_ids) - set(preempted_request_ids))
+                )
+                shape_manifest_recorder.record(
+                    {
+                        "queues_before": queues_before,
+                        "scheduled": scheduled,
+                        "preempted": preempted_request_ids,
+                        "queues_after": self._shape_manifest_queues(),
+                    }
+                )
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _shape_manifest_queues(self) -> dict[str, list[str]]:
+        return {
+            "running": [request.request_id for request in self.running],
+            "waiting": [request.request_id for request in self.waiting],
+            "skipped_waiting": [request.request_id for request in self.skipped_waiting],
+        }
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -2211,6 +2281,18 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
+    def get_request_queue_snapshot(self) -> dict[str, Any]:
+        queues = self._shape_manifest_queues()
+        return {
+            "pause_state": self._pause_state.name.lower(),
+            "running_count": len(queues["running"]),
+            "waiting_count": len(queues["waiting"]) + len(queues["skipped_waiting"]),
+            "skipped_waiting_count": len(queues["skipped_waiting"]),
+            "running_request_ids": queues["running"],
+            "waiting_request_ids": queues["waiting"],
+            "skipped_waiting_request_ids": queues["skipped_waiting"],
+        }
+
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
@@ -2556,6 +2638,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self._shape_manifest_recorder is not None:
+            self._shape_manifest_recorder.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

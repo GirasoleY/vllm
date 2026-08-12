@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from concurrent.futures import Future
 from unittest.mock import Mock
 
@@ -28,6 +29,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -104,6 +106,118 @@ def test_scheduled_encoder_input_stats_disabled_without_log_stats(
 
     make_stats.assert_not_called()
     assert scheduler_output.scheduled_encoder_input_stats is None
+
+
+def test_scheduler_shape_manifest_records_nonempty_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    manifest_template = tmp_path / "scheduler-shapes.jsonl"
+    monkeypatch.setenv("VLLM_SCHEDULER_SHAPE_MANIFEST_PATH", str(manifest_template))
+    envs.disable_envs_cache()
+    try:
+        scheduler = create_scheduler(
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            max_model_len=16,
+        )
+    finally:
+        envs.disable_envs_cache()
+
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=6,
+        max_tokens=1,
+        req_ids=["request-a", "request-b"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.schedule()
+    scheduler.schedule()
+    scheduler.shutdown()
+
+    manifests = list(tmp_path.glob("scheduler-shapes.*.jsonl"))
+    assert len(manifests) == 1
+    records = [json.loads(line) for line in manifests[0].read_text().splitlines()]
+    assert [record["step_seq"] for record in records] == [0, 1]
+    assert records[0]["queues_before"]["waiting"] == [
+        "request-a",
+        "request-b",
+    ]
+    assert records[0]["scheduled"] == [
+        {
+            "admission": "new",
+            "computed_before": 0,
+            "phase": "prefill",
+            "prompt_len": 6,
+            "request_id": "request-a",
+            "scheduled_tokens": 4,
+        }
+    ]
+    assert records[1]["scheduled"][0]["admission"] == "cached"
+    assert records[1]["scheduled"][0]["computed_before"] == 4
+
+
+def test_scheduler_shape_manifest_records_external_cache_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "VLLM_SCHEDULER_SHAPE_MANIFEST_PATH",
+        str(tmp_path / "scheduler-shapes.jsonl"),
+    )
+    envs.disable_envs_cache()
+    try:
+        scheduler = create_scheduler(
+            max_num_seqs=1,
+            max_num_batched_tokens=8,
+            max_model_len=16,
+            enable_prefix_caching=True,
+            use_kv_connector=mock_kv(matched_tokens=4, is_async=False),
+            block_size=2,
+        )
+    finally:
+        envs.disable_envs_cache()
+    scheduler.add_request(
+        create_requests(
+            num_requests=1,
+            num_tokens=6,
+            max_tokens=1,
+            block_size=2,
+            req_ids=["request-a"],
+        )[0]
+    )
+
+    scheduler.schedule()
+    scheduler.shutdown()
+
+    manifest = next(tmp_path.glob("scheduler-shapes.*.jsonl"))
+    record = json.loads(manifest.read_text().splitlines()[0])
+    assert record["scheduled"][0]["computed_before"] == 4
+    assert record["scheduled"][0]["scheduled_tokens"] == 2
+
+
+def test_request_queue_snapshot_is_authoritative_while_paused():
+    scheduler = create_scheduler()
+    requests = create_requests(
+        num_requests=2,
+        req_ids=["request-a", "request-b"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert scheduler.get_request_queue_snapshot() == {
+        "pause_state": "paused_all",
+        "running_count": 0,
+        "waiting_count": 2,
+        "skipped_waiting_count": 0,
+        "running_request_ids": [],
+        "waiting_request_ids": ["request-a", "request-b"],
+        "skipped_waiting_request_ids": [],
+    }
 
 
 def test_add_requests():

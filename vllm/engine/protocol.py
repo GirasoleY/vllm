@@ -214,6 +214,10 @@ class EngineClient(ABC):
         """Return whether the engine is currently paused."""
         ...
 
+    async def get_request_queue_snapshot(self) -> dict[str, object]:
+        """Return the authoritative ordered scheduler queue state."""
+        raise NotImplementedError
+
     @abstractmethod
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine with optional timeout."""

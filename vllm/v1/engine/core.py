@@ -865,6 +865,10 @@ class EngineCore:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
 
+    def get_request_queue_snapshot(self) -> dict[str, object]:
+        """Return the authoritative ordered scheduler queue state."""
+        return self.scheduler.get_request_queue_snapshot()
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
         """Put the engine to sleep at the specified level.
 
