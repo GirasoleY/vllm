@@ -102,7 +102,6 @@ def test_dcp_chunked_context_accepts_non_virtual_block_aligned_prefix():
     metadata = build_mla_chunked_context_metadata(
         context_lens_cpu=context_lens_cpu,
         prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
-        num_prefills=2,
         chunked_prefill_workspace=torch.empty(0),
         chunked_prefill_workspace_size=128,
         block_size=64,
