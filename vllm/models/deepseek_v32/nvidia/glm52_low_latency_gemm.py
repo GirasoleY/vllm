@@ -25,6 +25,12 @@ from vllm.platforms import current_platform
 Backend = Literal["cute", "dsv3_fused_a"]
 ResolvedCall = tuple[Backend, SkinnyGemmConfig | None]
 
+# A Python overlay can temporarily be paired with an older vLLM extension
+# while testing a source-only model change. Remember a shape rejected by that
+# extension so only the first layer probes it; all later layers use the normal
+# unquantized linear implementation.
+_unsupported_dsv3_shapes: set[tuple[int, int]] = set()
+
 
 @dataclass(frozen=True, slots=True)
 class GLM52ProjectionSpec:
@@ -126,12 +132,21 @@ def run_glm52_plan(
 
     if not hasattr(torch.ops._C, "dsv3_fused_a_gemm"):
         return None
+    shape = (weight.shape[0], weight.shape[1])
+    if shape in _unsupported_dsv3_shapes:
+        return None
     output = torch.empty(
         (x.shape[0], weight.shape[0]),
         dtype=x.dtype,
         device=x.device,
     )
-    ops.dsv3_fused_a_gemm(output, x, weight.t(), enable_pdl=True)
+    try:
+        ops.dsv3_fused_a_gemm(output, x, weight.t(), enable_pdl=True)
+    except RuntimeError as error:
+        if "unsupported DSV3 fused-A GEMM shape" not in str(error):
+            raise
+        _unsupported_dsv3_shapes.add(shape)
+        return None
     return output
 
 
