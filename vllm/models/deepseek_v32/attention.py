@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING, cast
+
 import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -9,6 +11,10 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention.pcp import (
+    finalize_mla_pcp_decode,
+    maybe_gather_mla_latent_cache_inputs,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -34,6 +40,9 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -495,11 +504,12 @@ class DeepseekV32Attention(MLAAttention):
 
         attn_metadata_raw = get_forward_context().attn_metadata
         if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw.get(self.layer_name)
+            resolved_metadata = attn_metadata_raw.get(self.layer_name)
         elif isinstance(attn_metadata_raw, list):
-            attn_metadata = attn_metadata_raw[0].get(self.layer_name)
+            resolved_metadata = attn_metadata_raw[0].get(self.layer_name)
         else:
-            attn_metadata = attn_metadata_raw
+            resolved_metadata = attn_metadata_raw
+        attn_metadata = cast("MLACommonMetadata | None", resolved_metadata)
 
         if attn_metadata is None:
             output.zero_()
@@ -538,14 +548,190 @@ class DeepseekV32Attention(MLAAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        """Portable sparse-MLA path with PCP cache-input collectives.
+        """DSV32 fused sparse-MLA prefill with PCP cache collectives.
 
-        The fused DSV32 kernels write normalized/rotated K directly into the
-        indexer and MLA caches. PCP first has to gather each rank's partitioned
-        prefill K rows and pair them with the global slot mappings, so it cannot
-        use those direct-cache epilogues yet. Reuse the generic MLA/indexer path
-        here; the non-PCP path above remains fully fused.
+        Decode stays on the portable MLA path for now. Prefill reuses DSV32's
+        fused normalization, RoPE, query packing, and indexer-query preparation,
+        then hands the materialized local K rows to the existing PCP gathers.
         """
+        attn_metadata_raw = get_forward_context().attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            resolved_metadata = attn_metadata_raw.get(self.layer_name)
+        elif isinstance(attn_metadata_raw, list):
+            resolved_metadata = attn_metadata_raw[0].get(self.layer_name)
+        else:
+            resolved_metadata = attn_metadata_raw
+        attn_metadata = cast("MLACommonMetadata | None", resolved_metadata)
+        # V2's post-KV-allocation kernel warmup is a 32-request, two-token
+        # prefill. Keep that tiny shape on the established portable path; this
+        # fusion targets long prefill, where its launch/copy savings matter.
+        if (
+            attn_metadata is None
+            or attn_metadata.num_decode_tokens
+            or hidden_states.shape[0] < 1024
+        ):
+            return self._forward_pcp_portable(positions, hidden_states)
+
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_c, k_pe = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+
+        if self.indexer is not None and not self.skip_topk:
+            kw = self.indexer.wk_weights_proj(hidden_states)[0]
+            index_k = kw[:, : self.indexer.head_dim]
+            index_weights = kw[:, self.indexer.head_dim :]
+            has_indexer = True
+            index_k_norm_w = self.indexer.k_norm.weight
+            index_k_norm_bias = self.indexer.k_norm.bias
+            index_k_norm_eps = self.indexer.k_norm.eps
+            index_k_rope_cache = self.indexer_rope_emb.cos_sin_cache
+            index_k_out = torch.empty_like(index_k)
+            indexer_softmax_scale = self.indexer.softmax_scale
+            indexer_head_scale = self.indexer.n_head**-0.5
+        else:
+            index_k = None
+            index_weights = None
+            has_indexer = False
+            index_k_norm_w = None
+            index_k_norm_bias = None
+            index_k_norm_eps = 1e-6
+            index_k_rope_cache = None
+            index_k_out = None
+            indexer_softmax_scale = 0.0
+            indexer_head_scale = 0.0
+
+        q_c_out = torch.empty_like(q_c)
+        kv_c_out = torch.empty_like(kv_c)
+        k_pe_out = torch.empty_like(k_pe)
+        q_c = fused_norm_rope(
+            positions,
+            q_c,
+            self.q_a_layernorm.weight,
+            self.q_a_layernorm.variance_epsilon,
+            kv_c,
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.variance_epsilon,
+            k_pe,
+            self.rotary_emb.cos_sin_cache,
+            index_k,
+            index_k_norm_w,
+            index_k_norm_bias,
+            index_k_norm_eps,
+            index_k_rope_cache,
+            self.topk_indices_buffer,
+            has_indexer=has_indexer,
+            index_rope_interleave=self._index_rope_interleave,
+            q_c_out=q_c_out,
+            kv_c_out=kv_c_out,
+            k_pe_out=k_pe_out,
+            index_k_out=index_k_out,
+        )
+
+        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        if has_indexer:
+            assert self.indexer is not None
+            index_q = self.indexer.wq_b(q_c)[0].view(
+                -1, self.indexer.n_head, self.indexer.head_dim
+            )
+        else:
+            index_q = None
+        index_q_fp8, index_weights_out, mqa_q = fused_q(
+            positions,
+            q_pe,
+            self.rotary_emb.cos_sin_cache,
+            index_q,
+            self.indexer_rope_emb.cos_sin_cache if has_indexer else None,
+            ql_nope,
+            self._q_scale,
+            index_weights,
+            indexer_softmax_scale,
+            indexer_head_scale,
+            has_indexer=has_indexer,
+            index_rope_interleave=self._index_rope_interleave,
+            quantize_mqa=self._fp8_query,
+        )
+
+        if has_indexer:
+            assert self.indexer is not None and index_k_out is not None
+            self.indexer.indexer_op(
+                hidden_states,
+                index_q_fp8,
+                index_k_out,
+                index_weights_out,
+            )
+
+        forward_context = get_forward_context()
+        slot_mapping = forward_context.slot_mapping
+        assert isinstance(slot_mapping, dict)
+        kv_for_cache, kpe_for_cache, cache_slot_mapping = (
+            maybe_gather_mla_latent_cache_inputs(
+                kv_c_out,
+                k_pe_out.unsqueeze(1),
+                slot_mapping.get(self.layer_name),
+                0,
+                True,
+            )
+        )
+        self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+            kv_for_cache,
+            kpe_for_cache,
+            self.kv_cache,
+            cache_slot_mapping,
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+
+        num_actual = attn_metadata.num_actual_tokens
+        kv_cache = self.kv_cache
+        if self._fp8_kv_needs_view:
+            kv_cache = kv_cache.view(torch.float8_e4m3fn)
+        mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        if self._fp8_query:
+            mqa_q_arg = mqa_q[:num_actual]
+        else:
+            mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+        attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+            mqa_q_arg, kv_cache, attn_metadata, self
+        )
+        if self.impl.dcp_world_size > 1:
+            assert lse is not None and self.dcp_manager is not None
+            seq_lens = (
+                attn_metadata.decode.seq_lens
+                if attn_metadata.decode is not None
+                else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+                    : attn_metadata.num_decodes
+                ]
+            )
+            query_start_loc = attn_metadata.query_start_loc[
+                : attn_metadata.num_decodes + 1
+            ]
+            attn_out = self.dcp_manager.combine(
+                attn_out,
+                lse,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+            )
+            attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+
+        output = torch.empty(
+            (hidden_states.shape[0], self.num_local_heads * self.v_head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        self._v_up_proj(attn_out, out=output[:num_actual])
+        if num_actual < output.shape[0]:
+            output[num_actual:].zero_()
+        return self.o_proj(output)[0]
+
+    def _forward_pcp_portable(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Existing portable PCP path, retained for decode/profile fallback."""
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
         q_c, kv_c, k_pe = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -556,9 +742,7 @@ class DeepseekV32Attention(MLAAttention):
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-            positions,
-            q[..., self.qk_nope_head_dim :],
-            k_pe,
+            positions, q[..., self.qk_nope_head_dim :], k_pe
         )
 
         if self.indexer is not None and not self.skip_topk:

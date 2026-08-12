@@ -103,12 +103,16 @@ def _fused_norm_rope_kernel(
     kv_stride,
     kv_rms_norm_w_ptr,
     kv_rms_eps,
+    kv_out_ptr,
+    kv_out_stride,
     KV_DIM: tl.constexpr,
     # KV RoPE
     kpe_ptr,
     kpe_stride,
     kpe_rope_cos_sin_cache_ptr,
     kpe_rope_cos_sin_cache_stride,
+    kpe_out_ptr,
+    kpe_out_stride,
     KPE_HALF_ROT_DIM: tl.constexpr,
     # Index K layer norm
     index_k_ptr,
@@ -121,6 +125,8 @@ def _fused_norm_rope_kernel(
     # Index K RoPE
     index_k_rope_cos_sin_cache_ptr,
     index_k_rope_cos_sin_cache_stride,
+    index_k_out_ptr,
+    index_k_out_stride,
     INDEX_K_HALF_ROT_DIM: tl.constexpr,
     # Cache params (shared by indexer K and MLA)
     slot_mapping_ptr,
@@ -150,6 +156,8 @@ def _fused_norm_rope_kernel(
     TOPK_BLOCK_SIZE: tl.constexpr,
     HAS_INDEXER: tl.constexpr,
     INDEX_ROPE_INTERLEAVE: tl.constexpr,
+    WRITE_MLA_OUTPUTS: tl.constexpr,
+    WRITE_INDEX_OUTPUT: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -216,6 +224,17 @@ def _fused_norm_rope_kernel(
         x2 = tl.load(kpe_base + dim_off * 2 + 1).to(tl.float32)
         r1 = x1 * cos - x2 * sin
         r2 = x2 * cos + x1 * sin
+
+        if WRITE_MLA_OUTPUTS:
+            tl.store(kv_out_ptr + tok_idx * kv_out_stride + kv_block, kv_c)
+            tl.store(
+                kpe_out_ptr + tok_idx * kpe_out_stride + dim_off * 2,
+                r1.to(kpe_out_ptr.dtype.element_ty),
+            )
+            tl.store(
+                kpe_out_ptr + tok_idx * kpe_out_stride + dim_off * 2 + 1,
+                r2.to(kpe_out_ptr.dtype.element_ty),
+            )
 
         # MLA concat_and_cache: write [kv_c_normed, k_pe_roped] to cache.
         if mla_cache_entry_stride == 0:
@@ -354,6 +373,16 @@ def _fused_norm_rope_kernel(
         roped = normed * cos_full + sign * normed_partner * sin_full
         result = tl.where(in_rope, roped, normed)
 
+        if WRITE_INDEX_OUTPUT:
+            tl.store(
+                index_k_out_ptr + tok_idx * index_k_out_stride + index_k_block,
+                result.to(index_k_out_ptr.dtype.element_ty),
+                mask=index_k_mask,
+            )
+
+        if indexer_cache_stride == 0:
+            return
+
         # 3. FP8 quantize + cache write from registers.
         #    No need to write back to index_k_ptr — the only consumer
         #    (sparse_attn_indexer) reads from the cache, not index_k.
@@ -395,6 +424,9 @@ def fused_norm_rope(
     has_indexer: bool = True,
     index_rope_interleave: bool = False,
     q_c_out: torch.Tensor | None = None,
+    kv_c_out: torch.Tensor | None = None,
+    k_pe_out: torch.Tensor | None = None,
+    index_k_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert positions.ndim == 1
     assert q_c.ndim == 2
@@ -406,6 +438,9 @@ def fused_norm_rope(
     q_dim = q_c.shape[-1]
     kv_dim = kv_c.shape[-1]
     device = positions.device
+    materialize_outputs = any(
+        output is not None for output in (kv_c_out, k_pe_out, index_k_out)
+    )
 
     # Shared (no-indexer) layers: substitute cached 1-element dummies so the
     # kernel launches cleanly; pid 0/3 (indexer + topk fill) skipped by
@@ -435,12 +470,21 @@ def fused_norm_rope(
         idx_cache_scale_view = torch.empty(0, dtype=torch.float32, device=device)
         indexer_k_cache = torch.empty(0, dtype=torch.float8_e4m3fn, device=device)
         idx_cache_block_size = 1
-        idx_cache_stride = 1
+        idx_cache_stride = 0
         if mla_kv_cache is None:
-            # Pure profiling run (no caches at all): skip all per-token writes.
-            slot_mapping = torch.full(
-                (num_tokens,), -1, dtype=torch.int64, device=device
-            )
+            if materialize_outputs:
+                # PCP needs normalized/rotated local K rows before its gather.
+                # Any non-negative value reaches those output epilogues; cache
+                # writes remain disabled by their zero strides below.
+                if slot_mapping is None:
+                    slot_mapping = torch.zeros(
+                        num_tokens, dtype=torch.int64, device=device
+                    )
+            else:
+                # Pure profiling run: skip all per-token writes.
+                slot_mapping = torch.full(
+                    (num_tokens,), -1, dtype=torch.int64, device=device
+                )
 
     # --- MLA KV cache setup ---
     mla_cache_ds_mla = mla_kv_cache_dtype == "fp8_ds_mla"
@@ -478,6 +522,18 @@ def fused_norm_rope(
 
     if q_c_out is None:
         q_c_out = torch.empty_like(q_c)
+    write_mla_outputs = kv_c_out is not None or k_pe_out is not None
+    if write_mla_outputs:
+        assert kv_c_out is not None and kv_c_out.shape == kv_c.shape
+        assert k_pe_out is not None and k_pe_out.shape == k_pe.shape
+    else:
+        kv_c_out = _dummy((1, 1), kv_c.dtype, device)
+        k_pe_out = _dummy((1, 1), k_pe.dtype, device)
+    write_index_output = index_k_out is not None
+    if write_index_output:
+        assert index_k_out is not None and index_k_out.shape == index_k.shape
+    else:
+        index_k_out = _dummy((1, 1), index_k.dtype, device)
     use_pdl = current_platform.is_arch_support_pdl()
     _fused_norm_rope_kernel[(4, num_tokens)](
         positions,
@@ -495,12 +551,16 @@ def fused_norm_rope(
         kv_c.stride(0),
         kv_rms_norm_w,
         kv_rms_eps,
+        kv_c_out,
+        kv_c_out.stride(0),
         kv_dim,
         # KV RoPE
         k_pe,
         k_pe.stride(0),
         k_rope_cos_sin_cache,
         k_rope_cos_sin_cache.stride(0),
+        k_pe_out,
+        k_pe_out.stride(0),
         k_rope_cos_sin_cache.shape[-1] // 2,
         # Index K layer norm + RoPE + FP8 quant
         index_k,
@@ -512,6 +572,8 @@ def fused_norm_rope(
         triton.next_power_of_2(index_k_dim),
         index_k_rope_cos_sin_cache,
         index_k_rope_cos_sin_cache.stride(0),
+        index_k_out,
+        index_k_out.stride(0),
         index_k_rope_cos_sin_cache.shape[-1] // 2,
         # Cache params
         slot_mapping,
@@ -537,6 +599,8 @@ def fused_norm_rope(
         TOPK_BLOCK_SIZE=1024,
         HAS_INDEXER=has_indexer,
         INDEX_ROPE_INTERLEAVE=index_rope_interleave,
+        WRITE_MLA_OUTPUTS=write_mla_outputs,
+        WRITE_INDEX_OUTPUT=write_index_output,
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
     )
