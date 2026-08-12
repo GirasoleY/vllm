@@ -196,6 +196,8 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+    # Engine-core scheduler JSONL path template; supports {host} and {pid}.
+    VLLM_SCHEDULER_SHAPE_MANIFEST_PATH: str | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2084,6 +2086,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
     ),
+    "VLLM_SCHEDULER_SHAPE_MANIFEST_PATH": lambda: os.getenv(
+        "VLLM_SCHEDULER_SHAPE_MANIFEST_PATH"
+    ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -2223,6 +2228,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "VLLM_SCHEDULER_SHAPE_MANIFEST_PATH",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",

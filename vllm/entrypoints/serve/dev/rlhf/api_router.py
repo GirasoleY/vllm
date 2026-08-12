@@ -154,6 +154,24 @@ async def is_paused(raw_request: Request) -> JSONResponse:
     return JSONResponse(content={"is_paused": paused})
 
 
+@router.get("/request_counts")
+async def request_counts(raw_request: Request) -> JSONResponse:
+    """Return authoritative scheduler counts and ordered request IDs."""
+
+    engine = engine_client(raw_request)
+
+    try:
+        snapshot = await engine.get_request_queue_snapshot()
+    except Exception as err:  # pragma: no cover - defensive
+        logger.exception("Failed to fetch scheduler request counts")
+        return JSONResponse(
+            content={"error": f"Failed to fetch scheduler request counts: {err}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+    return JSONResponse(content=snapshot)
+
+
 @router.post("/init_weight_transfer_engine")
 async def init_weight_transfer_engine(raw_request: Request):
     try:

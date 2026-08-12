@@ -840,6 +840,10 @@ class AsyncLLM(EngineClient):
         """Return whether the engine is currently paused."""
         return await self.engine_core.is_scheduler_paused_async()
 
+    async def get_request_queue_snapshot(self) -> dict[str, object]:
+        """Return the authoritative ordered scheduler queue state."""
+        return await self.engine_core.get_request_queue_snapshot_async()
+
     async def encode(
         self,
         prompt: PromptType | EngineInput,
