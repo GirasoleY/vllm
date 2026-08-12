@@ -116,36 +116,30 @@ def test_dcp_chunked_context_accepts_non_virtual_block_aligned_prefix():
     assert len(metadata.chunks) == 2
     first_chunk, second_chunk = metadata.chunks
     assert [chunk.seq_lens.tolist() for chunk in metadata.chunks] == [
-        [64, 64],
-        [1, 32],
+        [65],
+        [96],
     ]
     assert [chunk.starts.tolist() for chunk in metadata.chunks] == [
-        [0, 0],
-        [16, 16],
+        [0],
+        [0],
     ]
-    assert first_chunk.local_context_lens_allranks == [
-        [17, 16, 16, 16],
-        [24, 24, 24, 24],
-    ]
-    assert second_chunk.local_context_lens_allranks == [
-        [17, 16, 16, 16],
-        [24, 24, 24, 24],
-    ]
+    assert first_chunk.local_context_lens_allranks == [[17, 16, 16, 16]]
+    assert second_chunk.local_context_lens_allranks == [[24, 24, 24, 24]]
     assert [chunk.padded_local_seq_lens for chunk in metadata.chunks] == [
-        [16, 16],
-        [1, 8],
+        [17],
+        [24],
     ]
     assert all(chunk.padded_local_cu_seq_lens is not None for chunk in metadata.chunks)
     assert [chunk.padded_local_cu_seq_lens.tolist() for chunk in metadata.chunks] == [
-        [0, 16, 32],
-        [0, 1, 9],
+        [0, 17],
+        [0, 24],
     ]
     assert [chunk.cu_seq_lens.tolist() for chunk in metadata.chunks] == [
-        [0, 64, 128],
-        [0, 1, 33],
+        [0, 65],
+        [0, 96],
     ]
-    assert [chunk.num_context_tokens for chunk in metadata.chunks] == [128, 33]
-    assert [chunk.num_local_context_tokens for chunk in metadata.chunks] == [32, 9]
+    assert [chunk.num_context_tokens for chunk in metadata.chunks] == [65, 96]
+    assert [chunk.num_local_context_tokens for chunk in metadata.chunks] == [17, 24]
 
 
 # Remove sm100 backends from the list if not using sm100
