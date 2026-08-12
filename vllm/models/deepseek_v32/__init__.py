@@ -11,16 +11,25 @@ attend. The same model code serves any DSA checkpoint, including GLM-5.2
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
+    from vllm.model_executor.models.deepseek_v2 import GlmMoeDsaForCausalLM
+
     from .amd.model import DeepseekV32ForCausalLM
     from .amd.mtp import DeepseekV32MTP
 elif current_platform.is_xpu():
     raise NotImplementedError("deepseek_v32 does not yet support XPU.")
 else:
-    # Covers Blackwell (sm100) and all other CUDA devices.
+    # Keep DeepSeek V3.2 on its NVIDIA path on CUDA. GLM-5.2 uses that path
+    # only on the SM100 family; older CUDA devices retain its generic model.
     from .nvidia.model import DeepseekV32ForCausalLM
     from .nvidia.mtp import DeepseekV32MTP
+
+    if current_platform.is_device_capability_family(100):
+        from .nvidia.model import DeepseekV32ForCausalLM as GlmMoeDsaForCausalLM
+    else:
+        from vllm.model_executor.models.deepseek_v2 import GlmMoeDsaForCausalLM
 
 __all__ = [
     "DeepseekV32ForCausalLM",
     "DeepseekV32MTP",
+    "GlmMoeDsaForCausalLM",
 ]
