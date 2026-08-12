@@ -333,6 +333,9 @@ class DeepseekV32Attention(MLAAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if self.use_pcp:
+            return self._forward_pcp(positions, hidden_states)
+
         # Captured: A-projections (+ indexer A-GEMM on indexer layers).
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
         q_c, kv_c, k_pe = qkv_lora.split(
@@ -529,3 +532,45 @@ class DeepseekV32Attention(MLAAttention):
             .transpose(0, 1)
         )
         torch.bmm(x, self.W_UV, out=out)
+
+    def _forward_pcp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Portable sparse-MLA path with PCP cache-input collectives.
+
+        The fused DSV32 kernels write normalized/rotated K directly into the
+        indexer and MLA caches. PCP first has to gather each rank's partitioned
+        prefill K rows and pair them with the global slot mappings, so it cannot
+        use those direct-cache epilogues yet. Reuse the generic MLA/indexer path
+        here; the non-PCP path above remains fully fused.
+        """
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_c, k_pe = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        q_c = self.q_a_layernorm(q_c)
+        kv_c = self.kv_a_layernorm(kv_c)
+        k_pe = k_pe.unsqueeze(1)
+
+        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+            positions,
+            q[..., self.qk_nope_head_dim :],
+            k_pe,
+        )
+
+        if self.indexer is not None and not self.skip_topk:
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+
+        attn_out = super().forward(
+            q,
+            kv_c,
+            k_pe,
+            output_shape=(
+                hidden_states.shape[0],
+                self.num_local_heads * self.v_head_dim,
+            ),
+        )
+        return self.o_proj(attn_out)[0]
