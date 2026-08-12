@@ -3003,6 +3003,33 @@ def concat_mla_q(
     torch.ops._C_cache_ops.concat_mla_q(ql_nope, q_pe, q_out)
 
 
+def concat_mla_q_fp8(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Concatenate and statically quantize a 512+64 MLA query to FP8."""
+    q_out = torch.empty(
+        (*ql_nope.shape[:-1], ql_nope.shape[-1] + q_pe.shape[-1]),
+        dtype=torch.float8_e4m3fn,
+        device=ql_nope.device,
+    )
+    torch.ops._C.concat_mla_q_fp8(ql_nope, q_pe, q_out, scale)
+    return q_out
+
+
+if hasattr(torch.ops._C, "concat_mla_q_fp8"):
+
+    @register_fake("_C::concat_mla_q_fp8")
+    def _concat_mla_q_fp8_fake(
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_out: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        return None
+
+
 def indexer_k_quant_and_cache(
     k: torch.Tensor,
     kv_cache: torch.Tensor,

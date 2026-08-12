@@ -648,6 +648,33 @@ __global__ void fusedKimiK3MLADecodeQConcatDsMlaKernel(
 #endif
 }
 
+#ifndef USE_ROCM
+// NVIDIA MLA query epilogue for the common 512+64 latent layout. This reuses
+// the Kimi-K3 vectorized E4M3 writer without coupling callers to cache
+// insertion.
+template <typename scalar_t>
+__global__ void concatMLAQFp8Kernel(
+    const scalar_t* __restrict__ ql_nope, int64_t const qn_tok_stride,
+    int64_t const qn_head_stride, const scalar_t* __restrict__ q_pe,
+    int64_t const qpe_tok_stride, int64_t const qpe_head_stride,
+    uint8_t* __restrict__ q_out, int64_t const qo_tok_stride,
+    int64_t const qo_head_stride, const float* __restrict__ scale,
+    int const num_tokens, int const num_heads) {
+  int const lane_id = threadIdx.x % 32;
+  int const flat_warp_id = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (flat_warp_id >= num_tokens * num_heads) return;
+
+  int const token_id = flat_warp_id / num_heads;
+  int const head_id = flat_warp_id % num_heads;
+  float const scale_inv = 1.0f / __ldg(scale);
+  writeLatent576<scalar_t, true>(
+      q_out + token_id * qo_tok_stride + head_id * qo_head_stride,
+      ql_nope + token_id * qn_tok_stride + head_id * qn_head_stride,
+      q_pe + token_id * qpe_tok_stride + head_id * qpe_head_stride, lane_id, 1,
+      scale_inv);
+}
+#endif
+
 // PDL-aware launch of a (token, num_heads + 1)-warp grid.
 template <typename KernelT, typename... Args>
 static void launchPdl(KernelT kernel, int num_tokens, int num_heads,
@@ -726,6 +753,68 @@ bool check_rope_inputs(
   return true;
 }
 }  // namespace
+
+#ifndef USE_ROCM
+void concat_mla_q_fp8(torch::stable::Tensor const& ql_nope,
+                      torch::stable::Tensor const& q_pe,
+                      torch::stable::Tensor& q_out,
+                      torch::stable::Tensor const& scale) {
+  using torch::headeronly::ScalarType;
+  namespace kk3 = vllm::kimi_k3_fused_ops;
+  ScalarType const dt = ql_nope.scalar_type();
+  STD_TORCH_CHECK(ql_nope.device().is_cuda() && ql_nope.dim() == 3 &&
+                      ql_nope.size(2) == 512 && ql_nope.stride(2) == 1,
+                  "ql_nope must be CUDA [num_tokens, num_heads, 512] with unit "
+                  "last-dimension stride");
+  STD_TORCH_CHECK(
+      q_pe.device().is_cuda() && q_pe.dim() == 3 && q_pe.size(2) == 64 &&
+          q_pe.stride(2) == 1 && q_pe.scalar_type() == dt &&
+          q_pe.get_device_index() == ql_nope.get_device_index() &&
+          q_pe.size(0) == ql_nope.size(0) && q_pe.size(1) == ql_nope.size(1),
+      "q_pe must match ql_nope's token/head dimensions and dtype, with shape "
+      "[num_tokens, num_heads, 64]");
+  STD_TORCH_CHECK(q_out.device().is_cuda() && q_out.is_contiguous() &&
+                      q_out.get_device_index() == ql_nope.get_device_index() &&
+                      q_out.dim() == 3 && q_out.size(0) == ql_nope.size(0) &&
+                      q_out.size(1) == ql_nope.size(1) &&
+                      q_out.size(2) == 576 &&
+                      q_out.scalar_type() == ScalarType::Float8_e4m3fn,
+                  "q_out must be contiguous CUDA float8_e4m3fn with shape "
+                  "[num_tokens, num_heads, 576]");
+  STD_TORCH_CHECK(scale.device().is_cuda() &&
+                      scale.get_device_index() == ql_nope.get_device_index() &&
+                      scale.scalar_type() == ScalarType::Float &&
+                      scale.numel() == 1,
+                  "scale must be a single-element float32 CUDA tensor");
+  static int const sm_version = kk3::getSMVersion();
+  STD_TORCH_CHECK(sm_version >= 80, "concat_mla_q_fp8 requires sm_80+; got sm_",
+                  sm_version);
+
+  int const num_tokens = static_cast<int>(ql_nope.size(0));
+  int const num_heads = static_cast<int>(ql_nope.size(1));
+  if (num_tokens == 0) return;
+
+  constexpr int kBlockSize = 256;
+  constexpr int kWarpsPerBlock = kBlockSize / 32;
+  int64_t const total_warps = static_cast<int64_t>(num_tokens) * num_heads;
+  int const grid =
+      static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      ql_nope.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(ql_nope.get_device_index());
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(dt, "concat_mla_q_fp8", [&] {
+    kk3::concatMLAQFp8Kernel<scalar_t><<<grid, kBlockSize, 0, stream>>>(
+        reinterpret_cast<scalar_t const*>(ql_nope.const_data_ptr()),
+        ql_nope.stride(0), ql_nope.stride(1),
+        reinterpret_cast<scalar_t const*>(q_pe.const_data_ptr()),
+        q_pe.stride(0), q_pe.stride(1),
+        reinterpret_cast<uint8_t*>(q_out.mutable_data_ptr()), q_out.stride(0),
+        q_out.stride(1), scale.const_data_ptr<float>(), num_tokens, num_heads);
+  });
+}
+#endif
 
 void fused_kimi_k3_mla_key_concat_kv_cache_insert(
     torch::stable::Tensor& q,                   // [Tp, H, 192]

@@ -5,6 +5,11 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
+
+requires_cuda = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="concat_mla_q requires CUDA"
+)
 
 NUM_TOKENS = [1, 4, 16, 64, 128]
 NUM_HEADS = [128]
@@ -137,3 +142,44 @@ def test_concat_mla_q_values_preserved(num_tokens):
     assert torch.equal(out_bits[..., :nope_dim], ql_nope_bits)
 
     assert torch.equal(out_bits[..., nope_dim:], q_pe_bits)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 4, 64])
+@pytest.mark.parametrize("num_heads", [1, 16, 128])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("scale_value", [0.125, 1.0, 2.75])
+@requires_cuda
+def test_concat_mla_q_fp8(num_tokens, num_heads, dtype, scale_value):
+    torch.manual_seed(42)
+    nope_raw = torch.randn(num_heads, num_tokens, 512, dtype=dtype, device="cuda")
+    ql_nope = nope_raw.transpose(0, 1)
+    q_orig = torch.randn(num_tokens, num_heads, 192, dtype=dtype, device="cuda")
+    q_pe = q_orig[..., 128:]
+    scale = torch.tensor(scale_value, dtype=torch.float32, device="cuda")
+
+    actual = ops.concat_mla_q_fp8(ql_nope, q_pe, scale)
+    expected = (
+        (torch.cat((ql_nope, q_pe), dim=-1).float() * scale.reciprocal())
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+    )
+
+    assert actual.shape == (num_tokens, num_heads, 576)
+    assert actual.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+
+
+@requires_cuda
+def test_concat_mla_q_fp8_saturates():
+    ql_nope = torch.full((1, 1, 512), 1000, dtype=torch.float16, device="cuda")
+    q_pe = torch.full((1, 1, 64), -1000, dtype=torch.float16, device="cuda")
+    scale = torch.tensor(0.5, dtype=torch.float32, device="cuda")
+
+    actual = ops.concat_mla_q_fp8(ql_nope, q_pe, scale).float()
+
+    torch.testing.assert_close(
+        actual[..., :512], torch.full_like(actual[..., :512], 448)
+    )
+    torch.testing.assert_close(
+        actual[..., 512:], torch.full_like(actual[..., 512:], -448)
+    )

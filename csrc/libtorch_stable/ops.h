@@ -313,6 +313,13 @@ void fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert(
     std::optional<torch::stable::Tensor> position_ids,
     std::optional<torch::stable::Tensor> cos_sin_cache);
 
+#ifndef USE_ROCM
+void concat_mla_q_fp8(torch::stable::Tensor const& ql_nope,
+                      torch::stable::Tensor const& q_pe,
+                      torch::stable::Tensor& q_out,
+                      torch::stable::Tensor const& scale);
+#endif
+
 void fused_kimi_k3_mla_decode_q_concat_kv_cache_insert(
     torch::stable::Tensor const& ql_nope, torch::stable::Tensor const& q_pe,
     torch::stable::Tensor const& kv_c_normed, torch::stable::Tensor const& k_pe,

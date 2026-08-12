@@ -44,6 +44,7 @@ class QuantFP8(CustomOp):
         tma_aligned_scales: bool = False,
         use_ue8m0: bool | None = None,  # for Torch compile
         compile_native: bool = True,
+        enforce_enable: bool = False,
     ):
         """
         Args:
@@ -57,8 +58,12 @@ class QuantFP8(CustomOp):
             column_major_scales: For group quantization, output scales in
                 column major format
             compile_native: Manually compile forward_native if compile mode > None
+            enforce_enable: Always dispatch to the platform-specific implementation
         """
-        super().__init__(compile_native=compile_native)
+        super().__init__(
+            compile_native=compile_native,
+            enforce_enable=enforce_enable,
+        )
         self.static = static
         self.group_shape = group_shape
         self.use_per_token_if_dynamic = group_shape == GroupShape.PER_TOKEN

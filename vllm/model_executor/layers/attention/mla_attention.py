@@ -616,6 +616,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             static=True,
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
+            use_fused_cuda=(
+                current_platform.is_cuda()
+                and current_platform.has_device_capability(80)
+                and self.kv_lora_rank == 512
+                and self.qk_rope_head_dim == 64
+                and dtype in (torch.bfloat16, torch.float16)
+            ),
         )
         self._quant_fp8_op = QuantFP8(
             static=True,
@@ -1333,6 +1340,22 @@ class _DecodeConcatQuantFP8(QuantFP8):
     fusing cat/reshape/quant/view together.
     """
 
+    def __init__(
+        self,
+        *,
+        static: bool,
+        group_shape: GroupShape,
+        compile_native: bool = True,
+        use_fused_cuda: bool = False,
+    ) -> None:
+        self.use_fused_cuda = use_fused_cuda
+        super().__init__(
+            static=static,
+            group_shape=group_shape,
+            compile_native=compile_native,
+            enforce_enable=use_fused_cuda,
+        )
+
     def _make_forward(quant_fn):  # noqa: N805
         """Factory to create forward methods that concat before quantization."""
 
@@ -1351,8 +1374,25 @@ class _DecodeConcatQuantFP8(QuantFP8):
         return forward
 
     forward_native = _make_forward(QuantFP8.forward_native)  # type: ignore[arg-type]
-    forward_cuda = _make_forward(QuantFP8.forward_cuda)  # type: ignore[arg-type]
+    _forward_cuda_fallback = _make_forward(QuantFP8.forward_cuda)  # type: ignore[arg-type]
     forward_hip = _make_forward(QuantFP8.forward_hip)  # type: ignore[arg-type]
+
+    def forward_cuda(  # type: ignore[override]
+        self,
+        decode_ql_nope: torch.Tensor,
+        decode_q_pe: torch.Tensor,
+        scale: torch.Tensor,
+        scale_ub: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.use_fused_cuda:
+            assert scale_ub is None
+            return ops.concat_mla_q_fp8(decode_ql_nope, decode_q_pe, scale)
+        return self._forward_cuda_fallback(
+            decode_ql_nope,
+            decode_q_pe,
+            scale,
+            scale_ub,
+        )
 
 
 class MLACommonBackend(AttentionBackend):
