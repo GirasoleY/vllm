@@ -550,6 +550,196 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         )
 
 
+class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
+    """Persistent NVLS workspace for GLM-5.2 sparse-layer cache dispatch.
+
+    This is deliberately a narrow, prefill-only primitive while the fused PCP
+    path is being evaluated. Each rank contributes the same number of local
+    tokens. The dispatch op writes final FP8 cache payloads directly into the
+    symmetric window; the combine op scatters those rows into local paged
+    caches using the gathered rank-major slot mappings.
+    """
+
+    PACKED_ROW_BYTES = 720
+
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device,
+        max_local_tokens: int,
+        num_ubatches: int = 1,
+    ) -> None:
+        if group.size() not in (2, 4, 8):
+            raise ValueError(
+                "fused_norm_rope_pcp initially supports PCP2/4/8, got "
+                f"PCP{group.size()}"
+            )
+        if max_local_tokens < 1:
+            raise ValueError("max_local_tokens must be positive")
+        if num_ubatches < 1:
+            raise ValueError("num_ubatches must be positive")
+        super().__init__(group, device, num_ubatches)
+        self.max_local_tokens = max_local_tokens
+
+        payload_shape = (
+            num_ubatches,
+            2,
+            self.world_size,
+            max_local_tokens,
+            self.PACKED_ROW_BYTES,
+        )
+        signal_shape = (num_ubatches, 2, self.world_size)
+        self.received_payload, _ = self._allocate(payload_shape, torch.uint8)
+        self.received_signal, _ = self._allocate(signal_shape, torch.int32)
+        payload_multicast_ptrs = self._multicast_ptrs(self.received_payload)
+        signal_multicast_ptrs = self._multicast_ptrs(self.received_signal)
+        self.multicast_ptrs = list(
+            zip(payload_multicast_ptrs, signal_multicast_ptrs, strict=True)
+        )
+        if not all(
+            payload_ptr and signal_ptr
+            for payload_ptr, signal_ptr in self.multicast_ptrs
+        ):
+            raise RuntimeError(
+                "fused_norm_rope_pcp requires NVLS symmetric-memory multicast"
+            )
+        self.completion = self.received_signal.new_zeros((num_ubatches, 2))
+        self.phase = self.received_signal.new_zeros((num_ubatches, 1))
+        torch.accelerator.synchronize()
+
+    def dispatch(
+        self,
+        *,
+        positions: torch.Tensor,
+        q_c: torch.Tensor,
+        q_weight: torch.Tensor,
+        q_eps: float,
+        kv_c: torch.Tensor,
+        kv_weight: torch.Tensor,
+        mla_k_scale: torch.Tensor,
+        kv_eps: float,
+        k_pe: torch.Tensor,
+        k_pe_cos_sin: torch.Tensor,
+        index_k: torch.Tensor,
+        index_weight: torch.Tensor,
+        index_bias: torch.Tensor,
+        index_eps: float,
+        index_cos_sin: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        local_tokens = q_c.shape[0]
+        if local_tokens > self.max_local_tokens:
+            raise ValueError(
+                f"local tokens {local_tokens} exceed fused PCP capacity "
+                f"{self.max_local_tokens}"
+            )
+        ubatch = dbo_current_ubatch_id()
+        if not 0 <= ubatch < self.num_ubatches:
+            raise ValueError(f"DCP ubatch {ubatch} exceeds {self.num_ubatches} slots")
+        payload_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
+        q_out = torch.empty_like(q_c)
+        torch.ops._C.fused_norm_rope_pcp_dispatch(
+            positions,
+            q_c,
+            q_weight,
+            q_eps,
+            q_out,
+            kv_c,
+            kv_weight,
+            mla_k_scale,
+            kv_eps,
+            k_pe,
+            k_pe_cos_sin,
+            index_k,
+            index_weight,
+            index_bias,
+            index_eps,
+            index_cos_sin,
+            topk_indices,
+            self.received_payload[ubatch],
+            self.received_signal[ubatch],
+            self.completion[ubatch],
+            self.epoch[ubatch : ubatch + 1],
+            self.phase[ubatch],
+            self.world_size,
+            self.rank,
+            payload_multicast_ptr,
+            signal_multicast_ptr,
+        )
+        return q_out
+
+    def combine(
+        self,
+        *,
+        local_tokens: int,
+        mla_slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+        mla_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+    ) -> None:
+        ubatch = dbo_current_ubatch_id()
+        torch.ops._C.fused_norm_rope_pcp_combine(
+            self.received_payload[ubatch],
+            self.epoch[ubatch : ubatch + 1],
+            mla_slot_mapping,
+            index_slot_mapping,
+            mla_cache,
+            index_cache,
+            local_tokens,
+        )
+
+    def dispatch_combine(
+        self,
+        *,
+        positions: torch.Tensor,
+        q_c: torch.Tensor,
+        q_weight: torch.Tensor,
+        q_eps: float,
+        kv_c: torch.Tensor,
+        kv_weight: torch.Tensor,
+        mla_k_scale: torch.Tensor,
+        kv_eps: float,
+        k_pe: torch.Tensor,
+        k_pe_cos_sin: torch.Tensor,
+        index_k: torch.Tensor,
+        index_weight: torch.Tensor,
+        index_bias: torch.Tensor,
+        index_eps: float,
+        index_cos_sin: torch.Tensor,
+        topk_indices: torch.Tensor,
+        mla_slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+        mla_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        q_out = self.dispatch(
+            positions=positions,
+            q_c=q_c,
+            q_weight=q_weight,
+            q_eps=q_eps,
+            kv_c=kv_c,
+            kv_weight=kv_weight,
+            mla_k_scale=mla_k_scale,
+            kv_eps=kv_eps,
+            k_pe=k_pe,
+            k_pe_cos_sin=k_pe_cos_sin,
+            index_k=index_k,
+            index_weight=index_weight,
+            index_bias=index_bias,
+            index_eps=index_eps,
+            index_cos_sin=index_cos_sin,
+            topk_indices=topk_indices,
+        )
+        self.combine(
+            local_tokens=q_c.shape[0],
+            mla_slot_mapping=mla_slot_mapping,
+            index_slot_mapping=index_slot_mapping,
+            mla_cache=mla_cache,
+            index_cache=index_cache,
+        )
+        return q_out
+
+
 @functools.cache
 def get_direct_dcp_kv_gather_workspace(
     group: GroupCoordinator,
