@@ -1712,6 +1712,7 @@ def build_dcp_kv_final_layout_dst_rows(
     padded_local_seq_lens: list[int],
     local_context_lens_allranks: list[list[int]],
     local_starts: list[int],
+    output_seq_lens: list[int],
     dcp_rank: int,
 ) -> np.ndarray:
     """Map padded local DCP rows to compact request-major output rows.
@@ -1725,34 +1726,60 @@ def build_dcp_kv_final_layout_dst_rows(
         len(padded_local_seq_lens)
         == len(local_context_lens_allranks)
         == len(local_starts)
+        == len(output_seq_lens)
     ):
         raise ValueError("DCP final-layout metadata must have equal request counts")
     if not local_context_lens_allranks:
         return np.empty(0, dtype=np.int32)
     world_size = len(local_context_lens_allranks[0])
+    if world_size <= 1:
+        raise ValueError(
+            f"DCP final-layout metadata requires at least two ranks: {world_size}"
+        )
     if not 0 <= dcp_rank < world_size:
         raise ValueError(f"invalid DCP rank {dcp_rank} for world size {world_size}")
 
     dst_rows: list[int] = []
     request_output_start = 0
-    for padded_len, context_lens, local_start in zip(
-        padded_local_seq_lens,
-        local_context_lens_allranks,
-        local_starts,
+    for request, (padded_len, context_lens, local_start, output_len) in enumerate(
+        zip(
+            padded_local_seq_lens,
+            local_context_lens_allranks,
+            local_starts,
+            output_seq_lens,
+            strict=True,
+        )
     ):
         if len(context_lens) != world_size:
             raise ValueError("DCP final-layout metadata has inconsistent world sizes")
-        if padded_len < 0 or local_start < 0:
+        if (
+            padded_len < 0
+            or local_start < 0
+            or output_len < 0
+            or any(context_len < 0 for context_len in context_lens)
+        ):
             raise ValueError("DCP final-layout lengths and starts must be nonnegative")
         valid_lens = [
             min(max(0, context_len - local_start), padded_len)
             for context_len in context_lens
         ]
+        covered = sum(valid_lens)
+        if covered != output_len:
+            raise ValueError(
+                "DCP final-layout rows do not exactly cover request "
+                f"{request}: rank lengths {valid_lens} cover {covered}, "
+                f"expected {output_len}"
+            )
+        if request_output_start + output_len > np.iinfo(np.int32).max:
+            raise ValueError(
+                "DCP final-layout output exceeds int32 destination-row capacity: "
+                f"{request_output_start + output_len}"
+            )
         local_valid = valid_lens[dcp_rank]
         rank_output_start = request_output_start + sum(valid_lens[:dcp_rank])
         dst_rows.extend(range(rank_output_start, rank_output_start + local_valid))
         dst_rows.extend([-1] * (padded_len - local_valid))
-        request_output_start += sum(valid_lens)
+        request_output_start += output_len
     return np.asarray(dst_rows, dtype=np.int32)
 
 
@@ -1895,6 +1922,11 @@ def build_mla_chunked_context_metadata(
         )
 
         if use_dcp:
+            if any(start % dcp_virtual_block_size != 0 for start in plan.starts):
+                raise ValueError(
+                    "DCP context chunk starts must align to the virtual block "
+                    f"size {dcp_virtual_block_size}: {plan.starts}"
+                )
             # A request's local rows are its context rows sharded across ranks
             # and rounded up to the interleave block size, so the local start of
             # a continuation is the padded row count of the context before it.
@@ -1916,6 +1948,12 @@ def build_mla_chunked_context_metadata(
             num_local_tokens = sum(local_seq_lens)
             if dcp_manager is not None and dcp_manager.use_direct_kv_gather:
                 assert local_context_lens_allranks is not None
+                if dcp_manager.group.world_size != dcp_world_size:
+                    raise ValueError(
+                        "DCP final-layout metadata world size does not match "
+                        f"the DCP group: {dcp_world_size}/"
+                        f"{dcp_manager.group.world_size}"
+                    )
                 request_context_lens = local_context_lens_allranks[
                     plan.request_start : plan.request_end
                 ]
@@ -1923,11 +1961,14 @@ def build_mla_chunked_context_metadata(
                     local_seq_lens,
                     request_context_lens,
                     local_starts,
+                    plan.seq_lens,
                     dcp_manager.group.rank_in_group,
                 )
-                assert final_layout_dst_rows.shape == (num_local_tokens,)
-                assert np.count_nonzero(final_layout_dst_rows >= 0) <= num_tokens
-                assert np.all(final_layout_dst_rows < num_tokens)
+                if final_layout_dst_rows.shape != (num_local_tokens,):
+                    raise ValueError(
+                        "DCP final-layout map does not match the local padded "
+                        f"rows: {final_layout_dst_rows.shape}/{num_local_tokens}"
+                    )
                 final_layout_dst_rows_parts.append(final_layout_dst_rows)
             # The gather takes per-rank local offsets under DCP.
             starts_flat.extend(local_starts)
@@ -2179,27 +2220,33 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
-            # Note(hc): The local kvcache is incomplete when DCP is triggered,
-            # an additional kvcache allgather across the DCP group is therefore
-            # required, so the workspace has to be enlarged by 1/DCP relative
-            # to the original TP allocation.
             assert self.chunked_prefill_workspace_size % self.dcp_world_size == 0
-            self.chunked_prefill_workspace = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size
-                    + self.chunked_prefill_workspace_size // self.dcp_world_size,
-                    self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
-                ),
-                dtype=torch.bfloat16
-                if use_packed_fp8_cache
-                else self.model_config.dtype,
-                device=device,
+            workspace_dtype = (
+                torch.bfloat16 if use_packed_fp8_cache else self.model_config.dtype
+            )
+            workspace_head_size = (
+                self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim
             )
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
             assert isinstance(self.dcp_manager, MLADCPManager)
-            self.dcp_manager.init_kv_gather(
-                self.chunked_prefill_workspace,
+            use_direct_kv_gather = self.dcp_manager.init_kv_gather(
                 self.chunked_prefill_workspace_size,
+                workspace_head_size,
+                self.mla_dims.kv_lora_rank,
+                workspace_dtype,
+            )
+            # The direct path only materializes this rank's padded rows.  NCCL
+            # additionally needs a rank-major destination for every rank.
+            local_rows = self.chunked_prefill_workspace_size // self.dcp_world_size
+            workspace_rows = (
+                local_rows
+                if use_direct_kv_gather
+                else self.chunked_prefill_workspace_size + local_rows
+            )
+            self.chunked_prefill_workspace = torch.empty(
+                (workspace_rows, workspace_head_size),
+                dtype=workspace_dtype,
+                device=device,
             )
         else:
             self.chunked_prefill_workspace = torch.empty(
@@ -2781,26 +2828,32 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     batch_size=chunk.num_requests,
                     seq_starts=chunk.starts,
                 )
-            # workspace
-            # |------- N tokens --------|--------- N*dcp_size tokens ----------|
-            # |<- use for local_gather ->|<--------- use for allgather -------->|
-            allgather_offset = workspace.shape[0] // (dcp_world_size + 1)
-            assert allgather_offset * (dcp_world_size + 1) == workspace.shape[0]
-            assert toks <= allgather_offset
-            local_gathered_kvcache = workspace[:toks]
             dcp_manager = cast(MLADCPManager, chunked_context.dcp_manager)
             if dcp_manager.use_direct_kv_gather:
+                assert toks <= workspace.shape[0]
+                local_gathered_kvcache = workspace[:toks]
                 assert chunk.final_layout_dst_rows is not None
                 kv_c_normed, k_pe = dcp_manager.direct_kv_gather(
                     local_gathered_kvcache,
                     chunk.final_layout_dst_rows,
                     chunk.num_context_tokens,
                     self.kv_lora_rank,
+                    # K3's TP all-reduce/reduce-scatter after attention is an
+                    # all-DCP-rank post-consumption rendezvous. Therefore the
+                    # final chunk's slot may safely reset to zero on the next
+                    # layer/forward; no host parity is needed for graph replay.
                     chunk.index & 1,
                 )
                 assert kv_c_normed.is_contiguous()
                 assert k_pe.is_contiguous()
             else:
+                # workspace
+                # |------- N tokens --------|------ N*dcp_size tokens -------|
+                # |<- use for local gather ->|<------ use for allgather ----->|
+                allgather_offset = workspace.shape[0] // (dcp_world_size + 1)
+                assert allgather_offset * (dcp_world_size + 1) == workspace.shape[0]
+                assert toks <= allgather_offset
+                local_gathered_kvcache = workspace[:toks]
                 cur_allgather_workspace = workspace[
                     allgather_offset : allgather_offset * (1 + dcp_world_size)
                 ]

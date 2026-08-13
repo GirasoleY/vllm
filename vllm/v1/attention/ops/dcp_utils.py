@@ -472,12 +472,31 @@ _KV_GATHER_SUPPORTED_DTYPES = (
 )
 
 
-def _kv_gather_layout_supported(token_dim: int, dtype: torch.dtype) -> bool:
-    return token_dim * torch.empty((), dtype=dtype).element_size() % 16 == 0
+def _kv_gather_layout_supported(
+    token_dim: int,
+    plane_split_dim: int,
+    dtype: torch.dtype,
+) -> bool:
+    """Whether both packed output planes support 16-byte multicast stores."""
+    if not 0 < plane_split_dim < token_dim:
+        return False
+    element_size = torch.empty((), dtype=dtype).element_size()
+    return (
+        plane_split_dim * element_size % 16 == 0
+        and (token_dim - plane_split_dim) * element_size % 16 == 0
+    )
 
 
 class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
-    """Persistent symmetric buffers for direct DCP KV gather."""
+    """Persistent symmetric buffers for direct DCP KV gather.
+
+    Storage is owned by ``(DBO ubatch, buffer slot)``. Different ubatches have
+    disjoint buffers and may run independently. Within one ubatch, publishing
+    and consumption must remain stream ordered. Before reusing the same slot,
+    every rank must have consumed it and reached either a gather on the other
+    slot or another all-rank rendezvous. Concurrent same-ubatch use from
+    multiple streams is not supported.
+    """
 
     def __init__(
         self,
@@ -485,6 +504,7 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         device: torch.device,
         max_gathered_tokens: int,
         token_dim: int,
+        plane_split_dim: int,
         dtype: torch.dtype = torch.bfloat16,
         num_ubatches: int = 1,
     ) -> None:
@@ -500,8 +520,10 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
                 "Direct DCP kv-gather dimensions must be positive, got "
                 f"T={max_gathered_tokens}, D={token_dim}"
             )
-        if not _kv_gather_layout_supported(token_dim, dtype):
-            raise ValueError("Direct DCP kv-gather requires 16-byte-aligned KV rows.")
+        if not _kv_gather_layout_supported(token_dim, plane_split_dim, dtype):
+            raise ValueError(
+                "Direct DCP kv-gather requires two nonempty 16-byte-aligned KV planes."
+            )
         super().__init__(group, device, num_ubatches)
         if self.world_size <= 1:
             raise ValueError("Direct DCP kv-gather requires at least two ranks")
@@ -511,6 +533,8 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
                 f"ranks: {max_gathered_tokens} % {self.world_size} != 0"
             )
         self.max_gathered_tokens = max_gathered_tokens
+        self.token_dim = token_dim
+        self.plane_split_dim = plane_split_dim
 
         kv_shape = (num_ubatches, 2, max_gathered_tokens, token_dim)
         signal_shape = (num_ubatches, 2, self.world_size)
@@ -546,22 +570,52 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
             raise ValueError(
                 f"DCP kv-gather buffer slot must be 0 or 1, got {buffer_slot}"
             )
+        if local_kv.ndim != 2 or local_kv.shape[1] != self.token_dim:
+            raise ValueError(
+                "DCP final-layout local KV must match the configured token "
+                f"dimension {self.token_dim}, got {tuple(local_kv.shape)}"
+            )
         if dst_rows.dtype != torch.int32 or dst_rows.shape != (local_kv.shape[0],):
             raise ValueError(
                 "DCP final-layout destination rows must be int32 with one "
                 f"entry per local row, got {dst_rows.dtype} {tuple(dst_rows.shape)}"
+            )
+        if not dst_rows.is_contiguous():
+            raise ValueError("DCP final-layout destination rows must be contiguous")
+        if dst_rows.device != local_kv.device:
+            raise ValueError(
+                "DCP final-layout destination rows and local KV must share a "
+                f"device, got {dst_rows.device}/{local_kv.device}"
             )
         if not 0 < output_tokens <= self.max_gathered_tokens:
             raise ValueError(
                 "DCP final-layout output tokens must be within the symmetric "
                 f"buffer capacity, got {output_tokens}/{self.max_gathered_tokens}"
             )
-        token_dim = local_kv.shape[1]
-        if not 0 < plane_split_dim < token_dim:
+        if not local_kv.is_contiguous():
+            raise ValueError("DCP final-layout local KV must be contiguous")
+        if local_kv.shape[0] * self.world_size > self.max_gathered_tokens:
             raise ValueError(
-                "DCP final-layout plane split must be within the token row, "
-                f"got {plane_split_dim}/{token_dim}"
+                "DCP final-layout padded local rows exceed the symmetric "
+                f"buffer capacity: {local_kv.shape[0]} * {self.world_size} > "
+                f"{self.max_gathered_tokens}"
             )
+        if local_kv.dtype != self.received_kv.dtype:
+            raise ValueError(
+                "DCP final-layout local KV dtype must match the symmetric "
+                f"buffer, got {local_kv.dtype}/{self.received_kv.dtype}"
+            )
+        if local_kv.device != self.received_kv.device:
+            raise ValueError(
+                "DCP final-layout local KV and symmetric buffer must share a "
+                f"device, got {local_kv.device}/{self.received_kv.device}"
+            )
+        if plane_split_dim != self.plane_split_dim:
+            raise ValueError(
+                "DCP final-layout plane split differs from the configured "
+                f"layout, got {plane_split_dim}/{self.plane_split_dim}"
+            )
+        token_dim = self.token_dim
         kv_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
         torch.ops._C.direct_dcp_kv_gather(
             local_kv,
@@ -594,6 +648,7 @@ def get_direct_dcp_kv_gather_workspace(
     device: torch.device,
     max_gathered_tokens: int,
     token_dim: int,
+    plane_split_dim: int,
     dtype: torch.dtype,
     num_ubatches: int,
 ) -> DirectDCPKVGatherWorkspace | None:
@@ -604,13 +659,14 @@ def get_direct_dcp_kv_gather_workspace(
         _KV_GATHER_SUPPORTED_DTYPES,
     ):
         return None
-    if not _kv_gather_layout_supported(token_dim, dtype):
+    if not _kv_gather_layout_supported(token_dim, plane_split_dim, dtype):
         return None
     return DirectDCPKVGatherWorkspace(
         group.device_group,
         device,
         max_gathered_tokens,
         token_dim,
+        plane_split_dim,
         dtype,
         num_ubatches,
     )
@@ -741,38 +797,50 @@ class MLADCPManager:
 
     def init_kv_gather(
         self,
-        workspace: torch.Tensor,
         max_gathered_tokens: int,
-    ) -> None:
+        token_dim: int,
+        plane_split_dim: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        """Select the KV collective before allocating its local scratch.
+
+        Returns whether the direct final-layout publisher was selected.  That
+        path only needs one rank's local rows; the fallback additionally needs
+        a rank-major all-gather destination.
+        """
         world_size = self.group.world_size
-        assert max_gathered_tokens > 0
-        assert max_gathered_tokens % world_size == 0
-        assert workspace.ndim == 2
-        assert workspace.is_contiguous()
-        assert workspace.shape[0] == (
-            max_gathered_tokens + max_gathered_tokens // world_size
-        )
-        assert workspace.shape[1] > 0
+        if max_gathered_tokens <= 0 or max_gathered_tokens % world_size != 0:
+            raise ValueError(
+                "DCP KV gather capacity must be positive and divide evenly "
+                f"across {world_size} ranks, got {max_gathered_tokens}"
+            )
+        if token_dim <= 0:
+            raise ValueError(
+                f"DCP KV gather token dimension must be positive: {token_dim}"
+            )
 
         direct_workspace = get_direct_dcp_kv_gather_workspace(
             self.group,
-            workspace.device,
+            self.device,
             max_gathered_tokens,
-            workspace.shape[1],
-            workspace.dtype,
+            token_dim,
+            plane_split_dim,
+            dtype,
             self.num_ubatches,
         )
+        self._direct_kv_gather_workspace = direct_workspace
+        self.use_direct_kv_gather = direct_workspace is not None
         if direct_workspace is not None:
             logger.info_once(
                 "Using direct symmetric-memory DCP final-layout KV multicast for MLA."
             )
-            self._direct_kv_gather_workspace = direct_workspace
-            self.use_direct_kv_gather = True
+            self._kv_gather = None
         else:
             self._kv_gather = functools.partial(
                 torch.distributed.all_gather_into_tensor,
                 group=self.group.device_group,
             )
+        return self.use_direct_kv_gather
 
     def kv_gather(
         self,
