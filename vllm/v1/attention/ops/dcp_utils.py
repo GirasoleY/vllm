@@ -528,26 +528,64 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         self.completion = self.received_signal.new_zeros((num_ubatches, 2))
         torch.accelerator.synchronize()
 
-    def gather(self, gathered_kv: torch.Tensor, local_kv: torch.Tensor) -> None:
+    def gather(
+        self,
+        local_kv: torch.Tensor,
+        dst_rows: torch.Tensor,
+        output_tokens: int,
+        plane_split_dim: int,
+        buffer_slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Publish valid rows into compact request-major KV planes."""
         ubatch = dbo_current_ubatch_id()
         if not 0 <= ubatch < self.num_ubatches:
             raise ValueError(
                 f"DCP kv-gather ubatch {ubatch} exceeds {self.num_ubatches} slots"
             )
+        if buffer_slot not in (0, 1):
+            raise ValueError(
+                f"DCP kv-gather buffer slot must be 0 or 1, got {buffer_slot}"
+            )
+        if dst_rows.dtype != torch.int32 or dst_rows.shape != (local_kv.shape[0],):
+            raise ValueError(
+                "DCP final-layout destination rows must be int32 with one "
+                f"entry per local row, got {dst_rows.dtype} {tuple(dst_rows.shape)}"
+            )
+        if not 0 < output_tokens <= self.max_gathered_tokens:
+            raise ValueError(
+                "DCP final-layout output tokens must be within the symmetric "
+                f"buffer capacity, got {output_tokens}/{self.max_gathered_tokens}"
+            )
+        token_dim = local_kv.shape[1]
+        if not 0 < plane_split_dim < token_dim:
+            raise ValueError(
+                "DCP final-layout plane split must be within the token row, "
+                f"got {plane_split_dim}/{token_dim}"
+            )
         kv_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
         torch.ops._C.direct_dcp_kv_gather(
             local_kv,
+            dst_rows,
             self.received_kv[ubatch],
             self.received_signal[ubatch],
             self.completion[ubatch],
             self.epoch[ubatch : ubatch + 1],
-            gathered_kv,
+            output_tokens,
+            plane_split_dim,
+            buffer_slot,
             self.world_size,
             self.rank,
             self.max_gathered_tokens,
             kv_multicast_ptr,
             signal_multicast_ptr,
         )
+        slot = self.received_kv[ubatch, buffer_slot].view(-1)
+        kv_c_capacity = self.max_gathered_tokens * plane_split_dim
+        kv_c = slot[:kv_c_capacity].view(self.max_gathered_tokens, 1, plane_split_dim)
+        k_pe = slot[kv_c_capacity:].view(
+            self.max_gathered_tokens, 1, token_dim - plane_split_dim
+        )
+        return kv_c[:output_tokens], k_pe[:output_tokens]
 
 
 @functools.cache
@@ -592,7 +630,7 @@ class DCPCombine(Protocol):
 class MLADCPManager:
     """Select and own layer-level collective implementations for MLA DCP."""
 
-    _kv_gather: Callable[[torch.Tensor, torch.Tensor], object]
+    _kv_gather: Callable[[torch.Tensor, torch.Tensor], object] | None
 
     def __init__(
         self,
@@ -614,6 +652,9 @@ class MLADCPManager:
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
+        self._direct_kv_gather_workspace: DirectDCPKVGatherWorkspace | None = None
+        self.use_direct_kv_gather = False
+        self._kv_gather = None
 
         self.combine = self._init_combine(
             num_heads,
@@ -723,9 +764,10 @@ class MLADCPManager:
         )
         if direct_workspace is not None:
             logger.info_once(
-                "Using direct symmetric-memory DCP chunked-context KV gather for MLA."
+                "Using direct symmetric-memory DCP final-layout KV multicast for MLA."
             )
-            self._kv_gather = direct_workspace.gather
+            self._direct_kv_gather_workspace = direct_workspace
+            self.use_direct_kv_gather = True
         else:
             self._kv_gather = functools.partial(
                 torch.distributed.all_gather_into_tensor,
@@ -737,4 +779,26 @@ class MLADCPManager:
         gathered_kv: torch.Tensor,
         local_kv: torch.Tensor,
     ) -> object:
-        return self._kv_gather(gathered_kv, local_kv)
+        kv_gather = self._kv_gather
+        if kv_gather is None:
+            raise RuntimeError("NCCL DCP KV gather is not selected")
+        return kv_gather(gathered_kv, local_kv)
+
+    def direct_kv_gather(
+        self,
+        local_kv: torch.Tensor,
+        dst_rows: torch.Tensor,
+        output_tokens: int,
+        plane_split_dim: int,
+        buffer_slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self._direct_kv_gather_workspace
+        if not self.use_direct_kv_gather or workspace is None:
+            raise RuntimeError("direct DCP KV gather is not enabled")
+        return workspace.gather(
+            local_kv,
+            dst_rows,
+            output_tokens,
+            plane_split_dim,
+            buffer_slot,
+        )

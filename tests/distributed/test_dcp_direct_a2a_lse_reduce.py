@@ -295,6 +295,42 @@ class TestDirectDCPGating:
                 _FakeProcessGroup(), torch.device("cpu"), 64, 3
             )
 
+    def test_kv_final_layout_returns_contiguous_planes(self, monkeypatch):
+        workspace = object.__new__(dcp_utils.DirectDCPKVGatherWorkspace)
+        workspace.num_ubatches = 1
+        workspace.max_gathered_tokens = 8
+        workspace.world_size = 2
+        workspace.rank = 0
+        workspace.multicast_ptrs = [(1, 2)]
+        workspace.received_kv = torch.arange(96, dtype=torch.bfloat16).view(1, 2, 8, 6)
+        workspace.received_signal = torch.zeros(1, 2, 2, dtype=torch.int32)
+        workspace.completion = torch.zeros(1, 2, dtype=torch.int32)
+        workspace.epoch = torch.zeros(1, dtype=torch.int64)
+        direct_op = MagicMock()
+        monkeypatch.setattr(dcp_utils, "dbo_current_ubatch_id", lambda: 0)
+        monkeypatch.setattr(
+            torch.ops._C,
+            "direct_dcp_kv_gather",
+            direct_op,
+            raising=False,
+        )
+
+        kv_c, k_pe = workspace.gather(
+            torch.empty(4, 6),
+            torch.arange(4, dtype=torch.int32),
+            output_tokens=4,
+            plane_split_dim=4,
+            buffer_slot=0,
+        )
+
+        assert kv_c.shape == (4, 1, 4)
+        assert k_pe.shape == (4, 1, 2)
+        assert kv_c.is_contiguous()
+        assert k_pe.is_contiguous()
+        assert kv_c.flatten().tolist() == list(range(16))
+        assert k_pe.flatten().tolist() == list(range(32, 40))
+        direct_op.assert_called_once()
+
     def test_q_gather_rejects_invalid_workspace_geometry(self):
         with pytest.raises(ValueError, match="ubatch"):
             dcp_utils.DirectDCPQGatherWorkspace(
@@ -369,9 +405,19 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
 
     assert manager.query_gather == direct_query.gather
     manager.init_kv_gather(workspace, 64)
-    gathered_kv, local_kv = torch.empty(4, 8), torch.empty(2, 8)
-    manager.kv_gather(gathered_kv, local_kv)
-    direct_kv.gather.assert_called_once_with(gathered_kv, local_kv)
+    local_kv = torch.empty(2, 8)
+    dst_rows = torch.tensor([0, 1], dtype=torch.int32)
+    compact_kv = (torch.empty(2, 1, 6), torch.empty(2, 1, 2))
+    direct_kv.gather.return_value = compact_kv
+    assert manager.use_direct_kv_gather
+    assert manager.direct_kv_gather(local_kv, dst_rows, 2, 6, 1) is compact_kv
+    direct_kv.gather.assert_called_once_with(
+        local_kv,
+        dst_rows,
+        2,
+        6,
+        1,
+    )
     output, lse = torch.empty(1), torch.empty(1)
     seq_lens = torch.ones(1, dtype=torch.int32)
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
