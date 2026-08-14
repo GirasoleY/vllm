@@ -785,11 +785,16 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        cache_is_populated: bool = False,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
-            return self.forward_cuda(hidden_states, q_quant, k, weights)
+            return self.forward_cuda(
+                hidden_states, q_quant, k, weights, cache_is_populated
+            )
         elif current_platform.is_rocm():
-            return self.forward_hip(hidden_states, q_quant, k, weights)
+            return self.forward_hip(
+                hidden_states, q_quant, k, weights, cache_is_populated
+            )
         else:
             raise NotImplementedError(
                 "SparseAttnIndexer native forward is only implemented for "
@@ -802,6 +807,7 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        cache_is_populated: bool = False,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
@@ -824,7 +830,7 @@ class SparseAttnIndexer(CustomOp):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
-            self.skip_k_cache_insert,
+            self.skip_k_cache_insert or cache_is_populated,
             self.use_pcp,
             _encode_layer_name(self.dense_mha_metadata_layer_name),
             self.use_fp4_cache,
@@ -840,8 +846,9 @@ class SparseAttnIndexer(CustomOp):
         q_fp8: torch.Tensor,
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        cache_is_populated: bool = False,
     ):
-        return self.forward_cuda(hidden_states, q_fp8, k, weights)
+        return self.forward_cuda(hidden_states, q_fp8, k, weights, cache_is_populated)
 
     def forward_hip(
         self,
@@ -849,6 +856,7 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        cache_is_populated: bool = False,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
@@ -875,7 +883,7 @@ class SparseAttnIndexer(CustomOp):
                 self.max_model_len,
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
-                skip_k_cache_insert=self.skip_k_cache_insert,
+                skip_k_cache_insert=self.skip_k_cache_insert or cache_is_populated,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

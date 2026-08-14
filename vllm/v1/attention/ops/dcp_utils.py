@@ -12,7 +12,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -551,13 +551,11 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
 
 
 class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
-    """Persistent NVLS workspace for GLM-5.2 sparse-layer cache dispatch.
+    """Persistent NVLS workspace for GLM-5.2 PCP cache dispatch.
 
-    This is deliberately a narrow, prefill-only primitive while the fused PCP
-    path is being evaluated. Each rank contributes the same number of local
-    tokens. The dispatch op writes final FP8 cache payloads directly into the
-    symmetric window; the combine op scatters those rows into local paged
-    caches using the gathered rank-major slot mappings.
+    Each rank contributes the same number of local tokens. The dispatch kernel
+    writes FP8 payloads into the symmetric window, and the combine kernel
+    scatters the acquired rows into local paged caches.
     """
 
     PACKED_ROW_BYTES = 720
@@ -607,7 +605,7 @@ class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
         self.phase = self.received_signal.new_zeros((num_ubatches, 1))
         torch.accelerator.synchronize()
 
-    def dispatch(
+    def forward(
         self,
         *,
         positions: torch.Tensor,
@@ -620,13 +618,17 @@ class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
         kv_eps: float,
         k_pe: torch.Tensor,
         k_pe_cos_sin: torch.Tensor,
-        index_k: torch.Tensor,
-        index_weight: torch.Tensor,
-        index_bias: torch.Tensor,
+        index_k: torch.Tensor | None,
+        index_weight: torch.Tensor | None,
+        index_bias: torch.Tensor | None,
         index_eps: float,
-        index_cos_sin: torch.Tensor,
+        index_cos_sin: torch.Tensor | None,
         topk_indices: torch.Tensor,
-    ) -> torch.Tensor:
+        mla_slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor | None,
+        mla_cache: torch.Tensor,
+        index_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         local_tokens = q_c.shape[0]
         if local_tokens > self.max_local_tokens:
             raise ValueError(
@@ -637,8 +639,14 @@ class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
         if not 0 <= ubatch < self.num_ubatches:
             raise ValueError(f"DCP ubatch {ubatch} exceeds {self.num_ubatches} slots")
         payload_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
-        q_out = torch.empty_like(q_c)
-        torch.ops._C.fused_norm_rope_pcp_dispatch(
+        global_tokens = self.world_size * local_tokens
+        mla_slot_mapping = mla_slot_mapping[:global_tokens].contiguous()
+        if index_slot_mapping is not None:
+            index_slot_mapping = index_slot_mapping[:global_tokens].contiguous()
+        q_out = q_c.new_empty(q_c.shape)
+        kv_out = kv_c.new_empty(kv_c.shape)
+        k_pe_out = k_pe.new_empty(k_pe.shape)
+        torch.ops._C.fused_norm_rope_pcp(
             positions,
             q_c,
             q_weight,
@@ -646,9 +654,11 @@ class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
             q_out,
             kv_c,
             kv_weight,
+            kv_out,
             mla_k_scale,
             kv_eps,
             k_pe,
+            k_pe_out,
             k_pe_cos_sin,
             index_k,
             index_weight,
@@ -661,83 +671,36 @@ class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
             self.completion[ubatch],
             self.epoch[ubatch : ubatch + 1],
             self.phase[ubatch],
-            self.world_size,
-            self.rank,
-            payload_multicast_ptr,
-            signal_multicast_ptr,
-        )
-        return q_out
-
-    def combine(
-        self,
-        *,
-        local_tokens: int,
-        mla_slot_mapping: torch.Tensor,
-        index_slot_mapping: torch.Tensor,
-        mla_cache: torch.Tensor,
-        index_cache: torch.Tensor,
-    ) -> None:
-        ubatch = dbo_current_ubatch_id()
-        torch.ops._C.fused_norm_rope_pcp_combine(
-            self.received_payload[ubatch],
-            self.epoch[ubatch : ubatch + 1],
             mla_slot_mapping,
             index_slot_mapping,
             mla_cache,
             index_cache,
-            local_tokens,
+            self.rank,
+            payload_multicast_ptr,
+            signal_multicast_ptr,
         )
+        return q_out, kv_out, k_pe_out
 
-    def dispatch_combine(
-        self,
-        *,
-        positions: torch.Tensor,
-        q_c: torch.Tensor,
-        q_weight: torch.Tensor,
-        q_eps: float,
-        kv_c: torch.Tensor,
-        kv_weight: torch.Tensor,
-        mla_k_scale: torch.Tensor,
-        kv_eps: float,
-        k_pe: torch.Tensor,
-        k_pe_cos_sin: torch.Tensor,
-        index_k: torch.Tensor,
-        index_weight: torch.Tensor,
-        index_bias: torch.Tensor,
-        index_eps: float,
-        index_cos_sin: torch.Tensor,
-        topk_indices: torch.Tensor,
-        mla_slot_mapping: torch.Tensor,
-        index_slot_mapping: torch.Tensor,
-        mla_cache: torch.Tensor,
-        index_cache: torch.Tensor,
-    ) -> torch.Tensor:
-        q_out = self.dispatch(
-            positions=positions,
-            q_c=q_c,
-            q_weight=q_weight,
-            q_eps=q_eps,
-            kv_c=kv_c,
-            kv_weight=kv_weight,
-            mla_k_scale=mla_k_scale,
-            kv_eps=kv_eps,
-            k_pe=k_pe,
-            k_pe_cos_sin=k_pe_cos_sin,
-            index_k=index_k,
-            index_weight=index_weight,
-            index_bias=index_bias,
-            index_eps=index_eps,
-            index_cos_sin=index_cos_sin,
-            topk_indices=topk_indices,
-        )
-        self.combine(
-            local_tokens=q_c.shape[0],
-            mla_slot_mapping=mla_slot_mapping,
-            index_slot_mapping=index_slot_mapping,
-            mla_cache=mla_cache,
-            index_cache=index_cache,
-        )
-        return q_out
+
+@functools.cache
+def get_fused_pcp_norm_rope_workspace(
+    device: torch.device,
+    max_local_tokens: int,
+    num_ubatches: int,
+) -> DirectPCPFusedNormRopeWorkspace | None:
+    group = get_pcp_group()
+    if not _direct_dcp_multicast_enabled(
+        group, torch.uint8, envs.VLLM_USE_FUSED_PCP_NORM_ROPE
+    ):
+        return None
+    workspace = DirectPCPFusedNormRopeWorkspace(
+        group.device_group,
+        device,
+        max_local_tokens,
+        num_ubatches,
+    )
+    logger.info_once("Using fused symmetric-memory PCP norm/RoPE cache dispatch.")
+    return workspace
 
 
 @functools.cache

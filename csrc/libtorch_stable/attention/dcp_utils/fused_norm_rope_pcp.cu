@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 
 #include "../../dispatch_utils.h"
@@ -44,10 +45,13 @@ constexpr int kIndexerDim = 128;
 constexpr int kTopK = 2048;
 constexpr int kMlaRowBytes = kKvLoraDim + kRopeDim;
 constexpr int kIndexerScaleOffset = kMlaRowBytes + kIndexerDim;
-constexpr int kPackedRowBytes = 720;
+constexpr int kIndexerRowBytes = 720;
+constexpr int kSharedRowBytes = kMlaRowBytes;
+constexpr int kMaxPackedRowBytes = kIndexerRowBytes;
 constexpr float kFp8Max = 448.0f;
 
-static_assert(kPackedRowBytes % sizeof(uint4) == 0);
+static_assert(kIndexerRowBytes % sizeof(uint4) == 0);
+static_assert(kSharedRowBytes % sizeof(uint4) == 0);
 
 template <typename scalar_t>
 __device__ __forceinline__ float load_half(const scalar_t* ptr) {
@@ -61,6 +65,23 @@ __device__ __forceinline__ void store_half(scalar_t* ptr, float value) {
   using Converter = vllm::_typeConvert<scalar_t>;
   using device_t = typename Converter::hip_type;
   *reinterpret_cast<device_t*>(ptr) = Converter::convert(value);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float round_half(float value) {
+  using Converter = vllm::_typeConvert<scalar_t>;
+  using device_t = typename Converter::hip_type;
+  device_t rounded = Converter::convert(value);
+  return Converter::convert(rounded);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float load_cos_sin(const void* ptr, int64_t offset,
+                                              bool is_float) {
+  if (is_float) {
+    return static_cast<const float*>(ptr)[offset];
+  }
+  return load_half(static_cast<const scalar_t*>(ptr) + offset);
 }
 
 __device__ __forceinline__ float warp_sum(float value) {
@@ -160,20 +181,24 @@ __device__ __forceinline__ uint32_t establish_epoch(int32_t* phase,
 template <typename scalar_t>
 __global__ void fused_norm_rope_pcp_dispatch_kernel(
     const int64_t* __restrict__ positions, const scalar_t* __restrict__ q_c,
-    const scalar_t* __restrict__ q_weight, float q_eps,
+    int64_t q_stride, const scalar_t* __restrict__ q_weight, float q_eps,
     scalar_t* __restrict__ q_out, const scalar_t* __restrict__ kv_c,
-    const scalar_t* __restrict__ kv_weight, float kv_eps,
+    int64_t kv_stride, const scalar_t* __restrict__ kv_weight,
+    scalar_t* __restrict__ kv_out, int64_t kv_out_stride, float kv_eps,
     const float* __restrict__ mla_k_scale, const scalar_t* __restrict__ k_pe,
-    const float* __restrict__ k_pe_cos_sin,
-    const scalar_t* __restrict__ index_k,
+    int64_t k_pe_stride, scalar_t* __restrict__ k_pe_out,
+    int64_t k_pe_out_stride, const void* __restrict__ k_pe_cos_sin,
+    int64_t k_pe_cos_sin_stride, bool k_pe_cos_sin_is_float,
+    const scalar_t* __restrict__ index_k, int64_t index_k_stride,
     const float* __restrict__ index_weight,
     const float* __restrict__ index_bias, float index_eps,
-    const float* __restrict__ index_cos_sin, int32_t* __restrict__ topk_indices,
+    const void* __restrict__ index_cos_sin, int64_t index_cos_sin_stride,
+    bool index_cos_sin_is_float, int32_t* __restrict__ topk_indices,
     uint4* __restrict__ payload_mc, uint32_t* __restrict__ signal_mc,
     const uint32_t* __restrict__ received_signal,
     uint32_t* __restrict__ completion, int64_t* __restrict__ epoch,
     int32_t* __restrict__ phase, int world_size, int rank, int max_local_tokens,
-    int topk_stride) {
+    int topk_stride, bool has_indexer) {
   __shared__ float reduce_scratch[8];
   __shared__ float kv_values[kKvLoraDim];
   __shared__ float k_pe_values[kRopeDim];
@@ -192,8 +217,7 @@ __global__ void fused_norm_rope_pcp_dispatch_kernel(
 #pragma unroll
   for (int idx = 0; idx < kQLoraDim / kThreads; ++idx) {
     int dim = tid + idx * kThreads;
-    float value =
-        load_half(q_c + static_cast<int64_t>(token) * kQLoraDim + dim);
+    float value = load_half(q_c + static_cast<int64_t>(token) * q_stride + dim);
     q_values[idx] = value;
     q_sum_sq += value * value;
   }
@@ -215,7 +239,7 @@ __global__ void fused_norm_rope_pcp_dispatch_kernel(
   for (int idx = 0; idx < kKvLoraDim / kThreads; ++idx) {
     int dim = tid + idx * kThreads;
     float value =
-        load_half(kv_c + static_cast<int64_t>(token) * kKvLoraDim + dim);
+        load_half(kv_c + static_cast<int64_t>(token) * kv_stride + dim);
     kv_values[dim] = value;
     kv_sum_sq += value * value;
   }
@@ -226,63 +250,88 @@ __global__ void fused_norm_rope_pcp_dispatch_kernel(
   for (int idx = 0; idx < kKvLoraDim / kThreads; ++idx) {
     int dim = tid + idx * kThreads;
     float weight = load_half(kv_weight + dim);
-    kv_values[dim] *= kv_inv_rms * weight;
+    kv_values[dim] = round_half<scalar_t>(kv_values[dim] * kv_inv_rms * weight);
+    store_half(kv_out + static_cast<int64_t>(token) * kv_out_stride + dim,
+               kv_values[dim]);
   }
 
   // GLM uses adjacent-pair (interleaved) RoPE for MLA K-pe.
   if (tid < kRopeDim / 2) {
     int64_t position = positions[token];
-    const float* cos_sin = k_pe_cos_sin + position * kRopeDim;
-    float cosine = cos_sin[tid];
-    float sine = cos_sin[tid + kRopeDim / 2];
-    const scalar_t* row = k_pe + static_cast<int64_t>(token) * kRopeDim;
+    int64_t cos_sin_offset = position * k_pe_cos_sin_stride;
+    float cosine = load_cos_sin<scalar_t>(k_pe_cos_sin, cos_sin_offset + tid,
+                                          k_pe_cos_sin_is_float);
+    float sine = load_cos_sin<scalar_t>(k_pe_cos_sin,
+                                        cos_sin_offset + tid + kRopeDim / 2,
+                                        k_pe_cos_sin_is_float);
+    const scalar_t* row = k_pe + static_cast<int64_t>(token) * k_pe_stride;
     float x = load_half(row + 2 * tid);
     float y = load_half(row + 2 * tid + 1);
-    k_pe_values[2 * tid] = x * cosine - y * sine;
-    k_pe_values[2 * tid + 1] = y * cosine + x * sine;
+    k_pe_values[2 * tid] = round_half<scalar_t>(x * cosine - y * sine);
+    k_pe_values[2 * tid + 1] = round_half<scalar_t>(y * cosine + x * sine);
+    scalar_t* output_row =
+        k_pe_out + static_cast<int64_t>(token) * k_pe_out_stride;
+    store_half(output_row + 2 * tid, k_pe_values[2 * tid]);
+    store_half(output_row + 2 * tid + 1, k_pe_values[2 * tid + 1]);
   }
+
+  // Shared layers skip all indexer reductions below.  Synchronize the KV and
+  // K-pe producers explicitly before either branch packs their shared rows.
+  __syncthreads();
 
   // Indexer K LayerNorm, interleaved RoPE, and UE8M0 FP8 quantization.
   float index_value = 0.0f;
-  if (tid < kIndexerDim) {
-    index_value =
-        load_half(index_k + static_cast<int64_t>(token) * kIndexerDim + tid);
+  if (has_indexer) {
+    if (tid < kIndexerDim) {
+      index_value = load_half(
+          index_k + static_cast<int64_t>(token) * index_k_stride + tid);
+    }
   }
-  float index_mean =
-      block_sum(index_value, reduce_scratch) / static_cast<float>(kIndexerDim);
-  float centered = tid < kIndexerDim ? index_value - index_mean : 0.0f;
-  float index_variance = block_sum(centered * centered, reduce_scratch) /
-                         static_cast<float>(kIndexerDim);
-  if (tid < kIndexerDim) {
-    index_values[tid] =
-        centered * rsqrtf(index_variance + index_eps) * index_weight[tid] +
-        index_bias[tid];
+  float index_scale = 1.0f;
+  if (has_indexer) {
+    float index_mean = block_sum(index_value, reduce_scratch) /
+                       static_cast<float>(kIndexerDim);
+    float centered = tid < kIndexerDim ? index_value - index_mean : 0.0f;
+    float index_variance = block_sum(centered * centered, reduce_scratch) /
+                           static_cast<float>(kIndexerDim);
+    if (tid < kIndexerDim) {
+      index_values[tid] =
+          centered * rsqrtf(index_variance + index_eps) * index_weight[tid] +
+          index_bias[tid];
+    }
+    __syncthreads();
+    if (tid < kRopeDim / 2) {
+      int64_t position = positions[token];
+      int64_t cos_sin_offset = position * index_cos_sin_stride;
+      float cosine = load_cos_sin<scalar_t>(index_cos_sin, cos_sin_offset + tid,
+                                            index_cos_sin_is_float);
+      float sine = load_cos_sin<scalar_t>(index_cos_sin,
+                                          cos_sin_offset + tid + kRopeDim / 2,
+                                          index_cos_sin_is_float);
+      float x = index_values[2 * tid];
+      float y = index_values[2 * tid + 1];
+      index_values[2 * tid] = x * cosine - y * sine;
+      index_values[2 * tid + 1] = y * cosine + x * sine;
+    }
+    __syncthreads();
+    if (tid < kIndexerDim) {
+      index_values[tid] = round_half<scalar_t>(index_values[tid]);
+    }
+    __syncthreads();
+    float local_max = tid < kIndexerDim ? fabsf(index_values[tid]) : 0.0f;
+    index_scale =
+        fmaxf(block_max(local_max, reduce_scratch), 1.0e-4f) / kFp8Max;
+    index_scale = exp2f(ceilf(log2f(index_scale)));
   }
-  __syncthreads();
-  if (tid < kRopeDim / 2) {
-    int64_t position = positions[token];
-    const float* cos_sin = index_cos_sin + position * kRopeDim;
-    float cosine = cos_sin[tid];
-    float sine = cos_sin[tid + kRopeDim / 2];
-    float x = index_values[2 * tid];
-    float y = index_values[2 * tid + 1];
-    index_values[2 * tid] = x * cosine - y * sine;
-    index_values[2 * tid + 1] = y * cosine + x * sine;
-  }
-  __syncthreads();
-  float local_max = tid < kIndexerDim ? fabsf(index_values[tid]) : 0.0f;
-  float index_scale =
-      fmaxf(block_max(local_max, reduce_scratch), 1.0e-4f) / kFp8Max;
-  index_scale = exp2f(ceilf(log2f(index_scale)));
 
   int64_t slot_stride =
-      static_cast<int64_t>(world_size) * max_local_tokens * kPackedRowBytes;
-  int64_t row_offset =
-      static_cast<int64_t>(parity) * slot_stride +
-      (static_cast<int64_t>(rank) * max_local_tokens + token) * kPackedRowBytes;
+      static_cast<int64_t>(world_size) * max_local_tokens * kMaxPackedRowBytes;
+  int64_t row_offset = static_cast<int64_t>(parity) * slot_stride +
+                       (static_cast<int64_t>(rank) * max_local_tokens + token) *
+                           kMaxPackedRowBytes;
   auto* row_mc = reinterpret_cast<uint8_t*>(payload_mc) + row_offset;
 
-  // Quantize directly into the symmetric payload.  No BF16 K tensor exists.
+  // Quantize the rounded BF16 values directly into the symmetric payload.
   if (tid < kKvLoraDim / 16) {
     float values[16];
 #pragma unroll
@@ -303,24 +352,25 @@ __global__ void fused_norm_rope_pcp_dispatch_kernel(
     multimem_store_16(reinterpret_cast<uint4*>(row_mc + kKvLoraDim) + tid,
                       pack_fp8_16(values, inverse_scale));
   }
-  if (tid < kIndexerDim / 16) {
-    float values[16];
+  if (has_indexer) {
+    if (tid < kIndexerDim / 16) {
+      float values[16];
 #pragma unroll
-    for (int idx = 0; idx < 16; ++idx) {
-      values[idx] = index_values[tid * 16 + idx];
+      for (int idx = 0; idx < 16; ++idx) {
+        values[idx] = index_values[tid * 16 + idx];
+      }
+      multimem_store_16(reinterpret_cast<uint4*>(row_mc + kMlaRowBytes) + tid,
+                        pack_fp8_16(values, 1.0f / index_scale));
     }
-    multimem_store_16(reinterpret_cast<uint4*>(row_mc + kMlaRowBytes) + tid,
-                      pack_fp8_16(values, 1.0f / index_scale));
-  }
-  if (tid == 0) {
-    uint4 scale_and_padding = {0u, 0u, 0u, 0u};
-    scale_and_padding.x = __float_as_uint(index_scale);
-    multimem_store_16(reinterpret_cast<uint4*>(row_mc + kIndexerScaleOffset),
-                      scale_and_padding);
-  }
-
-  for (int idx = tid; idx < kTopK; idx += blockDim.x) {
-    topk_indices[static_cast<int64_t>(token) * topk_stride + idx] = -1;
+    if (tid == 0) {
+      uint4 scale_and_padding = {0u, 0u, 0u, 0u};
+      scale_and_padding.x = __float_as_uint(index_scale);
+      multimem_store_16(reinterpret_cast<uint4*>(row_mc + kIndexerScaleOffset),
+                        scale_and_padding);
+    }
+    for (int idx = tid; idx < kTopK; idx += blockDim.x) {
+      topk_indices[static_cast<int64_t>(token) * topk_stride + idx] = -1;
+    }
   }
 
   __threadfence_system();
@@ -355,7 +405,7 @@ __global__ void fused_norm_rope_pcp_combine_kernel(
     uint8_t* __restrict__ mla_cache, int64_t mla_block_stride,
     int64_t mla_token_stride, uint8_t* __restrict__ index_cache,
     int64_t index_block_stride, int world_size, int local_tokens,
-    int max_local_tokens, int cache_block_size) {
+    int max_local_tokens, int cache_block_size, bool has_indexer) {
   int global_token = blockIdx.x;
   int source = global_token / local_tokens;
   int source_token = global_token - source * local_tokens;
@@ -366,7 +416,7 @@ __global__ void fused_norm_rope_pcp_combine_kernel(
   int64_t row_offset =
       (static_cast<int64_t>(parity) * world_size * max_local_tokens +
        static_cast<int64_t>(source) * max_local_tokens + source_token) *
-      kPackedRowBytes;
+      kMaxPackedRowBytes;
   const uint8_t* row = received_payload + row_offset;
 
   int64_t mla_slot = mla_slot_mapping[global_token];
@@ -382,22 +432,24 @@ __global__ void fused_norm_rope_pcp_combine_kernel(
     }
   }
 
-  int64_t index_slot = index_slot_mapping[global_token];
-  if (index_slot >= 0) {
-    int64_t block = index_slot / cache_block_size;
-    int64_t block_offset = index_slot % cache_block_size;
-    uint8_t* block_base = index_cache + block * index_block_stride;
-    uint8_t* value_destination = block_base + block_offset * kIndexerDim;
-    for (int chunk = threadIdx.x; chunk < kIndexerDim / 16;
-         chunk += blockDim.x) {
-      reinterpret_cast<uint4*>(value_destination)[chunk] =
-          reinterpret_cast<const uint4*>(row + kMlaRowBytes)[chunk];
-    }
-    if (threadIdx.x == 0) {
-      uint8_t* scale_destination =
-          block_base + cache_block_size * kIndexerDim + block_offset * 4;
-      *reinterpret_cast<uint32_t*>(scale_destination) =
-          *reinterpret_cast<const uint32_t*>(row + kIndexerScaleOffset);
+  if (has_indexer) {
+    int64_t index_slot = index_slot_mapping[global_token];
+    if (index_slot >= 0) {
+      int64_t block = index_slot / cache_block_size;
+      int64_t block_offset = index_slot % cache_block_size;
+      uint8_t* block_base = index_cache + block * index_block_stride;
+      uint8_t* value_destination = block_base + block_offset * kIndexerDim;
+      for (int chunk = threadIdx.x; chunk < kIndexerDim / 16;
+           chunk += blockDim.x) {
+        reinterpret_cast<uint4*>(value_destination)[chunk] =
+            reinterpret_cast<const uint4*>(row + kMlaRowBytes)[chunk];
+      }
+      if (threadIdx.x == 0) {
+        uint8_t* scale_destination =
+            block_base + cache_block_size * kIndexerDim + block_offset * 4;
+        *reinterpret_cast<uint32_t*>(scale_destination) =
+            *reinterpret_cast<const uint32_t*>(row + kIndexerScaleOffset);
+      }
     }
   }
 }
@@ -406,9 +458,9 @@ void fused_norm_rope_pcp_dispatch(
     const torch::stable::Tensor& positions, const torch::stable::Tensor& q_c,
     const torch::stable::Tensor& q_weight, double q_eps,
     torch::stable::Tensor& q_out, const torch::stable::Tensor& kv_c,
-    const torch::stable::Tensor& kv_weight,
+    const torch::stable::Tensor& kv_weight, torch::stable::Tensor& kv_out,
     const torch::stable::Tensor& mla_k_scale, double kv_eps,
-    const torch::stable::Tensor& k_pe,
+    const torch::stable::Tensor& k_pe, torch::stable::Tensor& k_pe_out,
     const torch::stable::Tensor& k_pe_cos_sin,
     const torch::stable::Tensor& index_k,
     const torch::stable::Tensor& index_weight,
@@ -418,30 +470,32 @@ void fused_norm_rope_pcp_dispatch(
     torch::stable::Tensor& received_payload,
     torch::stable::Tensor& received_signal, torch::stable::Tensor& completion,
     torch::stable::Tensor& epoch, torch::stable::Tensor& phase,
-    int64_t world_size, int64_t rank, int64_t payload_mc_ptr,
+    int64_t world_size, int64_t rank, bool has_indexer, int64_t payload_mc_ptr,
     int64_t signal_mc_ptr) {
   using torch::headeronly::ScalarType;
-  STD_TORCH_CHECK(q_c.is_cuda() && q_c.is_contiguous() && q_c.dim() == 2 &&
-                      q_c.size(1) == kQLoraDim,
-                  "q_c must be contiguous CUDA [T,2048]");
+  auto valid_rows = [](const torch::stable::Tensor& tensor, int64_t rows,
+                       int64_t columns, ScalarType dtype) {
+    return tensor.is_cuda() && tensor.dim() == 2 && tensor.size(0) == rows &&
+           tensor.size(1) == columns && tensor.stride(1) == 1 &&
+           tensor.scalar_type() == dtype;
+  };
+  STD_TORCH_CHECK(q_c.is_cuda() && q_c.dim() == 2 && q_c.size(1) == kQLoraDim &&
+                      q_c.stride(1) == 1,
+                  "q_c must be CUDA [T,2048] with contiguous rows");
   ScalarType dtype = q_c.scalar_type();
   STD_TORCH_CHECK(dtype == ScalarType::Half || dtype == ScalarType::BFloat16,
                   "fused_norm_rope_pcp only supports FP16/BF16 inputs");
   int64_t num_tokens = q_c.size(0);
   STD_TORCH_CHECK(num_tokens > 0, "fused_norm_rope_pcp requires tokens");
-  auto same_input = [&](const torch::stable::Tensor& tensor) {
-    return tensor.is_cuda() && tensor.is_contiguous() &&
-           tensor.scalar_type() == dtype && tensor.size(0) == num_tokens;
-  };
-  STD_TORCH_CHECK(
-      same_input(kv_c) && kv_c.dim() == 2 && kv_c.size(1) == kKvLoraDim,
-      "kv_c must be contiguous [T,512] with the Q dtype");
-  STD_TORCH_CHECK(
-      same_input(k_pe) && k_pe.dim() == 2 && k_pe.size(1) == kRopeDim,
-      "k_pe must be contiguous [T,64] with the Q dtype");
-  STD_TORCH_CHECK(same_input(index_k) && index_k.dim() == 2 &&
-                      index_k.size(1) == kIndexerDim,
-                  "index_k must be contiguous [T,128] with the Q dtype");
+  STD_TORCH_CHECK(valid_rows(kv_c, num_tokens, kKvLoraDim, dtype),
+                  "kv_c must be [T,512] with contiguous rows and the Q dtype");
+  STD_TORCH_CHECK(valid_rows(k_pe, num_tokens, kRopeDim, dtype),
+                  "k_pe must be [T,64] with contiguous rows and the Q dtype");
+  if (has_indexer) {
+    STD_TORCH_CHECK(
+        valid_rows(index_k, num_tokens, kIndexerDim, dtype),
+        "index_k must be [T,128] with contiguous rows and the Q dtype");
+  }
   STD_TORCH_CHECK(q_weight.is_cuda() && q_weight.is_contiguous() &&
                       q_weight.scalar_type() == dtype &&
                       q_weight.numel() == kQLoraDim,
@@ -454,34 +508,51 @@ void fused_norm_rope_pcp_dispatch(
                       mla_k_scale.scalar_type() == ScalarType::Float &&
                       mla_k_scale.numel() == 1,
                   "mla_k_scale must be one CUDA float32 value");
-  STD_TORCH_CHECK(index_weight.is_cuda() && index_weight.is_contiguous() &&
-                      index_weight.scalar_type() == ScalarType::Float &&
-                      index_weight.numel() == kIndexerDim &&
-                      index_bias.is_cuda() && index_bias.is_contiguous() &&
-                      index_bias.scalar_type() == ScalarType::Float &&
-                      index_bias.numel() == kIndexerDim,
-                  "indexer norm weight/bias must be CUDA float32 [128]");
+  if (has_indexer) {
+    STD_TORCH_CHECK(index_weight.is_cuda() && index_weight.is_contiguous() &&
+                        index_weight.scalar_type() == ScalarType::Float &&
+                        index_weight.numel() == kIndexerDim &&
+                        index_bias.is_cuda() && index_bias.is_contiguous() &&
+                        index_bias.scalar_type() == ScalarType::Float &&
+                        index_bias.numel() == kIndexerDim,
+                    "indexer norm weight/bias must be CUDA float32 [128]");
+  }
   STD_TORCH_CHECK(positions.is_cuda() && positions.is_contiguous() &&
                       positions.scalar_type() == ScalarType::Long &&
                       positions.numel() == num_tokens,
                   "positions must be contiguous CUDA int64 [T]");
   auto valid_cos_sin = [&](const torch::stable::Tensor& tensor) {
-    return tensor.is_cuda() && tensor.is_contiguous() && tensor.dim() == 2 &&
-           tensor.size(1) == kRopeDim &&
-           tensor.scalar_type() == ScalarType::Float;
+    auto cache_dtype = tensor.scalar_type();
+    return tensor.is_cuda() && tensor.dim() == 2 &&
+           tensor.size(1) == kRopeDim && tensor.stride(1) == 1 &&
+           (cache_dtype == ScalarType::Float || cache_dtype == dtype);
   };
-  STD_TORCH_CHECK(valid_cos_sin(k_pe_cos_sin) && valid_cos_sin(index_cos_sin),
-                  "RoPE caches must be contiguous CUDA float32 [P,64]");
+  STD_TORCH_CHECK(valid_cos_sin(k_pe_cos_sin),
+                  "K RoPE cache must be CUDA float32/input-dtype [P,64] "
+                  "with contiguous rows");
+  if (has_indexer) {
+    STD_TORCH_CHECK(valid_cos_sin(index_cos_sin),
+                    "index RoPE cache must be CUDA float32/input-dtype "
+                    "[P,64] with contiguous rows");
+  }
   STD_TORCH_CHECK(q_out.is_cuda() && q_out.is_contiguous() &&
                       q_out.scalar_type() == dtype && q_out.dim() == 2 &&
                       q_out.size(0) == num_tokens && q_out.size(1) == kQLoraDim,
                   "q_out must be contiguous [T,2048] with the Q dtype");
-  STD_TORCH_CHECK(topk_indices.is_cuda() && topk_indices.is_contiguous() &&
-                      topk_indices.scalar_type() == ScalarType::Int &&
-                      topk_indices.dim() == 2 &&
-                      topk_indices.size(0) == num_tokens &&
-                      topk_indices.size(1) >= kTopK,
-                  "topk_indices must be contiguous CUDA int32 [T,>=2048]");
+  STD_TORCH_CHECK(
+      valid_rows(kv_out, num_tokens, kKvLoraDim, dtype),
+      "kv_out must be [T,512] with contiguous rows and the Q dtype");
+  STD_TORCH_CHECK(
+      valid_rows(k_pe_out, num_tokens, kRopeDim, dtype),
+      "k_pe_out must be [T,64] with contiguous rows and the Q dtype");
+  if (has_indexer) {
+    STD_TORCH_CHECK(topk_indices.is_cuda() && topk_indices.is_contiguous() &&
+                        topk_indices.scalar_type() == ScalarType::Int &&
+                        topk_indices.dim() == 2 &&
+                        topk_indices.size(0) >= num_tokens &&
+                        topk_indices.size(1) >= kTopK,
+                    "topk_indices must be contiguous CUDA int32 [>=T,>=2048]");
+  }
   STD_TORCH_CHECK(world_size > 1 && rank >= 0 && rank < world_size,
                   "invalid PCP world_size/rank");
   STD_TORCH_CHECK(
@@ -489,7 +560,7 @@ void fused_norm_rope_pcp_dispatch(
           received_payload.scalar_type() == ScalarType::Byte &&
           received_payload.dim() == 4 && received_payload.size(0) == 2 &&
           received_payload.size(1) == world_size &&
-          received_payload.size(3) == kPackedRowBytes &&
+          received_payload.size(3) == kMaxPackedRowBytes &&
           num_tokens <= received_payload.size(2),
       "received_payload must be uint8 [2,W,max_local,720]");
   STD_TORCH_CHECK(
@@ -515,7 +586,6 @@ void fused_norm_rope_pcp_dispatch(
   int device = q_c.get_device_index();
   STD_TORCH_CHECK(
       kv_c.get_device_index() == device && k_pe.get_device_index() == device &&
-          index_k.get_device_index() == device &&
           received_payload.get_device_index() == device &&
           received_signal.get_device_index() == device,
       "fused_norm_rope_pcp tensors must be on the same CUDA device");
@@ -529,18 +599,29 @@ void fused_norm_rope_pcp_dispatch(
         <<<num_tokens, kThreads, 0, stream>>>(
             positions.const_data_ptr<int64_t>(),
             reinterpret_cast<const scalar_t*>(q_c.const_data_ptr()),
+            q_c.stride(0),
             reinterpret_cast<const scalar_t*>(q_weight.const_data_ptr()),
             static_cast<float>(q_eps),
             reinterpret_cast<scalar_t*>(q_out.mutable_data_ptr()),
             reinterpret_cast<const scalar_t*>(kv_c.const_data_ptr()),
+            kv_c.stride(0),
             reinterpret_cast<const scalar_t*>(kv_weight.const_data_ptr()),
-            static_cast<float>(kv_eps), mla_k_scale.const_data_ptr<float>(),
+            reinterpret_cast<scalar_t*>(kv_out.mutable_data_ptr()),
+            kv_out.stride(0), static_cast<float>(kv_eps),
+            mla_k_scale.const_data_ptr<float>(),
             reinterpret_cast<const scalar_t*>(k_pe.const_data_ptr()),
-            k_pe_cos_sin.const_data_ptr<float>(),
+            k_pe.stride(0),
+            reinterpret_cast<scalar_t*>(k_pe_out.mutable_data_ptr()),
+            k_pe_out.stride(0), k_pe_cos_sin.const_data_ptr(),
+            k_pe_cos_sin.stride(0),
+            k_pe_cos_sin.scalar_type() == ScalarType::Float,
             reinterpret_cast<const scalar_t*>(index_k.const_data_ptr()),
+            has_indexer ? index_k.stride(0) : 0,
             index_weight.const_data_ptr<float>(),
             index_bias.const_data_ptr<float>(), static_cast<float>(index_eps),
-            index_cos_sin.const_data_ptr<float>(),
+            index_cos_sin.const_data_ptr(),
+            has_indexer ? index_cos_sin.stride(0) : 0,
+            has_indexer && index_cos_sin.scalar_type() == ScalarType::Float,
             topk_indices.mutable_data_ptr<int32_t>(),
             reinterpret_cast<uint4*>(static_cast<uintptr_t>(payload_mc_ptr)),
             reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(signal_mc_ptr)),
@@ -549,7 +630,7 @@ void fused_norm_rope_pcp_dispatch(
             reinterpret_cast<uint32_t*>(completion.mutable_data_ptr<int32_t>()),
             epoch.mutable_data_ptr<int64_t>(),
             phase.mutable_data_ptr<int32_t>(), static_cast<int>(world_size),
-            static_cast<int>(rank), max_local_tokens, topk_stride);
+            static_cast<int>(rank), max_local_tokens, topk_stride, has_indexer);
   });
   check_cuda_launch("fused_norm_rope_pcp_dispatch");
 }
@@ -560,13 +641,13 @@ void fused_norm_rope_pcp_combine(
     const torch::stable::Tensor& mla_slot_mapping,
     const torch::stable::Tensor& index_slot_mapping,
     torch::stable::Tensor& mla_cache, torch::stable::Tensor& index_cache,
-    int64_t local_tokens) {
+    int64_t local_tokens, bool has_indexer) {
   using torch::headeronly::ScalarType;
   STD_TORCH_CHECK(
       received_payload.is_cuda() && received_payload.is_contiguous() &&
           received_payload.scalar_type() == ScalarType::Byte &&
           received_payload.dim() == 4 && received_payload.size(0) == 2 &&
-          received_payload.size(3) == kPackedRowBytes,
+          received_payload.size(3) == kMaxPackedRowBytes,
       "received_payload must be uint8 [2,W,max_local,720]");
   int64_t world_size = received_payload.size(1);
   int64_t max_local_tokens = received_payload.size(2);
@@ -577,9 +658,12 @@ void fused_norm_rope_pcp_combine(
            mapping.scalar_type() == ScalarType::Long &&
            mapping.numel() == world_size * local_tokens;
   };
-  STD_TORCH_CHECK(
-      valid_mapping(mla_slot_mapping) && valid_mapping(index_slot_mapping),
-      "slot mappings must be CUDA int64 [W*local_tokens]");
+  STD_TORCH_CHECK(valid_mapping(mla_slot_mapping),
+                  "MLA slot mapping must be CUDA int64 [W*local_tokens]");
+  if (has_indexer) {
+    STD_TORCH_CHECK(valid_mapping(index_slot_mapping),
+                    "index slot mapping must be CUDA int64 [W*local_tokens]");
+  }
   STD_TORCH_CHECK(epoch.is_cuda() && epoch.is_contiguous() &&
                       epoch.scalar_type() == ScalarType::Long &&
                       epoch.numel() == 1,
@@ -590,20 +674,23 @@ void fused_norm_rope_pcp_combine(
                        mla_dtype == ScalarType::Float8_e4m3fn) &&
                       mla_cache.dim() == 3 && mla_cache.size(2) == kMlaRowBytes,
                   "MLA cache must be contiguous byte/FP8 [B,block,576]");
-  STD_TORCH_CHECK(index_cache.is_cuda() && index_cache.is_contiguous() &&
-                      index_cache.scalar_type() == ScalarType::Byte &&
-                      index_cache.dim() == 3 &&
-                      index_cache.size(2) >= kIndexerDim + 4,
-                  "index cache must be contiguous uint8 [B,block,>=132]");
-  STD_TORCH_CHECK(mla_cache.size(1) == index_cache.size(1),
-                  "MLA and index caches must use the same block size");
+  if (has_indexer) {
+    STD_TORCH_CHECK(index_cache.is_cuda() && index_cache.is_contiguous() &&
+                        index_cache.scalar_type() == ScalarType::Byte &&
+                        index_cache.dim() == 3 &&
+                        index_cache.size(2) >= kIndexerDim + 4,
+                    "index cache must be contiguous uint8 [B,block,>=132]");
+    STD_TORCH_CHECK(mla_cache.size(1) == index_cache.size(1),
+                    "MLA and index caches must use the same block size");
+  }
   int device = received_payload.get_device_index();
-  STD_TORCH_CHECK(epoch.get_device_index() == device &&
-                      mla_slot_mapping.get_device_index() == device &&
-                      index_slot_mapping.get_device_index() == device &&
-                      mla_cache.get_device_index() == device &&
-                      index_cache.get_device_index() == device,
-                  "fused_norm_rope_pcp tensors must be on one device");
+  STD_TORCH_CHECK(
+      epoch.get_device_index() == device &&
+          mla_slot_mapping.get_device_index() == device &&
+          mla_cache.get_device_index() == device &&
+          (!has_indexer || (index_slot_mapping.get_device_index() == device &&
+                            index_cache.get_device_index() == device)),
+      "fused_norm_rope_pcp tensors must be on one device");
 
   const torch::stable::accelerator::DeviceGuard device_guard(device);
   cudaStream_t stream = get_current_cuda_stream(device);
@@ -616,35 +703,82 @@ void fused_norm_rope_pcp_combine(
       reinterpret_cast<uint8_t*>(mla_cache.mutable_data_ptr()),
       mla_cache.stride(0), mla_cache.stride(1),
       reinterpret_cast<uint8_t*>(index_cache.mutable_data_ptr()),
-      index_cache.stride(0), static_cast<int>(world_size),
+      has_indexer ? index_cache.stride(0) : 0, static_cast<int>(world_size),
       static_cast<int>(local_tokens), static_cast<int>(max_local_tokens),
-      static_cast<int>(mla_cache.size(1)));
+      static_cast<int>(mla_cache.size(1)), has_indexer);
   check_cuda_launch("fused_norm_rope_pcp_combine");
+}
+
+void fused_norm_rope_pcp(
+    const torch::stable::Tensor& positions, const torch::stable::Tensor& q_c,
+    const torch::stable::Tensor& q_weight, double q_eps,
+    torch::stable::Tensor& q_out, const torch::stable::Tensor& kv_c,
+    const torch::stable::Tensor& kv_weight, torch::stable::Tensor& kv_out,
+    const torch::stable::Tensor& mla_k_scale, double kv_eps,
+    const torch::stable::Tensor& k_pe, torch::stable::Tensor& k_pe_out,
+    const torch::stable::Tensor& k_pe_cos_sin,
+    const std::optional<torch::stable::Tensor>& index_k,
+    const std::optional<torch::stable::Tensor>& index_weight,
+    const std::optional<torch::stable::Tensor>& index_bias, double index_eps,
+    const std::optional<torch::stable::Tensor>& index_cos_sin,
+    torch::stable::Tensor& topk_indices,
+    torch::stable::Tensor& received_payload,
+    torch::stable::Tensor& received_signal, torch::stable::Tensor& completion,
+    torch::stable::Tensor& epoch, torch::stable::Tensor& phase,
+    const torch::stable::Tensor& mla_slot_mapping,
+    const std::optional<torch::stable::Tensor>& index_slot_mapping,
+    torch::stable::Tensor& mla_cache,
+    std::optional<torch::stable::Tensor> index_cache, int64_t rank,
+    int64_t payload_mc_ptr, int64_t signal_mc_ptr) {
+  bool has_indexer = index_k.has_value();
+  STD_TORCH_CHECK(
+      index_weight.has_value() == has_indexer &&
+          index_bias.has_value() == has_indexer &&
+          index_cos_sin.has_value() == has_indexer &&
+          index_slot_mapping.has_value() == has_indexer &&
+          index_cache.has_value() == has_indexer,
+      "indexer tensors must either all be present or all be absent");
+  STD_TORCH_CHECK(received_payload.dim() == 4,
+                  "received_payload must be rank four");
+
+  const auto& index_k_arg = has_indexer ? *index_k : q_c;
+  const auto& index_weight_arg = has_indexer ? *index_weight : mla_k_scale;
+  const auto& index_bias_arg = has_indexer ? *index_bias : mla_k_scale;
+  const auto& index_cos_sin_arg = has_indexer ? *index_cos_sin : k_pe_cos_sin;
+  const auto& index_slot_mapping_arg =
+      has_indexer ? *index_slot_mapping : mla_slot_mapping;
+  auto& index_cache_arg = has_indexer ? *index_cache : mla_cache;
+  int64_t world_size = received_payload.size(1);
+
+  fused_norm_rope_pcp_dispatch(
+      positions, q_c, q_weight, q_eps, q_out, kv_c, kv_weight, kv_out,
+      mla_k_scale, kv_eps, k_pe, k_pe_out, k_pe_cos_sin, index_k_arg,
+      index_weight_arg, index_bias_arg, index_eps, index_cos_sin_arg,
+      topk_indices, received_payload, received_signal, completion, epoch, phase,
+      world_size, rank, has_indexer, payload_mc_ptr, signal_mc_ptr);
+  fused_norm_rope_pcp_combine(received_payload, epoch, mla_slot_mapping,
+                              index_slot_mapping_arg, mla_cache,
+                              index_cache_arg, q_c.size(0), has_indexer);
 }
 
 }  // namespace
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, fused_norm_rope_pcp_ops) {
   fused_norm_rope_pcp_ops.def(
-      "fused_norm_rope_pcp_dispatch("
+      "fused_norm_rope_pcp("
       "Tensor positions, Tensor q_c, Tensor q_weight, float q_eps, "
-      "Tensor! q_out, Tensor kv_c, Tensor kv_weight, Tensor mla_k_scale, "
-      "float kv_eps, Tensor k_pe, Tensor k_pe_cos_sin, Tensor index_k, "
-      "Tensor index_weight, Tensor index_bias, float index_eps, "
-      "Tensor index_cos_sin, Tensor! topk_indices, Tensor! received_payload, "
+      "Tensor! q_out, Tensor kv_c, Tensor kv_weight, Tensor! kv_out, "
+      "Tensor mla_k_scale, float kv_eps, Tensor k_pe, Tensor! k_pe_out, "
+      "Tensor k_pe_cos_sin, Tensor? index_k, "
+      "Tensor? index_weight, Tensor? index_bias, float index_eps, "
+      "Tensor? index_cos_sin, Tensor! topk_indices, Tensor! received_payload, "
       "Tensor! received_signal, Tensor! completion, Tensor! epoch, "
-      "Tensor! phase, int world_size, int rank, int payload_mc_ptr, "
-      "int signal_mc_ptr) -> ()");
-  fused_norm_rope_pcp_ops.def(
-      "fused_norm_rope_pcp_combine("
-      "Tensor received_payload, Tensor epoch, Tensor mla_slot_mapping, "
-      "Tensor index_slot_mapping, Tensor! mla_cache, Tensor! index_cache, "
-      "int local_tokens) -> ()");
+      "Tensor! phase, Tensor mla_slot_mapping, Tensor? index_slot_mapping, "
+      "Tensor! mla_cache, Tensor!? index_cache, int rank, "
+      "int payload_mc_ptr, int signal_mc_ptr) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, fused_norm_rope_pcp_ops) {
-  fused_norm_rope_pcp_ops.impl("fused_norm_rope_pcp_dispatch",
-                               TORCH_BOX(&fused_norm_rope_pcp_dispatch));
-  fused_norm_rope_pcp_ops.impl("fused_norm_rope_pcp_combine",
-                               TORCH_BOX(&fused_norm_rope_pcp_combine));
+  fused_norm_rope_pcp_ops.impl("fused_norm_rope_pcp",
+                               TORCH_BOX(&fused_norm_rope_pcp));
 }
