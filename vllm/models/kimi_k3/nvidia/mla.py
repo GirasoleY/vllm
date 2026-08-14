@@ -631,13 +631,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 assert lse is not None
                 assert self.dcp_manager is not None
                 assert attn_metadata.decode is not None
+                decode_metadata = attn_metadata.decode
+                seq_lens, query_start_loc = decode_metadata.get_dcp_combine_metadata(
+                    attn_metadata.query_start_loc[: attn_metadata.num_decodes + 1]
+                )
                 latent_out = self.dcp_manager.combine(
                     latent_out,
                     lse,
-                    seq_lens=attn_metadata.decode.seq_lens,
-                    query_start_loc=attn_metadata.query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
                 )
             self._v_up_proj(latent_out, out=attn_out[:num_mqa_tokens])
 

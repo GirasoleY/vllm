@@ -25,6 +25,7 @@ from vllm.config.vllm import set_current_vllm_config
 from vllm.model_executor.layers.attention import mla_attention as mla_attention_module
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
+    MLACommonDecodeMetadata,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
 )
@@ -34,7 +35,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
-from vllm.v1.attention.backends.mla import flashinfer_mla as flashinfer_mla_module
 from vllm.v1.attention.backends.mla import flashmla as flashmla_module
 from vllm.v1.attention.backends.mla import tokenspeed_mla as tokenspeed_mla_module
 from vllm.v1.attention.backends.mla.prefill import (
@@ -842,7 +842,13 @@ def test_tokenspeed_mla_noncausal_capability():
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
-def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch):
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(100),
+    reason="FlashInfer MLA requires compute capability 10 or above.",
+)
+def test_flashinfer_mla_dcp_multi_token_reuses_common_metadata(monkeypatch):
+    from vllm.v1.attention.backends.mla import flashinfer_mla as flashinfer_mla_module
+
     decode_call = None
 
     def fake_decode(**kwargs):
@@ -876,16 +882,18 @@ def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch
     impl.bmm2_scale = 1.0
 
     block_table = torch.tensor([[1], [2]], dtype=torch.int32)
+    decode = MLACommonDecodeMetadata(
+        block_table=block_table,
+        seq_lens=torch.tensor([5, 6], dtype=torch.int32),
+        dcp_tot_seq_lens=torch.tensor([10, 13], dtype=torch.int32),
+    )
     metadata = SimpleNamespace(
         num_decodes=2,
         num_decode_tokens=6,
         max_seq_len=7,
         causal=True,
-        decode=SimpleNamespace(
-            block_table=block_table,
-            seq_lens=torch.tensor([5, 6], dtype=torch.int32),
-            dcp_tot_seq_lens=torch.tensor([10, 13], dtype=torch.int32),
-        ),
+        query_start_loc=torch.tensor([0, 3, 6], dtype=torch.int32),
+        decode=decode,
     )
     query = torch.empty(6, 2, 576, dtype=torch.bfloat16)
     kv_cache = torch.empty(3, 16, 576, dtype=torch.bfloat16)
@@ -898,8 +906,7 @@ def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch
     )
 
     assert output.shape == (6, 2, 512)
-    assert lse is not None
-    assert lse.shape == (6, 2)
+    assert lse is not None and lse.shape == (6, 2)
     assert decode_call is not None
     assert decode_call["query"].shape == (6, 1, 2, 576)
     torch.testing.assert_close(
@@ -909,6 +916,15 @@ def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch
     torch.testing.assert_close(
         decode_call["block_tables"], block_table.repeat_interleave(3, dim=0)
     )
+    torch.testing.assert_close(
+        decode.flattened_query_start_loc,
+        torch.arange(7, dtype=torch.int32),
+    )
+    combine_seq_lens, combine_query_start_loc = decode.get_dcp_combine_metadata(
+        metadata.query_start_loc
+    )
+    assert combine_seq_lens is decode.flattened_seq_lens
+    assert combine_query_start_loc is decode.flattened_query_start_loc
 
 
 @pytest.mark.parametrize(

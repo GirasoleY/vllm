@@ -204,7 +204,7 @@ import itertools
 import math
 from abc import abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from math import lcm
 from typing import ClassVar, Generic, TypeVar, cast
@@ -954,16 +954,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.impl.dcp_world_size > 1:
                 assert lse is not None
                 assert self.dcp_manager is not None
-                seq_lens = (
-                    attn_metadata.decode.seq_lens
-                    if attn_metadata.decode is not None
-                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                        : attn_metadata.num_decodes
-                    ]
-                )
+                decode_metadata = attn_metadata.decode
                 query_start_loc = attn_metadata.query_start_loc[
                     : attn_metadata.num_decodes + 1
                 ]
+                if decode_metadata is not None:
+                    seq_lens, query_start_loc = (
+                        decode_metadata.get_dcp_combine_metadata(query_start_loc)
+                    )
+                else:
+                    seq_lens = cast(
+                        torch.Tensor,
+                        attn_metadata.seq_lens,  # type: ignore[attr-defined]
+                    )[: attn_metadata.num_decodes]
                 attn_out = self.dcp_manager.combine(
                     attn_out,
                     lse,
@@ -1468,6 +1471,18 @@ class MLACommonDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     dcp_tot_seq_lens: torch.Tensor | None
+    flattened_block_table: torch.Tensor | None = field(default=None, kw_only=True)
+    flattened_seq_lens: torch.Tensor | None = field(default=None, kw_only=True)
+    flattened_query_start_loc: torch.Tensor | None = field(default=None, kw_only=True)
+    flattened_query_len: int = field(default=0, kw_only=True)
+
+    def get_dcp_combine_metadata(
+        self, query_start_loc: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.flattened_seq_lens is None:
+            return self.seq_lens, query_start_loc
+        assert self.flattened_query_start_loc is not None
+        return self.flattened_seq_lens, self.flattened_query_start_loc
 
 
 D = TypeVar("D", bound=MLACommonDecodeMetadata)
