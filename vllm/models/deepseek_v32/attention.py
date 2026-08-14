@@ -41,6 +41,10 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.worker.gpu.pcp_manager import (
+    DirectPCPFusedNormRopeWorkspace,
+    get_fused_pcp_norm_rope_workspace,
+)
 
 # Per-tensor fp8 layouts this attention reads as float8_e4m3fn. Which cache
 # dtypes are reachable at all is the sparse MLA backend's call
@@ -310,19 +314,28 @@ class DeepseekV32Attention(MLAAttention):
         self._dense_mha_metadata_layer_name = (
             self.layer_name if enable_short_prefill_scoring_skip else ""
         )
+        self._index_rope_interleave = getattr(config, "indexer_rope_interleave", False)
+        self._fused_pcp_norm_rope: DirectPCPFusedNormRopeWorkspace | None = (
+            get_fused_pcp_norm_rope_workspace(
+                vllm_config,
+                config,
+                self.kv_cache_dtype,
+                next(kv_b_proj.parameters()).device,
+            )
+        )
         if self.indexer is not None:
-            self.indexer.indexer_op.skip_k_cache_insert = not self.use_pcp
             self.indexer.indexer_op.dense_mha_metadata_layer_name = (
                 self._dense_mha_metadata_layer_name
             )
             self.indexer.indexer_op.skip_topk_buffer_clear = True
+            self.indexer.indexer_op.skip_k_cache_insert = (
+                not self.use_pcp or self._fused_pcp_norm_rope is not None
+            )
 
         if self.require_fp8_kv_cache:
             self._fp8_query, self._fp8_kv_needs_view = select_query_and_cache_form(
                 self.kv_cache_dtype, self.impl.supports_quant_query_input
             )
-
-        self._index_rope_interleave = getattr(config, "indexer_rope_interleave", False)
 
         # Remaining MLA projections (registered on this module).
         self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
@@ -410,7 +423,7 @@ class DeepseekV32Attention(MLAAttention):
             indexer_k_norm_eps = self.indexer.k_norm.eps
             indexer_k_rope_cos_sin_cache = self.indexer_rope_emb.cos_sin_cache
             indexer_k_cache = None if self.use_pcp else self.indexer.k_cache.kv_cache
-            index_k_out = torch.empty_like(index_k) if self.use_pcp else None
+            index_k_out = None
             indexer_softmax_scale = self.indexer.softmax_scale
             indexer_n_head_scale = self.indexer.n_head**-0.5
         else:
@@ -424,7 +437,14 @@ class DeepseekV32Attention(MLAAttention):
             indexer_softmax_scale = 0.0
             indexer_n_head_scale = 0.0
 
-        if attn_metadata is None or self.use_pcp:
+        if has_indexer and self.use_pcp and self._fused_pcp_norm_rope is None:
+            assert index_k is not None
+            index_k_out = torch.empty_like(index_k)
+
+        use_fused_pcp_norm_rope = (
+            self._fused_pcp_norm_rope is not None and attn_metadata is not None
+        )
+        if attn_metadata is None or (self.use_pcp and not use_fused_pcp_norm_rope):
             mla_kv_cache = None
             mla_k_scale = None
             indexer_k_cache = None
@@ -433,35 +453,71 @@ class DeepseekV32Attention(MLAAttention):
             mla_kv_cache = self.kv_cache
             mla_k_scale = self._k_scale
 
-        kv_c_out = torch.empty_like(kv_c) if self.use_pcp else None
-        k_pe_out = torch.empty_like(k_pe) if self.use_pcp else None
-        q_c = fused_norm_rope(
-            positions,
-            q_c,
-            self.q_a_layernorm.weight,
-            self.q_a_layernorm.variance_epsilon,
-            kv_c,
-            self.kv_a_layernorm.weight,
-            self.kv_a_layernorm.variance_epsilon,
-            k_pe,
-            self.rotary_emb.cos_sin_cache,
-            index_k,
-            indexer_k_norm_w,
-            indexer_k_norm_bias,
-            indexer_k_norm_eps,
-            indexer_k_rope_cos_sin_cache,
-            self.topk_indices_buffer,
-            slot_mapping=mla_slot,
-            indexer_k_cache=indexer_k_cache,
-            mla_kv_cache=mla_kv_cache,
-            mla_kv_cache_dtype=self.kv_cache_dtype,
-            mla_k_scale=mla_k_scale,
-            has_indexer=has_indexer,
-            index_rope_interleave=self._index_rope_interleave,
-            kv_c_out=kv_c_out,
-            k_pe_out=k_pe_out,
-            index_k_out=index_k_out,
-        )
+        if not use_fused_pcp_norm_rope:
+            kv_c_out = torch.empty_like(kv_c) if self.use_pcp else None
+            k_pe_out = torch.empty_like(k_pe) if self.use_pcp else None
+            q_c = fused_norm_rope(
+                positions,
+                q_c,
+                self.q_a_layernorm.weight,
+                self.q_a_layernorm.variance_epsilon,
+                kv_c,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+                k_pe,
+                self.rotary_emb.cos_sin_cache,
+                index_k,
+                indexer_k_norm_w,
+                indexer_k_norm_bias,
+                indexer_k_norm_eps,
+                indexer_k_rope_cos_sin_cache,
+                self.topk_indices_buffer,
+                slot_mapping=mla_slot,
+                indexer_k_cache=indexer_k_cache,
+                mla_kv_cache=mla_kv_cache,
+                mla_kv_cache_dtype=self.kv_cache_dtype,
+                mla_k_scale=mla_k_scale,
+                has_indexer=has_indexer,
+                index_rope_interleave=self._index_rope_interleave,
+                kv_c_out=kv_c_out,
+                k_pe_out=k_pe_out,
+                index_k_out=index_k_out,
+            )
+        else:
+            assert self._fused_pcp_norm_rope is not None
+            assert attn_metadata is not None
+            assert mla_slot is not None
+            assert self._k_scale is not None
+            indexer_slot = None
+            indexer_cache = None
+            if has_indexer:
+                assert self.indexer is not None
+                indexer_slot = slot_mapping.get(self.indexer.k_cache.prefix)
+                assert indexer_slot is not None
+                indexer_cache = self.indexer.k_cache.kv_cache
+            q_c, kv_c_out, k_pe_out = self._fused_pcp_norm_rope.forward(
+                positions=positions,
+                q_c=q_c,
+                q_weight=self.q_a_layernorm.weight,
+                q_eps=self.q_a_layernorm.variance_epsilon,
+                kv_c=kv_c,
+                kv_weight=self.kv_a_layernorm.weight,
+                mla_k_scale=self._k_scale,
+                kv_eps=self.kv_a_layernorm.variance_epsilon,
+                k_pe=k_pe,
+                k_pe_cos_sin=self.rotary_emb.cos_sin_cache,
+                index_k=index_k,
+                index_weight=indexer_k_norm_w,
+                index_bias=indexer_k_norm_bias,
+                index_eps=indexer_k_norm_eps,
+                index_cos_sin=indexer_k_rope_cos_sin_cache,
+                topk_indices=self.topk_indices_buffer,
+                mla_slot_mapping=mla_slot,
+                index_slot_mapping=indexer_slot,
+                mla_cache=self.kv_cache,
+                index_cache=indexer_cache,
+                num_decode_tokens=attn_metadata.num_decode_tokens,
+            )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -536,7 +592,7 @@ class DeepseekV32Attention(MLAAttention):
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
-            if self.use_pcp:
+            if self.use_pcp and self._fused_pcp_norm_rope is None:
                 assert index_k is not None
             self.indexer.indexer_op(
                 q_c,
@@ -553,7 +609,7 @@ class DeepseekV32Attention(MLAAttention):
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
 
-        if self.use_pcp:
+        if self.use_pcp and self._fused_pcp_norm_rope is None:
             assert kv_c is not None and k_pe is not None
             kv_for_cache, kpe_for_cache, cache_slot_mapping = (
                 maybe_gather_mla_latent_cache_inputs(
