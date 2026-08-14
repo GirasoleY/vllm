@@ -384,9 +384,25 @@ class NixlBaseConnectorWorker:
         # replicated or fully sharded. A DCP rank is always derivable this way.
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.dcp_rank = self.tp_rank % self.dcp_size
-        if self._has_mamba and self.dcp_size > 1:
-            # Prefix-cache-aware DCP slicing isn't implemented for the Mamba group.
-            raise ValueError("DCP is not supported for hybrid MLA+Mamba models.")
+        # DCP interleaves attention blocks, while align-mode Mamba state is
+        # replicated at block-table level and sharded across TP ranks by state
+        # dimension during transfer. Other hybrid layouts would need their own
+        # group-specific mapping.
+        if (
+            self._has_mamba
+            and self.dcp_size > 1
+            and (
+                mamba_spec.mamba_cache_mode != "align"
+                or any(
+                    not isinstance(spec, (FullAttentionSpec, MambaSpec))
+                    for spec in self._layer_specs.values()
+                )
+            )
+        ):
+            raise ValueError(
+                "DCP with hybrid MLA+Mamba only supports FullAttention "
+                "plus align-mode Mamba cache groups."
+            )
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
@@ -1787,6 +1803,15 @@ class NixlBaseConnectorWorker:
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
             and self.vllm_config.cache_config.enable_prefix_caching
+            and not (
+                self.use_mla
+                and (self.dcp_size > 1 or remote_dcp_size > 1)
+                and self.vllm_config.cache_config.mamba_cache_mode == "align"
+                and all(
+                    issubclass(spec_type, (FullAttentionSpec, MambaSpec))
+                    for spec_type in self._group_spec_types
+                )
+            )
         ):
             raise RuntimeError(
                 "Prefix caching with heterogeneous physical_blocks_per_logical "
@@ -2165,16 +2190,21 @@ class NixlBaseConnectorWorker:
                 remote_info.remote_physical_blocks_per_logical
                 != self._physical_blocks_per_logical_kv_block
             )
+            dcp_active = self.dcp_size > 1 or remote_info.remote_dcp_size > 1
             if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
                         continue
                     # Number of remote-sized sub-blocks the transfer covered;
                     # everything past this was clipped and must be zeroed.
-                    covered_sub_blocks = min(
-                        len(local_group) * block_size_ratio,
-                        len(meta.remote.block_ids[g]),
-                    )
+                    if dcp_active:
+                        assert meta.dcp_local_attention_blocks_covered
+                        covered_sub_blocks = meta.dcp_local_attention_blocks_covered[g]
+                    else:
+                        covered_sub_blocks = min(
+                            len(local_group) * block_size_ratio,
+                            len(meta.remote.block_ids[g]),
+                        )
                     block_ids_for_blocksize_post_process[block_size_ratio].append(
                         (local_group, covered_sub_blocks)
                     )
@@ -2456,7 +2486,7 @@ class NixlBaseConnectorWorker:
                 )
         return physical_block_ids
 
-    def _apply_dcp_prefix_caching(
+    def _map_dcp_attention_block_ids(
         self,
         local_ids: list[int],
         remote_ids: list[int],
@@ -2465,70 +2495,69 @@ class NixlBaseConnectorWorker:
         local_dcp_rank: int,
         remote_dcp_size: int,
         local_num_computed_blocks: int,
+        local_physical_per_logical: int,
+        remote_physical_per_logical: int,
     ) -> tuple[list[int], list[int]]:
-        """Handle DCP prefix cache hit for asymmetric DCP configurations.
+        """Map DCP-sharded MLA pages at physical KV-block granularity.
 
-        Scoped to MLA with `dcp_size in (1, tp_size)`: a side is either fully
-        replicated (holds the whole sequence) or fully sharded (one every
-        `dcp_size` blocks). The examples below number blocks by their *global*
-        sequence position purely to explain the modulo arithmetic, in practice
-        they have independent block tables.
+        Scheduler block IDs describe global token pages. A rank stores only its
+        contiguous DCP slice of each page. Hybrid memory allocation can make a
+        slice span multiple physical KV blocks, and that span can differ across
+        P and D (Kimi-K3 TP8/DCP8 -> TP1 uses 48 -> 384). Matching whole logical
+        IDs would therefore omit seven eighths of a K3 page.
 
-        ``local_ids`` only carries the blocks still to be filled: the scheduler
-        already dropped the ``local_num_computed_blocks`` prefix-cached ones. The
-        count is passed separately because it fixes where this side's slice starts
-        in global position space, which is what the remote offset must line up
-        with.
-
-            local_dcp_size=4, local_dcp_rank=1
-            owns:       [1, 5, 9, 13, ...]
-            cached:     [1, 5]
-            next fetch: [9, 13, ...]
-
-        A given ``remote_rank`` can also drop out entirely: when the computed
-        slice lands past the end of the other side's list, the result is empty
-        (see the caller, which turns that into a notification-only read).
-
-            local_dcp_size=2, local_dcp_rank=0
-            owns:       [0, 2, 4, 6]
-            cached:     [0, 2, 4]
-            local_ids:  [6]
-
-            P0 owns:    [0, 4]
-            P2 owns:    [2, 6]
-
-            vs P0: start_local = (0-3) % 2 = 1  ->  [6][1::2] = []   (skip)
-            vs P2: start_local = (1-3) % 2 = 0  ->  [6][0::2] = [6]  (read)
-
-        When both sides interleave identically (including the non-sharded,
-        dcp_size=1 case), the remote list still starts at sequence position 0,
-        so skipping ``local_num_computed_blocks`` off its front is all that's
-        needed. Either way, the result is truncated to the shorter of the two
-        matched slices, so a subsequent, unconditional call to
-        ``_apply_prefix_caching`` is a guaranteed no-op on these lists.
+        Convert each side's page slice to global physical-block positions and
+        pair the intersections. ``local_ids`` has already dropped prefix-cached
+        pages, so its first page has ordinal ``local_num_computed_blocks``.
         """
-        local_size, remote_size = local_dcp_size, remote_dcp_size
+        assert local_dcp_size > 0 and remote_dcp_size > 0
+        assert local_physical_per_logical > 0
+        assert remote_physical_per_logical > 0
 
-        if local_size == remote_size:
-            local_slice = local_ids
-            remote_slice = remote_ids[local_num_computed_blocks:]
-        elif local_size < remote_size:
-            k = remote_size // local_size
-            p = (remote_rank - local_dcp_rank) // local_size
-            start_local = (p - local_num_computed_blocks) % k
-            start_remote = (local_num_computed_blocks + start_local - p) // k
-            local_slice = local_ids[start_local::k]
-            remote_slice = remote_ids[start_remote:]
-        else:
-            k = local_size // remote_size
-            remote_dcp_rank = remote_rank % remote_size
-            c = (local_dcp_rank - remote_dcp_rank) // remote_size
-            start_remote = c + local_num_computed_blocks * k
-            local_slice = local_ids
-            remote_slice = remote_ids[start_remote::k]
+        local_page_span = local_physical_per_logical * local_dcp_size
+        remote_page_span = remote_physical_per_logical * remote_dcp_size
+        remote_dcp_rank = remote_rank % remote_dcp_size
 
-        matched_blocks = min(len(local_slice), len(remote_slice))
-        return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+        mapped_local: list[int] = []
+        mapped_remote: list[int] = []
+        local_idx = remote_idx = 0
+        while local_idx < len(local_ids) and remote_idx < len(remote_ids):
+            local_start = (
+                local_num_computed_blocks + local_idx
+            ) * local_page_span + local_dcp_rank * local_physical_per_logical
+            local_end = local_start + local_physical_per_logical
+            remote_start = (
+                remote_idx * remote_page_span
+                + remote_dcp_rank * remote_physical_per_logical
+            )
+            remote_end = remote_start + remote_physical_per_logical
+
+            overlap_start = max(local_start, remote_start)
+            overlap_end = min(local_end, remote_end)
+            if overlap_start < overlap_end:
+                count = overlap_end - overlap_start
+                local_block_start = (
+                    local_ids[local_idx] * local_physical_per_logical
+                    + overlap_start
+                    - local_start
+                )
+                remote_block_start = (
+                    remote_ids[remote_idx] * remote_physical_per_logical
+                    + overlap_start
+                    - remote_start
+                )
+                mapped_local.extend(range(local_block_start, local_block_start + count))
+                mapped_remote.extend(
+                    range(remote_block_start, remote_block_start + count)
+                )
+
+            if local_end <= remote_end:
+                local_idx += 1
+            if remote_end <= local_end:
+                remote_idx += 1
+
+        assert len(mapped_local) == len(mapped_remote)
+        return mapped_local, mapped_remote
 
     def _apply_prefix_caching(
         self,

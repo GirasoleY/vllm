@@ -138,7 +138,8 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "local_ids,remote_ids,remote_rank,local_dcp_size,local_dcp_rank,"
-    "remote_dcp_size,local_num_computed_blocks,expected_local,expected_remote",
+    "remote_dcp_size,local_num_computed_blocks,local_ppl,remote_ppl,"
+    "expected_local,expected_remote",
     [
         # local more finely sharded than remote: remote's raw slice has an
         # extra tail block beyond what local's phase-aligned slice covers.
@@ -150,6 +151,8 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
             0,
             2,
             0,
+            1,
+            1,
             [101],
             [200],
             id="remote_tail_padding",
@@ -164,6 +167,8 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
             1,
             1,
             0,
+            1,
+            1,
             [],
             [],
             id="local_tail_padding",
@@ -178,6 +183,8 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
             0,
             4,
             3,
+            1,
+            1,
             [100],
             [201],
             id="prefix_phase",
@@ -192,13 +199,15 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
             1,
             2,
             2,
+            1,
+            1,
             [100, 101],
             [202, 203],
             id="equal_dcp_with_prefix",
         ),
     ],
 )
-def test_apply_dcp_prefix_caching_matches_global_logical_positions(
+def test_map_dcp_attention_block_ids_matches_global_positions(
     local_ids,
     remote_ids,
     remote_rank,
@@ -206,20 +215,19 @@ def test_apply_dcp_prefix_caching_matches_global_logical_positions(
     local_dcp_rank,
     remote_dcp_size,
     local_num_computed_blocks,
+    local_ppl,
+    remote_ppl,
     expected_local,
     expected_remote,
 ):
-    """_apply_dcp_prefix_caching must operate on logical block IDs (DCP
-    interleaves at logical-block granularity) and always return equal-length
-    local/remote slices, so a later, unconditional _apply_prefix_caching
-    trim is a guaranteed no-op rather than double-processing the read."""
+    """DCP attention mapping pairs equal global kernel-block positions."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
 
     worker = object.__new__(NixlConnectorWorker)
 
-    actual_local, actual_remote = worker._apply_dcp_prefix_caching(
+    actual_local, actual_remote = worker._map_dcp_attention_block_ids(
         local_ids,
         remote_ids,
         remote_rank=remote_rank,
@@ -227,6 +235,8 @@ def test_apply_dcp_prefix_caching_matches_global_logical_positions(
         local_dcp_rank=local_dcp_rank,
         remote_dcp_size=remote_dcp_size,
         local_num_computed_blocks=local_num_computed_blocks,
+        local_physical_per_logical=local_ppl,
+        remote_physical_per_logical=remote_ppl,
     )
 
     assert actual_local == expected_local
@@ -432,6 +442,111 @@ def test_read_blocks_for_req_expands_remote_ids(
     assert meta.remote.block_ids == expected_remote_block_ids, (
         f"Expected {expected_remote_block_ids}, got {meta.remote.block_ids}"
     )
+
+
+@pytest.mark.cpu_test
+def test_read_blocks_for_req_hybrid_remote_dcp_slices_only_attention():
+    """TP8/DCP8 P -> TP1 D interleaves MLA blocks but replicates Mamba state.
+
+    Every producer rank owns a different sequence slice for the attention
+    group. The align-Mamba block table is replicated; its tensor dimensions
+    are split by the heterogeneous-TP transfer handles instead.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        TPMapping,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._physical_blocks_per_logical_kv_block = 384
+    worker._engine_last_active = {}
+    worker._recving_transfers = {}
+    worker._bidirectional_kv_xfer_enabled = False
+    worker.dcp_size = 1
+    worker.dcp_rank = 0
+    worker.block_size = 32
+    worker._group_spec_types = (MLAAttentionSpec, MambaSpec)
+    worker._has_mamba = True
+    worker.use_mla = True
+    worker.kv_cache_config = make_kv_cache_config(block_size=32, mamba_enabled=True)
+
+    remote_engine_id = "remote-engine"
+    source_ranks = tuple(range(8))
+    worker.tp_mappings = {
+        remote_engine_id: TPMapping(
+            source_ranks_per_group=(source_ranks, source_ranks),
+            all_source_ranks=source_ranks,
+            rank_to_attention_slot={rank: 0 for rank in source_ranks},
+            rank_offset_factor=0,
+            local_consumers=1,
+        )
+    }
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.tp_ratio.return_value = -8
+    remote_info = MagicMock(
+        remote_tp_size=8,
+        remote_dcp_size=8,
+        remote_physical_blocks_per_logical=48,
+        remote_block_size=32,
+    )
+    worker.transfer_topo.get_engine_info.return_value = remote_info
+    worker.src_xfer_handles_by_tp_ratio = {(-8, 32): list(range(8))}
+    worker.dst_xfer_side_handles = {
+        remote_engine_id: {rank: 100 + rank for rank in source_ranks}
+    }
+    worker._read_blocks = MagicMock()
+
+    def make_meta(request_id, local_block_ids, local_num_computed_blocks):
+        metadata = NixlConnectorMetadata()
+        metadata.add_new_req_to_recv(
+            request_id=request_id,
+            local_block_ids=local_block_ids,
+            local_num_computed_blocks=local_num_computed_blocks,
+            kv_transfer_params={
+                # Every producer rank contributes a different physical slice
+                # of both global attention pages, while Mamba state is shared.
+                "remote_block_ids": ([200, 201], [900]),
+                "remote_engine_id": remote_engine_id,
+                "remote_request_id": f"prefill-{request_id}",
+                "remote_host": "localhost",
+                "remote_port": 1234,
+                "tp_size": 8,
+            },
+        )
+        meta = metadata.reqs_to_recv[request_id]
+        meta.local_physical_block_ids = worker._logical_to_kernel_block_ids(
+            meta.local_block_ids, worker._physical_blocks_per_logical_kv_block
+        )
+        return meta
+
+    meta = make_meta("test-req", ([100, 101], [800]), (0, 0))
+    worker._read_blocks_for_req("test-req", meta)
+
+    assert worker._read_blocks.call_count == 8
+    for rank, call in enumerate(worker._read_blocks.call_args_list):
+        spec = call.kwargs["read_spec"]
+        assert spec.remote_rank == rank
+        expected_local_attn = list(
+            range(100 * 384 + rank * 48, 100 * 384 + (rank + 1) * 48)
+        ) + list(range(101 * 384 + rank * 48, 101 * 384 + (rank + 1) * 48))
+        expected_remote_attn = list(range(200 * 48, 201 * 48)) + list(
+            range(201 * 48, 202 * 48)
+        )
+        assert spec.local_block_ids == [expected_local_attn, [800]]
+        assert spec.remote_block_ids == [expected_remote_attn, [900]]
+    assert meta.dcp_local_attention_blocks_covered == (2 * 384, 0)
+
+    prefix_meta = make_meta("prefix-hit", ([101], [801]), (1, 0))
+    with pytest.raises(ValueError, match="decoder-side prefix-cache hits"):
+        worker._read_blocks_for_req("prefix-hit", prefix_meta)
 
 
 @pytest.mark.cpu_test

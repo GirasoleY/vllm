@@ -234,6 +234,9 @@ class ReqMeta:
     # the remote's; kept per-group since hybrid models (e.g. SWA+FA) can have
     # different cache-hit counts per group.
     local_num_computed_blocks: tuple[int, ...] = ()
+    # Number of destination attention kernel blocks covered by the union of
+    # all DCP source-rank reads, per KV cache group. Empty when DCP is inactive.
+    dcp_local_attention_blocks_covered: tuple[int, ...] = ()
     remote: RemoteMeta | None = None
     # Remote block size, discovered during NIXL handshake (push mode).
     remote_block_size: int | None = None
