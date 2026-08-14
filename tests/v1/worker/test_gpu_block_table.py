@@ -132,6 +132,73 @@ def test_block_tables_apply_staged_writes_single_group():
     )
 
 
+@pytest.mark.parametrize(
+    ("cp_rank", "positions", "expected"),
+    [
+        (
+            0,
+            [0, 63, 64, 511, 512, 1535, 1536, 12287, 12288, 12800],
+            [3072, 3135, 3136, 3583, 3584, 4607, -1, -1, 7680, 8192],
+        ),
+        (
+            1,
+            [0, 63, 64, 511, 512, 1535, 1536, 12287, 12288, 12800],
+            [-1, -1, -1, -1, -1, -1, 3072, -1, -1, -1],
+        ),
+        (
+            7,
+            [0, 63, 64, 511, 512, 1535, 1536, 12287, 12288, 12800],
+            [-1, -1, -1, -1, -1, -1, -1, 4607, -1, -1],
+        ),
+        (
+            None,
+            [0, 63, 64, 511, 512, 1535, 1536, 2048],
+            [3072, 3135, 3136, 3583, 3584, 4607, 7680, 8192],
+        ),
+    ],
+    ids=["dcp-rank-0", "dcp-rank-1", "dcp-rank-7", "without-dcp"],
+)
+def test_compute_slot_mappings_hybrid_large_interleave(
+    cp_rank: int | None, positions: list[int], expected: list[int]
+):
+    """DCP local offsets must use the logical KV block before selecting the
+    expanded kernel block. A 1536-token logical block backed by 64-token
+    kernel blocks previously wrapped at every 512 global positions. The
+    non-DCP case guards the unchanged slot-mapping path."""
+    device = torch.device("cuda")
+    dcp_args = (
+        {"cp_size": 8, "cp_rank": cp_rank, "cp_interleave": 1536}
+        if cp_rank is not None
+        else {}
+    )
+    block_tables = BlockTables(
+        block_sizes=[1536],
+        max_num_reqs=1,
+        max_num_batched_tokens=len(positions),
+        max_num_blocks_per_group=[2],
+        device=device,
+        kernel_block_sizes=[64],
+        **dcp_args,
+    )
+    block_tables.append_block_ids(req_index=0, new_block_ids=([2, 5],), overwrite=True)
+    block_tables.apply_staged_writes()
+
+    positions_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+    idx_mapping = torch.tensor([0], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor(
+        [0, positions_tensor.numel()], dtype=torch.int32, device=device
+    )
+    slot_mappings = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions_tensor,
+        num_tokens_padded=positions_tensor.numel(),
+    )
+    torch.accelerator.synchronize()
+
+    assert slot_mappings[0].tolist() == expected
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows
