@@ -398,6 +398,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_interleave,
+                self.block_tables.block_sizes[gid],
+                self.block_tables.blocks_per_kv_block[gid],
             )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
@@ -500,11 +505,16 @@ def _prepare_dflash_inputs_kernel(
     # Scalars
     parallel_drafting_token_id,
     block_size,
+    kv_cache_block_size,
+    blocks_per_kv_block,
     num_query_per_req,
     num_speculative_steps,
     max_num_reqs,
     max_num_tokens,
     max_model_len,
+    dcp_size,
+    dcp_rank,
+    cp_interleave,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -539,14 +549,32 @@ def _prepare_dflash_inputs_kernel(
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
-    ctx_block_num = ctx_pos // block_size
+    # The scheduler allocates logical KV-manager blocks, while the attention
+    # backend can split each logical block into multiple entries in the input
+    # block table. Resolve DCP ownership in logical-page coordinates, then
+    # select the expanded kernel block containing the rank-local token. This
+    # must match BlockTables._compute_slot_mappings_kernel.
+    virtual_block_size = kv_cache_block_size * dcp_size
+    ctx_virtual_offset = ctx_pos % virtual_block_size
+    ctx_is_local = ((ctx_virtual_offset // cp_interleave) % dcp_size) == dcp_rank
+    ctx_virtual_block_num = ctx_pos // virtual_block_size
+    ctx_local_offset = (
+        ctx_virtual_offset // (dcp_size * cp_interleave)
+    ) * cp_interleave + (ctx_virtual_offset % cp_interleave)
+    ctx_block_num = (
+        ctx_virtual_block_num * blocks_per_kv_block + ctx_local_offset // block_size
+    )
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
-        mask=is_ctx,
+        mask=is_ctx & ctx_is_local,
         other=0,
     ).to(tl.int64)
-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+    ctx_slot = tl.where(
+        ctx_is_local,
+        ctx_block_id * block_size + ctx_local_offset % block_size,
+        PAD_SLOT_ID,
+    )
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
@@ -556,14 +584,26 @@ def _prepare_dflash_inputs_kernel(
     is_bonus = is_query & (query_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
 
-    q_block_num = query_pos // block_size
+    q_virtual_offset = query_pos % virtual_block_size
+    q_is_local = ((q_virtual_offset // cp_interleave) % dcp_size) == dcp_rank
+    q_virtual_block_num = query_pos // virtual_block_size
+    q_local_offset = (
+        q_virtual_offset // (dcp_size * cp_interleave)
+    ) * cp_interleave + (q_virtual_offset % cp_interleave)
+    q_block_num = (
+        q_virtual_block_num * blocks_per_kv_block + q_local_offset // block_size
+    )
     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
     q_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + q_block_num,
-        mask=is_query,
+        mask=is_query & q_is_local,
         other=0,
     ).to(tl.int64)
-    q_slot = q_block_id * block_size + (query_pos % block_size)
+    q_slot = tl.where(
+        q_is_local,
+        q_block_id * block_size + q_local_offset % block_size,
+        PAD_SLOT_ID,
+    )
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
@@ -664,9 +704,19 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    cp_interleave: int = 1,
+    kv_cache_block_size: int | None = None,
+    blocks_per_kv_block: int | None = None,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
+    if kv_cache_block_size is None:
+        kv_cache_block_size = block_size
+    if blocks_per_kv_block is None:
+        blocks_per_kv_block = kv_cache_block_size // block_size
+    assert kv_cache_block_size == block_size * blocks_per_kv_block
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
@@ -699,11 +749,16 @@ def prepare_dflash_inputs(
         block_table.stride(0),
         parallel_drafting_token_id,
         block_size,
+        kv_cache_block_size,
+        blocks_per_kv_block,
         num_query_per_req,
         num_speculative_steps,
         max_num_reqs,
         max_num_tokens,
         max_model_len,
+        dcp_size,
+        dcp_rank,
+        cp_interleave,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         BLOCK_SIZE=BLOCK_SIZE,

@@ -341,11 +341,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "parallelism."
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
-        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
-            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
-            "context parallelism because gathered queries require gathered "
-            "positions."
-        )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             query_dtype = (
@@ -642,6 +637,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 slot_mapping[:num_mqa_tokens],
             )
             if self.dcp_world_size > 1:
+                # RoPE is applied to each TP-local head above before DCP gathers
+                # those heads. Positions are replicated across the DCP group,
+                # so this is equivalent to rotating the gathered query and also
+                # supports the RoPE-enabled K3 DSpark draft.
                 assert self.dcp_manager is not None
                 assert self.dcp_manager.query_gather is not None
                 mqa_q = self.dcp_manager.query_gather(mqa_q)
@@ -652,13 +651,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 assert lse is not None
                 assert self.dcp_manager is not None
                 assert attn_metadata.decode is not None
+                query_start_loc = (
+                    attn_metadata.decode.dcp_virtual_query_start_loc
+                    if attn_metadata.decode.dcp_virtual_query_start_loc is not None
+                    else attn_metadata.query_start_loc[: attn_metadata.num_decodes + 1]
+                )
                 latent_out = self.dcp_manager.combine(
                     latent_out,
                     lse,
                     seq_lens=attn_metadata.decode.seq_lens,
-                    query_start_loc=attn_metadata.query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
+                    query_start_loc=query_start_loc,
                 )
             self._v_up_proj(latent_out, out=attn_out[:num_mqa_tokens])
 

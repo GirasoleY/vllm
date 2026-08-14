@@ -14,11 +14,18 @@ backends (e.g. ``ROCM_AITER_FA`` with eagle/eagle3 spec decode):
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode import speculator as base_speculator
+from vllm.v1.worker.gpu.spec_decode.autoregressive import (
+    speculator as autoregressive_speculator,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 
@@ -37,6 +44,7 @@ def _make_fake_speculator(
     fake_input_buffers = SimpleNamespace(
         query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32),
         seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
+        dcp_local_seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
     )
     fake_block_tables = SimpleNamespace(
         input_block_tables=[torch.zeros(max_num_reqs, 4, dtype=torch.int32)],
@@ -50,6 +58,10 @@ def _make_fake_speculator(
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
         max_model_len=max_model_len,
         draft_max_seq_len=draft_max_seq_len,
+        use_dcp=False,
+        dcp_size=1,
+        dcp_rank=0,
+        cp_interleave=1,
     )
 
 
@@ -126,3 +138,88 @@ def test_build_draft_attn_metadata_clamps_to_max_model_len():
     bound = captured["seq_lens_cpu_upper_bound"]
     # 1023 + 3 = 1026 -> clamped to 1024; 500 + 3 = 503 unaffected.
     assert torch.equal(bound, torch.tensor([1024, 503], dtype=torch.int32))
+
+
+def test_build_draft_attn_metadata_recomputes_dcp_local_seq_lens():
+    """A rejection changes the global boundary and can change which DCP rank
+    owns the tail. The draft path must derive local lengths from the current
+    global seq_lens on every step and pass the persistent buffer to builders."""
+    fake = _make_fake_speculator()
+    fake.use_dcp = True
+    fake.dcp_size = 2
+    fake.dcp_rank = 1
+    fake.cp_interleave = 4
+    fake.input_buffers.seq_lens[:3] = torch.tensor([5, 9, 16])
+
+    def fake_prepare(out, seq_lens, num_reqs, dcp_size, dcp_rank, cp_interleave):
+        assert (num_reqs, dcp_size, dcp_rank, cp_interleave) == (3, 2, 1, 4)
+        # local_len(rank=1, D=2, I=4): [1, 4, 8]
+        out[:num_reqs].copy_(torch.tensor([1, 4, 8], dtype=torch.int32))
+        out[num_reqs:].zero_()
+
+    with patch.object(base_speculator, "prepare_dcp_local_seq_lens", fake_prepare):
+        captured = _run_build(
+            fake,
+            num_reqs=3,
+            num_reqs_padded=4,
+            num_tokens_padded=4,
+            base=torch.tensor([5, 9, 16]),
+            step=0,
+        )
+
+    local = captured["dcp_local_seq_lens"]
+    assert isinstance(local, torch.Tensor)
+    assert local.data_ptr() == fake.input_buffers.dcp_local_seq_lens.data_ptr()
+    assert local.tolist() == [1, 4, 8, 0]
+
+
+def test_autoregressive_decode_forwards_cpu_bounds_and_draft_step():
+    """Every autoregressive draft step rebuilds rejection-sensitive metadata."""
+    num_reqs = 2
+    num_speculative_steps = 3
+    seq_lens_cpu_upper_bound = torch.tensor([40, 56], dtype=torch.int32)
+    build_metadata = MagicMock(return_value={})
+    fake = SimpleNamespace(
+        num_speculative_steps=num_speculative_steps,
+        current_draft_step=torch.zeros((), dtype=torch.int64),
+        input_buffers=SimpleNamespace(
+            positions=torch.zeros(num_reqs, dtype=torch.int64),
+            query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32),
+        ),
+        decode_cudagraph_manager=None,
+        advance_draft_positions=True,
+        idx_mapping=torch.arange(num_reqs, dtype=torch.int32),
+        block_tables=SimpleNamespace(
+            compute_slot_mappings=MagicMock(
+                return_value=torch.zeros(num_reqs, dtype=torch.int64)
+            )
+        ),
+        kv_cache_config=SimpleNamespace(),
+        _build_draft_attn_metadata=build_metadata,
+        _generate_draft=MagicMock(),
+    )
+    batch_desc = SimpleNamespace(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=num_reqs,
+        num_reqs=num_reqs,
+    )
+
+    with patch.object(
+        autoregressive_speculator,
+        "build_slot_mappings_by_layer",
+        return_value={},
+    ):
+        AutoRegressiveSpeculator._multi_step_decode(
+            fake,  # type: ignore[arg-type]
+            num_reqs=num_reqs,
+            skip_attn=False,
+            batch_desc=batch_desc,
+            num_tokens_across_dp=None,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        )
+
+    assert [call.kwargs["step"] for call in build_metadata.call_args_list] == [1, 2]
+    assert all(
+        call.kwargs["seq_lens_cpu_upper_bound"] is seq_lens_cpu_upper_bound
+        for call in build_metadata.call_args_list
+    )

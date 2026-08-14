@@ -117,6 +117,8 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     # Non-causal DSpark blocks are flattened to single-token rows in forward_mqa.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+    # Full-graph causal DCP verification is flattened to virtual q_len=1 rows.
+    supports_dcp_virtual_queries: ClassVar[bool] = True
 
 
 class FlashInferMLABackend(MLACommonBackend):
@@ -195,6 +197,10 @@ class FlashInferMLABackend(MLACommonBackend):
 
 class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
+    # Under DCP, eager multi-token verification is routed through the
+    # DCP-aware prefill path. Full-graph verification uses Strategy-D virtual
+    # q_len=1 rows, so both paths support a non-trivial KV interleave.
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     # trtllm-gen MLA decode emits LSE in log2 (per flashinfer's own
     # reference at flashinfer/trace/templates/attention.py:81:
     # `logsumexp / log(2.0)`). Override the AttentionImplBase default
@@ -277,7 +283,12 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
 
-        if not attn_metadata.causal:
+        dcp_virtual_query_len = attn_metadata.decode.dcp_virtual_query_len
+        if dcp_virtual_query_len is not None:
+            assert attn_metadata.causal
+            q = q.unsqueeze(1)
+            block_table = block_table.repeat_interleave(dcp_virtual_query_len, dim=0)
+        elif not attn_metadata.causal:
             # Non-causal DSpark block: flatten to single-token decode rows with
             # per-row context seq_lens (trtllm-gen has no causal flag and would
             # otherwise mask the block causally).

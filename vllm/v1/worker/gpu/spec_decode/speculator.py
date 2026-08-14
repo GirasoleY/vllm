@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_dcp_group
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -21,6 +22,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -104,6 +106,14 @@ class DraftModelSpeculator(BaseSpeculator):
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+
+        # Decode context parallelism. Draft-model attention owns separate
+        # metadata from the target, so it must populate the same persistent
+        # rank-local sequence-length buffer as the target model runner.
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.use_dcp = self.dcp_size > 1
+        self.dcp_rank = get_dcp_group().rank_in_group if self.use_dcp else 0
+        self.cp_interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
 
         self.eplb_state: EplbState | None = None
 
@@ -210,6 +220,12 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
+        # PD disaggregation finalizes the DCP interleave only after profiling,
+        # immediately before the target runner creates BlockTables. The
+        # speculator is constructed earlier, so its constructor-time copy can
+        # be stale. BlockTables is the source of truth for the finalized slot
+        # layout used by both target and draft attention.
+        self.cp_interleave = block_tables.cp_interleave
         self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
             self.attn_vllm_config,
@@ -268,6 +284,20 @@ class DraftModelSpeculator(BaseSpeculator):
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
         draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
+        dcp_local_seq_lens = None
+        if self.use_dcp:
+            # seq_lens may change on every speculative step after rejection.
+            # Recompute the local length from the new global boundary instead
+            # of incrementing a stale local length.
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_interleave,
+            )
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -284,6 +314,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens=dcp_local_seq_lens,
         )
         return attn_metadata
 
