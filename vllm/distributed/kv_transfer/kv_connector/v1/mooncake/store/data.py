@@ -284,7 +284,10 @@ class ChunkedTokenDatabase:
             return
         assert token_len % self.hash_block_size == 0
         assert token_len // self.hash_block_size <= len(block_hashes)
-        start_chunk = max(0, cdiv(mask_num, self.block_size))
+        # A fine-grained hit can start inside a physical page. Re-transfer the
+        # overlapping page so its prefix and externally loaded suffix come
+        # from one producer snapshot.
+        start_chunk = max(0, mask_num // self.block_size)
         max_chunks = cdiv(token_len, self.block_size)
         if chunk_mask is not None:
             max_chunks = min(max_chunks, start_chunk + len(chunk_mask))

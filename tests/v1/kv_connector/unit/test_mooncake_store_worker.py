@@ -67,6 +67,62 @@ def _default_send_coord() -> mooncake_store_worker.MooncakeStoreCoordinator:
     )
 
 
+def _make_full_mamba_groups(block_size: int = 4):
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    return [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=8,
+                head_size=64,
+                dtype=None,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=block_size,
+                shapes=((1,),),
+                dtypes=(torch.float16,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+
+
+def _dcp_full_mamba_transfer_fixture():
+    groups = worker._effective_kv_cache_groups(
+        _make_full_mamba_groups(),
+        dcp_world_size=2,
+        scheduler_block_size=8,
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=8,
+        hash_block_size=4,
+        dcp_world_size=2,
+    )
+    token_dbs = []
+    for group_idx, (block_size, base_addr, block_len) in enumerate(
+        [(8, 0x1000, 256), (4, 0x2000, 128)]
+    ):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_idx),
+            block_size=block_size,
+            hash_block_size=4,
+        )
+        db.set_kv_caches_base_addr([base_addr])
+        db.set_block_len([block_len])
+        token_dbs.append(db)
+    return groups, coord, token_dbs
+
+
 def _make_store_sending_thread(
     store: MagicMock,
     *,
@@ -625,6 +681,7 @@ def _make_partial_tail_send_thread(
         enable_partial_hash_hits=True,
         hash_block_size=4,
         lcm_block_size=16,
+        cache_hit_alignment_tokens=4,
     )
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -765,6 +822,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
     )
     coord = SimpleNamespace(
         lcm_block_size=16,
+        cache_hit_alignment_tokens=16,
         store_mask=lambda token_len, start_token, num_prompt_tokens=None: (
             None,
             [True, False],
@@ -816,6 +874,7 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
     store.batch_put_from_multi_buffers.return_value = [256, 256, 512, 512]
     coord = SimpleNamespace(
         lcm_block_size=16,
+        cache_hit_alignment_tokens=16,
         store_mask=lambda token_len, start_token, num_prompt_tokens=None: (
             None,
             None,
@@ -3233,3 +3292,75 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_effective_dcp_groups_scale_attention_not_mamba():
+    groups = _make_full_mamba_groups()
+
+    effective = worker._effective_kv_cache_groups(groups, dcp_world_size=2)
+
+    assert effective[0].kv_cache_spec.block_size == 8
+    assert effective[1].kv_cache_spec.block_size == 4
+    assert groups[0].kv_cache_spec.block_size == 4
+    assert groups[1].kv_cache_spec.block_size == 4
+
+
+def test_worker_records_receive_event_before_queueing_partial_load():
+    worker_instance = _make_bare_worker(kv_role="kv_consumer")
+    worker_instance.load_async = True
+    event = MagicMock()
+    request = _make_load_req("req", [b"h0"], token_len=16)
+    meta = SimpleNamespace(
+        requests=[request], preempted_req_ids=set(), unfinished_request_ids=set()
+    )
+
+    with patch.object(torch.cuda, "Event", return_value=event):
+        worker_instance.get_finished(set(), meta)
+
+    event.record.assert_called_once_with()
+    assert request.current_event is event
+    assert worker_instance.recv_request_queue.get_nowait() is request
+
+
+def test_dcp_partial_receive_waits_for_cow_and_loads_overlapping_page():
+    _groups, coord, token_dbs = _dcp_full_mamba_transfer_fixture()
+    event = MagicMock()
+    store = MagicMock()
+
+    def get_values(keys, _addrs, _sizes):
+        event.synchronize.assert_called_once_with()
+        return [1] * len(keys)
+
+    store.batch_get_into_multi_buffers.side_effect = get_values
+    thread = mooncake_store_worker.KVCacheStoreRecvingThread(
+        store=store,
+        coord=coord,
+        token_databases=token_dbs,
+        block_size=8,
+        tp_rank=0,
+        ready_event=threading.Event(),
+    )
+    thread.request_queue.task_done = MagicMock()
+    request = ReqMeta(
+        req_id="req",
+        token_len_chunk=12,
+        block_ids=([10, 11], [20, 21, 22]),
+        block_hashes=[b"h0", b"h1", b"h2"],
+        current_event=event,
+        load_spec=LoadSpec(
+            vllm_cached_tokens=4,
+            kvpool_cached_tokens=12,
+            can_load=True,
+            token_len=12,
+        ),
+    )
+
+    thread._handle_request(request)
+
+    keys, _addrs, sizes = store.batch_get_into_multi_buffers.call_args.args
+    assert [key.rsplit("@", 1)[-1] for key in keys] == [
+        b"h1".hex(),
+        b"h2".hex(),
+        b"h2".hex(),
+    ]
+    assert sizes == [[256], [256], [128]]

@@ -65,6 +65,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -72,6 +73,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_kind,
+    get_kv_cache_spec_sliding_window,
 )
 
 from .metrics import MooncakeStoreConnectorStats
@@ -115,6 +118,50 @@ _DIRECT_IO_PADDING_BYTES = 2 * _DIRECT_IO_ALIGNMENT
 
 
 MooncakeMode = Literal["embedded", "standalone-store"]
+
+
+def _effective_kv_cache_groups(
+    groups: Sequence[KVCacheGroupSpec],
+    dcp_world_size: int,
+    scheduler_block_size: int | None = None,
+) -> list[KVCacheGroupSpec]:
+    """Use global-token pages for DCP attention and local pages otherwise."""
+
+    def effective_spec(spec: KVCacheSpec) -> KVCacheSpec:
+        if dcp_world_size <= 1:
+            return spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            nested = {
+                name: effective_spec(nested_spec)
+                for name, nested_spec in spec.kv_cache_specs.items()
+            }
+            block_size = next(iter(nested.values())).block_size
+            return dataclasses.replace(
+                spec, block_size=block_size, kv_cache_specs=nested
+            )
+        if isinstance(spec, AttentionSpec):
+            return dataclasses.replace(
+                spec, block_size=spec.block_size * dcp_world_size
+            )
+        return spec
+
+    effective_groups = [
+        dataclasses.replace(group, kv_cache_spec=effective_spec(group.kv_cache_spec))
+        for group in groups
+    ]
+    if (
+        len(effective_groups) == 1
+        and scheduler_block_size is not None
+        and effective_groups[0].kv_cache_spec.block_size != scheduler_block_size
+    ):
+        group = effective_groups[0]
+        effective_groups[0] = dataclasses.replace(
+            group,
+            kv_cache_spec=dataclasses.replace(
+                group.kv_cache_spec, block_size=scheduler_block_size
+            ),
+        )
+    return effective_groups
 
 
 @dataclass
@@ -601,6 +648,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         keys: list[str] = []
         addrs: list[list[int]] = []
         sizes: list[list[int]] = []
+        event_meta: list[tuple[int, int, int, BlockHash]] = []
         group_ids: list[str] | None = (
             [] if self.enable_group_semantics and self.supports_group_ids else None
         )
@@ -644,6 +692,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 keys.append(key)
                 addrs.append(addr)
                 sizes.append(size)
+                event_meta.append(
+                    (block_idx * db.block_size, valid_end, g_idx, key_hash)
+                )
                 if group_ids is not None:
                     group_ids.append(
                         _make_mooncake_group_id(
@@ -672,12 +723,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
             return False
         self._record_operation("save_exists", exists_start, len(keys))
-        missing = [i for i, e in enumerate(exists) if e != 1]
+        missing = [i for i in range(len(keys)) if i >= len(exists) or exists[i] != 1]
         if not missing:
             return True
         keys = [keys[i] for i in missing]
         addrs = [addrs[i] for i in missing]
         sizes = [sizes[i] for i in missing]
+        event_meta = [event_meta[i] for i in missing]
         if group_ids is not None:
             group_ids = [group_ids[i] for i in missing]
         if req_meta.current_event is not None:
@@ -708,7 +760,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
             return False
 
-        failed = [i for i, value in enumerate(res) if value < 0]
+        failed = [i for i in range(len(keys)) if i >= len(res) or res[i] < 0]
         self._record_operation(
             "save_put",
             put_start,
@@ -717,8 +769,39 @@ class KVCacheStoreSendingThread(KVTransferThread):
             status="partial_failure" if failed else "ok",
             num_failed_keys=len(failed),
         )
+        if self.enable_kv_event:
+            successful_events: list[BlockStored] = []
+            for event_idx, (start, end, group_idx, key_hash) in enumerate(event_meta):
+                if event_idx >= len(res) or res[event_idx] < 0:
+                    continue
+                try:
+                    successful_events.append(
+                        self._build_stored_event(
+                            req_meta, start, end, group_idx, key_hash
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to build partial-tail Mooncake BlockStored "
+                        "event for request %s, group %d, range [%d, %d)",
+                        req_meta.req_id,
+                        group_idx,
+                        start,
+                        end,
+                    )
+            if successful_events:
+                try:
+                    self.update_kv_event(successful_events)
+                except Exception:
+                    logger.exception(
+                        "Failed to publish partial-tail Mooncake BlockStored "
+                        "events for request %s",
+                        req_meta.req_id,
+                    )
         if failed:
-            failed_codes = {res[i] for i in failed}
+            failed_codes: set[int | str] = {res[i] for i in failed if i < len(res)}
+            if len(res) < len(keys):
+                failed_codes.add("missing_result")
             logger.warning(
                 "Partial-tail put failed for request %s: %d/%d keys failed (codes=%s)",
                 req_meta.req_id,
@@ -737,11 +820,78 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
         return True
 
+    def _build_stored_event(
+        self,
+        req_meta: ReqMeta,
+        start: int,
+        end: int,
+        group_idx: int,
+        key_hash: BlockHash,
+    ) -> BlockStored:
+        """Describe one stored object using its cache spec's semantics."""
+        spec = self.coord.kv_cache_groups[group_idx].kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+
+        if req_meta.token_ids is None or end > len(req_meta.token_ids):
+            available_tokens = (
+                0 if req_meta.token_ids is None else len(req_meta.token_ids)
+            )
+            raise ValueError(
+                "Mooncake KV event requires the complete token prefix: "
+                f"request={req_meta.req_id}, range_end={end}, "
+                f"available_tokens={available_tokens}"
+            )
+
+        db = self.token_databases[group_idx]
+        hash_block_size = db.hash_block_size
+        first_hash_idx = start // hash_block_size
+        last_hash_idx = end // hash_block_size
+
+        if isinstance(spec, MambaSpec):
+            block_hashes = [maybe_convert_block_hash(key_hash)]
+            parent_block_hash = None
+            token_start = 0
+            block_size = end
+        elif self.coord.enable_partial_hash_hits:
+            block_hashes = [
+                maybe_convert_block_hash(block_hash)
+                for block_hash in req_meta.block_hashes[first_hash_idx:last_hash_idx]
+            ]
+            parent_block_hash = (
+                maybe_convert_block_hash(req_meta.block_hashes[first_hash_idx - 1])
+                if first_hash_idx > 0
+                else None
+            )
+            token_start = start
+            block_size = hash_block_size
+        else:
+            block_hashes = [maybe_convert_block_hash(key_hash)]
+            parent_block_hash = (
+                maybe_convert_block_hash(req_meta.block_hashes[first_hash_idx - 1])
+                if first_hash_idx > 0
+                else None
+            )
+            token_start = start
+            block_size = end - start
+
+        token_ids = req_meta.token_ids[token_start:end]
+        return BlockStored(
+            block_hashes=block_hashes,
+            parent_block_hash=parent_block_hash,
+            token_ids=token_ids,
+            block_size=block_size,
+            lora_id=None,
+            medium="cpu",
+            lora_name=None,
+            group_idx=group_idx,
+            kv_cache_spec_kind=get_kv_cache_spec_kind(spec).value,
+            kv_cache_spec_sliding_window=get_kv_cache_spec_sliding_window(spec),
+        )
+
     def _handle_request(self, req_meta: ReqMeta):
-        # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
-        # is also ``store_mask``'s precondition.
-        lcm_block_size = self.coord.lcm_block_size
-        token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
+        alignment_tokens = self.coord.cache_hit_alignment_tokens
+        token_len = req_meta.token_len_chunk // alignment_tokens * alignment_tokens
         block_ids_per_group = req_meta.block_ids
         req_id = req_meta.req_id
         current_event = req_meta.current_event
@@ -788,6 +938,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             keys: list[str] = []
             kv_event_block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
+            coord_groups = getattr(self.coord, "kv_cache_groups", ())
             for g_idx, db in enumerate(self.token_databases):
                 # Rotate the stride phase per group to balance load across ranks.
                 put_step = self.group_put_steps[g_idx]
@@ -800,6 +951,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     put_step=put_step,
                     put_step_rank=put_step_rank,
                 ):
+                    contains_mamba = False
+                    if g_idx < len(coord_groups):
+                        spec = coord_groups[g_idx].kv_cache_spec
+                        inner_specs = (
+                            tuple(spec.kv_cache_specs.values())
+                            if isinstance(spec, UniformTypeKVCacheSpecs)
+                            else (spec,)
+                        )
+                        contains_mamba = any(
+                            isinstance(inner_spec, MambaSpec)
+                            for inner_spec in inner_specs
+                        )
+                    source_block_id = block_ids_per_group[g_idx][start // db.block_size]
+                    if source_block_id == NULL_BLOCK_ID and contains_mamba:
+                        logger.debug(
+                            "Skipping unavailable Mamba source block "
+                            "(req=%s, group=%d, start=%d)",
+                            req_id,
+                            g_idx,
+                            start,
+                        )
+                        continue
                     starts.append(start)
                     ends.append(end)
                     keys.append(db.key_for(block_hash))
@@ -830,7 +1003,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 len(keys),
             )
             missing_indices = [
-                i for i, exists in enumerate(exists_states) if exists != 1
+                i
+                for i in range(len(keys))
+                if i >= len(exists_states) or exists_states[i] != 1
             ]
 
             if not missing_indices:
@@ -868,7 +1043,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             addrs: list[list[int]] = []
             sizes: list[list[int]] = []
-            stored_events: list[BlockStored] = []
             chunks_per_group: list[list[tuple[int, int]]] = [
                 [] for _ in self.token_databases
             ]
@@ -883,36 +1057,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 addrs.extend(group_addrs)
                 sizes.extend(group_sizes)
-
-            # parent_block_hash chains live within a group, not across.
-            if self.enable_kv_event:
-                prev_key_per_group: dict[int, Any] = {}
-                new_block_hashes = [
-                    maybe_convert_block_hash(bh) for bh in kv_event_block_hashes
-                ]
-
-            for idx, (s, e, g_idx) in enumerate(
-                zip(starts, ends, group_indices, strict=True)
-            ):
-                db = self.token_databases[g_idx]
-                if self.enable_kv_event:
-                    token_ids = (
-                        req_meta.token_ids[s:e]
-                        if req_meta.token_ids is not None
-                        else None
-                    )
-                    stored_event = BlockStored(
-                        block_hashes=[new_block_hashes[idx]],
-                        parent_block_hash=prev_key_per_group.get(g_idx),
-                        token_ids=token_ids,
-                        block_size=db.block_size,
-                        lora_id=None,
-                        medium="cpu",
-                        lora_name=None,
-                        group_idx=g_idx,
-                    )
-                    stored_events.append(stored_event)
-                    prev_key_per_group[g_idx] = new_block_hashes[idx]
 
             if current_event is not None:
                 current_event.synchronize()
@@ -930,7 +1074,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     sizes,
                     self.replicate_config,
                 )
-                failed = [i for i, v in enumerate(res) if v < 0]
+                failed = [i for i in range(len(keys)) if i >= len(res) or res[i] < 0]
                 self._record_operation(
                     "save_put",
                     put_start,
@@ -940,7 +1084,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
-                    failed_codes = set(res[i] for i in failed)
+                    failed_codes: set[int | str] = {
+                        res[i] for i in failed if i < len(res)
+                    }
+                    if len(res) < len(keys):
+                        failed_codes.add("missing_result")
                     logger.warning(
                         "batch_put failed: %d/%d keys failed "
                         "(codes=%s, batch_bytes=%d, num_keys=%d), "
@@ -970,6 +1118,41 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             "Mooncake CPU/disk offloading pressure cleared "
                             "after a successful store batch"
                         )
+                if self.enable_kv_event:
+                    successful_events: list[BlockStored] = []
+                    for event_idx, (start, end, group_idx) in enumerate(
+                        zip(starts, ends, group_indices, strict=True)
+                    ):
+                        if event_idx >= len(res) or res[event_idx] < 0:
+                            continue
+                        try:
+                            successful_events.append(
+                                self._build_stored_event(
+                                    req_meta,
+                                    start,
+                                    end,
+                                    group_idx,
+                                    kv_event_block_hashes[event_idx],
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to build Mooncake BlockStored event "
+                                "for request %s, group %d, range [%d, %d)",
+                                req_id,
+                                group_idx,
+                                start,
+                                end,
+                            )
+                    if successful_events:
+                        try:
+                            self.update_kv_event(successful_events)
+                        except Exception:
+                            logger.exception(
+                                "Failed to publish Mooncake BlockStored events "
+                                "for request %s",
+                                req_id,
+                            )
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -981,8 +1164,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 logger.error("Failed to put key %s, error: %s", keys, e)
 
-            if self.enable_kv_event and stored_events:
-                self.update_kv_event(stored_events)
         finally:
             self.dec_stored_request(req_id)
             self.request_queue.task_done()
@@ -1039,10 +1220,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
+        alignment_tokens = self.coord.cache_hit_alignment_tokens
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
-            // self.block_size
-            * self.block_size
+            // alignment_tokens
+            * alignment_tokens
         )
 
         # Skip chunks the consumer's per-group spec wouldn't populate
@@ -1070,6 +1252,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             addr_list.extend(g_addrs)
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
+
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
+
+        # Scheduler-issued CoW copies are enqueued before this event. Do not
+        # overwrite a shared partial-page destination until they complete.
+        if req_meta.current_event is not None:
+            req_meta.current_event.synchronize()
 
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
@@ -1364,21 +1556,13 @@ class MooncakeStoreWorker:
             )
             return
 
-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
-        # self.block_size (= scheduler_block_size) so the coordinator's
-        # ``block_size % hash_block_size == 0`` invariant holds.
-        groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
-            g = groups[0]
-            groups = [
-                dataclasses.replace(
-                    g,
-                    kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
-                    ),
-                )
-            ]
-        self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+        # Attention pages are DCP-sharded: one physical page per rank spans a
+        # global virtual block. Mamba state snapshots remain rank-replicated.
+        self._kv_cache_groups = _effective_kv_cache_groups(
+            kv_cache_config.kv_cache_groups,
+            self.dcp_size,
+            scheduler_block_size=self.block_size,
+        )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
@@ -1391,6 +1575,7 @@ class MooncakeStoreWorker:
             hash_block_size=self.hash_block_size,
             use_eagle=use_eagle,
             retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+            dcp_world_size=self.dcp_size,
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known. Each group's
@@ -1646,13 +1831,21 @@ class MooncakeStoreWorker:
         if self._capacity_only:
             return set(), set()
 
-        # Issue async loads
-        for request in meta.requests:
+        # Record after the model runner enqueues scheduler-issued CoW copies.
+        load_requests = [
+            request
+            for request in meta.requests
+            if request.load_spec is not None and request.load_spec.can_load
+        ]
+        load_event = None
+        if load_requests:
+            load_event = torch.cuda.Event()
+            load_event.record()
+        for request in load_requests:
             load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:
-                continue
-
+            assert load_spec is not None
             load_spec.token_len = load_spec.kvpool_cached_tokens
+            request.current_event = load_event
             self.recv_request_queue.put(request)
 
         assert self.load_async, "load_async must be True for better performance."
@@ -1838,7 +2031,7 @@ class MooncakeStoreWorker:
         pos = 0
         for g_idx, hash_bytes in candidate_meta:
             count = len(self._lookup_key_prefixes[g_idx])
-            if all(res[pos + j] == 1 for j in range(count)):
+            if pos + count <= len(res) and all(res[pos + j] == 1 for j in range(count)):
                 exists_set.add((g_idx, hash_bytes))
             pos += count
 

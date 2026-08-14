@@ -3,7 +3,11 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
@@ -29,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -51,6 +57,70 @@ def _make_kv_cache_config() -> KVCacheConfig:
         kv_cache_tensors=[KVCacheTensor(size=8192, shared_by=["layer0"])],
         kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
     )
+
+
+def _make_hybrid_kv_cache_config(*, simple: bool = True) -> KVCacheConfig:
+    full = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=None,
+    )
+    other = (
+        MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        if simple
+        else SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=64,
+            dtype=None,
+            sliding_window=32,
+        )
+    )
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], full),
+            KVCacheGroupSpec(["other"], other),
+        ],
+    )
+
+
+def _make_validation_config(*, dcp: int = 1, pcp: int = 1):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=pcp,
+        ),
+    )
+
+
+def test_validation_allows_simple_full_mamba_dcp():
+    mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+        _make_validation_config(dcp=2), _make_hybrid_kv_cache_config()
+    )
+
+
+def test_validation_rejects_non_simple_dcp_hybrid():
+    with pytest.raises(ValueError, match="DCP > 1 with a non-simple hybrid layout"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            _make_validation_config(dcp=2),
+            _make_hybrid_kv_cache_config(simple=False),
+        )
+
+
+def test_validation_rejects_hybrid_pcp():
+    with pytest.raises(ValueError, match=r"PCP > 1 \(pcp=2\)"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            _make_validation_config(pcp=2), _make_hybrid_kv_cache_config()
+        )
 
 
 def _make_block_stored() -> BlockStored:
