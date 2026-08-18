@@ -14,7 +14,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.logger import init_logger
-from vllm.v1.attention.ops.dcp import (
+from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
     direct_cp_multicast_enabled,
 )
