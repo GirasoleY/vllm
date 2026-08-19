@@ -2084,9 +2084,12 @@ class EngineArgs:
                 self.data_parallel_size
                 * self.pipeline_parallel_size
                 * self.tensor_parallel_size
+                * self.prefill_context_parallel_size
             )
             world_size_within_dp = (
-                self.pipeline_parallel_size * self.tensor_parallel_size
+                self.pipeline_parallel_size
+                * self.tensor_parallel_size
+                * self.prefill_context_parallel_size
             )
             if world_size % self.nnodes != 0:
                 raise ValueError(
