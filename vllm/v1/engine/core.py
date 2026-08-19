@@ -5,6 +5,7 @@ import os
 import queue
 import resource
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -1087,6 +1088,20 @@ class EngineCoreProc(EngineCore):
                 )
             self.host_timing_threshold_ns = int(timing_threshold_ms * 1_000_000)
             self.input_add_count = 0
+
+            gil_switch_interval_ms = envs.VLLM_ENGINE_CORE_GIL_SWITCH_INTERVAL_MS
+            if gil_switch_interval_ms < 0:
+                raise ValueError(
+                    "VLLM_ENGINE_CORE_GIL_SWITCH_INTERVAL_MS must be non-negative"
+                )
+            if gil_switch_interval_ms > 0:
+                old_interval_ms = sys.getswitchinterval() * 1_000
+                sys.setswitchinterval(gil_switch_interval_ms / 1_000)
+                logger.info(
+                    "EngineCore Python GIL switch interval: %.3f ms -> %.3f ms",
+                    old_interval_ms,
+                    gil_switch_interval_ms,
+                )
 
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (

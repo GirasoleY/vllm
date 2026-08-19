@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_DEBUG_HOST_TIMING_THRESHOLD_MS: float = 0.0
+    VLLM_ENGINE_CORE_GIL_SWITCH_INTERVAL_MS: float = 0.0
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
@@ -1916,6 +1917,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # exceeds this threshold. Zero disables the timers and logging.
     "VLLM_DEBUG_HOST_TIMING_THRESHOLD_MS": lambda: float(
         os.getenv("VLLM_DEBUG_HOST_TIMING_THRESHOLD_MS", "0")
+    ),
+    # Experimental mitigation for EngineCore input-thread GIL contention.
+    # Zero preserves Python's default switch interval.
+    "VLLM_ENGINE_CORE_GIL_SWITCH_INTERVAL_MS": lambda: float(
+        os.getenv("VLLM_ENGINE_CORE_GIL_SWITCH_INTERVAL_MS", "0")
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.
