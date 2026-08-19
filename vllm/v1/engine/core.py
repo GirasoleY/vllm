@@ -3,6 +3,7 @@
 import gc
 import os
 import queue
+import resource
 import signal
 import threading
 import time
@@ -90,10 +91,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.utils import compute_iteration_details
+from vllm.v1.utils import compute_iteration_details, record_function_or_nullcontext
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+_RUSAGE_THREAD = getattr(resource, "RUSAGE_THREAD", 1)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -1078,6 +1080,14 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            timing_threshold_ms = envs.VLLM_DEBUG_HOST_TIMING_THRESHOLD_MS
+            if timing_threshold_ms < 0:
+                raise ValueError(
+                    "VLLM_DEBUG_HOST_TIMING_THRESHOLD_MS must be non-negative"
+                )
+            self.host_timing_threshold_ns = int(timing_threshold_ms * 1_000_000)
+            self.input_add_count = 0
+
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
@@ -1102,6 +1112,7 @@ class EngineCoreProc(EngineCore):
                     identity,
                     ready_event,
                 ),
+                name=f"EngineCoreInput-{self.engine_index}",
                 daemon=True,
             )
             input_thread.start()
@@ -1113,6 +1124,7 @@ class EngineCoreProc(EngineCore):
                     addresses.coordinator_output,
                     self.engine_index,
                 ),
+                name=f"EngineCoreOutput-{self.engine_index}",
                 daemon=True,
             )
             self.output_thread.start()
@@ -1713,8 +1725,26 @@ class EngineCoreProc(EngineCore):
             del ready_event
             while True:
                 for input_socket, _ in poller.poll():
+                    timing_enabled = self.host_timing_threshold_ns > 0
+                    if timing_enabled:
+                        start_wall_ns = time.perf_counter_ns()
+                        start_cpu_ns = time.thread_time_ns()
+                        start_usage = resource.getrusage(_RUSAGE_THREAD)
+
                     # (RequestType, RequestData)
-                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    with record_function_or_nullcontext(
+                        "engine_core_input: recv_multipart"
+                    ):
+                        type_frame, *data_frames = input_socket.recv_multipart(
+                            copy=False
+                        )
+                    recv_wall_ns = time.perf_counter_ns() if timing_enabled else 0
+                    recv_cpu_ns = time.thread_time_ns() if timing_enabled else 0
+                    input_bytes = (
+                        sum(len(frame.buffer) for frame in data_frames)
+                        if timing_enabled
+                        else 0
+                    )
                     # NOTE(yongji): ignore READY message sent by DP coordinator
                     # that is used to notify newly started engines
                     if type_frame.buffer == b"READY":
@@ -1724,10 +1754,26 @@ class EngineCoreProc(EngineCore):
 
                     # Deserialize the request data.
                     request: Any
+                    request_id = "-"
+                    prompt_tokens = 0
                     if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        with record_function_or_nullcontext(
+                            "engine_core_input: decode_add"
+                        ):
+                            req: EngineCoreRequest = add_request_decoder.decode(
+                                data_frames
+                            )
+                        decode_wall_ns = time.perf_counter_ns() if timing_enabled else 0
+                        decode_cpu_ns = time.thread_time_ns() if timing_enabled else 0
+                        request_id = req.request_id
+                        prompt_tokens = len(req.prompt_token_ids or ())
+                        if timing_enabled:
+                            self.input_add_count += 1
                         try:
-                            request = self.preprocess_add_request(req)
+                            with record_function_or_nullcontext(
+                                "engine_core_input: preprocess_add"
+                            ):
+                                request = self.preprocess_add_request(req)
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -1745,7 +1791,10 @@ class EngineCoreProc(EngineCore):
                             )
                             continue
                     else:
-                        request = generic_decoder.decode(data_frames)
+                        with record_function_or_nullcontext(
+                            "engine_core_input: decode_other"
+                        ):
+                            request = generic_decoder.decode(data_frames)
 
                         if request_type == EngineCoreRequestType.ABORT:
                             # Aborts are added to *both* queues, allows us to eagerly
@@ -1755,7 +1804,55 @@ class EngineCoreProc(EngineCore):
                             self.aborts_queue.put_nowait(request)
 
                     # Push to input queue for core busy loop.
-                    self.input_queue.put_nowait((request_type, request))
+                    preprocess_wall_ns = time.perf_counter_ns() if timing_enabled else 0
+                    preprocess_cpu_ns = time.thread_time_ns() if timing_enabled else 0
+                    with record_function_or_nullcontext("engine_core_input: enqueue"):
+                        self.input_queue.put_nowait((request_type, request))
+
+                    if timing_enabled:
+                        end_wall_ns = time.perf_counter_ns()
+                        end_cpu_ns = time.thread_time_ns()
+                        elapsed_ns = end_wall_ns - start_wall_ns
+                        if elapsed_ns >= self.host_timing_threshold_ns:
+                            end_usage = resource.getrusage(_RUSAGE_THREAD)
+                            logger.info(
+                                "EngineCore input timing: dp_rank=%d tid=%d "
+                                "type=%s request_id=%s prompt_tokens=%d "
+                                "input_bytes=%d add_count=%d queue_depth=%d "
+                                "start_ns=%d total_ms=%.3f cpu_ms=%.3f "
+                                "recv_ms=%.3f recv_cpu_ms=%.3f "
+                                "decode_ms=%.3f decode_cpu_ms=%.3f "
+                                "preprocess_ms=%.3f preprocess_cpu_ms=%.3f "
+                                "enqueue_ms=%.3f nvcsw=%d nivcsw=%d",
+                                self.engine_index,
+                                threading.get_native_id(),
+                                request_type.value.decode(),
+                                request_id,
+                                prompt_tokens,
+                                input_bytes,
+                                self.input_add_count,
+                                self.input_queue.qsize(),
+                                start_wall_ns,
+                                elapsed_ns / 1e6,
+                                (end_cpu_ns - start_cpu_ns) / 1e6,
+                                (recv_wall_ns - start_wall_ns) / 1e6,
+                                (recv_cpu_ns - start_cpu_ns) / 1e6,
+                                (decode_wall_ns - recv_wall_ns) / 1e6
+                                if request_type == EngineCoreRequestType.ADD
+                                else 0.0,
+                                (decode_cpu_ns - recv_cpu_ns) / 1e6
+                                if request_type == EngineCoreRequestType.ADD
+                                else 0.0,
+                                (preprocess_wall_ns - decode_wall_ns) / 1e6
+                                if request_type == EngineCoreRequestType.ADD
+                                else (preprocess_wall_ns - recv_wall_ns) / 1e6,
+                                (preprocess_cpu_ns - decode_cpu_ns) / 1e6
+                                if request_type == EngineCoreRequestType.ADD
+                                else (preprocess_cpu_ns - recv_cpu_ns) / 1e6,
+                                (end_wall_ns - preprocess_wall_ns) / 1e6,
+                                end_usage.ru_nvcsw - start_usage.ru_nvcsw,
+                                end_usage.ru_nivcsw - start_usage.ru_nivcsw,
+                            )
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
@@ -2239,11 +2336,40 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
-        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
-            self.dp_group,
-            has_unfinished=local_unfinished,
-            pending_pause=self.pending_pause,
-        )
+        timing_enabled = self.host_timing_threshold_ns > 0
+        if timing_enabled:
+            start_wall_ns = time.perf_counter_ns()
+            start_cpu_ns = time.thread_time_ns()
+            start_usage = resource.getrusage(_RUSAGE_THREAD)
+
+        with record_function_or_nullcontext("engine_core: global_state_sync"):
+            has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
+                self.dp_group,
+                has_unfinished=local_unfinished,
+                pending_pause=self.pending_pause,
+            )
+
+        if timing_enabled:
+            end_wall_ns = time.perf_counter_ns()
+            elapsed_ns = end_wall_ns - start_wall_ns
+            if elapsed_ns >= self.host_timing_threshold_ns:
+                end_usage = resource.getrusage(_RUSAGE_THREAD)
+                logger.info(
+                    "EngineCore DP-state sync timing: dp_rank=%d tid=%d "
+                    "step=%d add_count=%d queue_depth=%d start_ns=%d "
+                    "wall_ms=%.3f cpu_ms=%.3f "
+                    "nvcsw=%d nivcsw=%d",
+                    self.dp_rank,
+                    threading.get_native_id(),
+                    self.step_counter,
+                    self.input_add_count,
+                    self.input_queue.qsize(),
+                    start_wall_ns,
+                    elapsed_ns / 1e6,
+                    (time.thread_time_ns() - start_cpu_ns) / 1e6,
+                    end_usage.ru_nvcsw - start_usage.ru_nvcsw,
+                    end_usage.ru_nivcsw - start_usage.ru_nivcsw,
+                )
 
         if pause_consensus:
             self.ignore_start_dp_wave = True

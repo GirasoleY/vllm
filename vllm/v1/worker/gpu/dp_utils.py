@@ -2,15 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import resource
+import threading
+import time
+
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group
+from vllm.logger import init_logger
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
+
+logger = init_logger(__name__)
+_RUSAGE_THREAD = getattr(resource, "RUSAGE_THREAD", 1)
 
 
 def sync_cudagraph_and_dp_padding(
@@ -23,6 +33,7 @@ def sync_cudagraph_and_dp_padding(
     dp_rank: int,
     max_query_len: int | None = None,
     num_active_loras: int = 0,
+    sync_phase: str = "target",
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     """
     Coordinates the batch descriptor and DP padding across all ranks.
@@ -36,7 +47,37 @@ def sync_cudagraph_and_dp_padding(
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
-    dist.all_reduce(tensor, group=group)
+
+    timing_threshold_ns = int(envs.VLLM_DEBUG_HOST_TIMING_THRESHOLD_MS * 1_000_000)
+    timing_enabled = timing_threshold_ns > 0
+    if timing_enabled:
+        start_wall_ns = time.perf_counter_ns()
+        start_cpu_ns = time.thread_time_ns()
+        start_usage = resource.getrusage(_RUSAGE_THREAD)
+
+    with record_function_or_nullcontext(f"worker_dp_sync: {sync_phase}"):
+        dist.all_reduce(tensor, group=group)
+
+    if timing_enabled:
+        end_wall_ns = time.perf_counter_ns()
+        elapsed_ns = end_wall_ns - start_wall_ns
+        if elapsed_ns >= timing_threshold_ns:
+            end_usage = resource.getrusage(_RUSAGE_THREAD)
+            logger.info(
+                "Worker DP-metadata sync timing: dp_rank=%d tid=%d phase=%s "
+                "start_ns=%d wall_ms=%.3f cpu_ms=%.3f num_reqs=%d "
+                "num_tokens=%d nvcsw=%d nivcsw=%d",
+                dp_rank,
+                threading.get_native_id(),
+                sync_phase,
+                start_wall_ns,
+                elapsed_ns / 1e6,
+                (time.thread_time_ns() - start_cpu_ns) / 1e6,
+                num_reqs,
+                num_tokens,
+                end_usage.ru_nvcsw - start_usage.ru_nvcsw,
+                end_usage.ru_nivcsw - start_usage.ru_nivcsw,
+            )
 
     num_tokens_across_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
@@ -105,6 +146,7 @@ def dispatch_cg_and_sync_dp(
     max_query_len: int | None = None,
     need_eager: bool = False,
     num_active_loras: int = 0,
+    sync_phase: str = "target",
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
@@ -139,4 +181,5 @@ def dispatch_cg_and_sync_dp(
         dp_rank,
         max_query_len=max_query_len,
         num_active_loras=num_active_loras,
+        sync_phase=sync_phase,
     )

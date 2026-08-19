@@ -287,6 +287,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            sync_phase="draft_prefill",
         )
 
         self._prepare_eplb_forward(num_tokens)
@@ -336,6 +337,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            sync_phase="draft_decode",
         )
 
         self.on_multi_step_decode_begin(num_reqs)
