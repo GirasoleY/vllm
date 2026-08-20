@@ -44,6 +44,7 @@ def _make_batch(
     cu_num_logits = torch.from_numpy(cu_num_logits_np).to(device)
 
     req_states = SimpleNamespace(
+        req_id_to_index={f"req-{i}": i for i in range(num_reqs)},
         last_sampled_tokens=torch.tensor([[101], [102]], device=device),
         prefill_len=SimpleNamespace(gpu=torch.from_numpy(prefill_lens).to(device)),
         draft_tokens=torch.tensor([[201, 202, 203], [211, 212, 213]], device=device),
@@ -86,10 +87,12 @@ def _make_batch(
     return req_states, input_batch
 
 
-def _make_manager(device: torch.device, req_states: SimpleNamespace) -> PCPManager:
+def _make_manager(
+    device: torch.device, req_states: SimpleNamespace, rank: int = 0
+) -> PCPManager:
     return PCPManager(
         pcp_world_size=2,
-        pcp_rank=0,
+        pcp_rank=rank,
         device=device,
         req_states=req_states,
         max_num_reqs=2,
@@ -107,16 +110,77 @@ def test_pcp_partitions_mtp_decode_batch():
         num_draft_tokens_per_req=np.array([3, 1], dtype=np.int32),
     )
 
-    local_batch = _make_manager(device, req_states).partition_batch(global_batch)
+    rank0_manager = _make_manager(device, req_states)
+    local_batch = rank0_manager.partition_batch(global_batch)
 
-    assert local_batch.num_draft_tokens == 4
+    assert local_batch.num_draft_tokens == 3
     assert local_batch.num_draft_tokens_per_req is not None
-    assert local_batch.num_draft_tokens_per_req.tolist() == [3, 1]
-    assert local_batch.cu_num_logits_np.tolist() == [0, 4, 6]
-    assert local_batch.input_ids.tolist() == [101, 201, 202, 203, 102, 211]
-    assert local_batch.logits_indices.tolist() == [0, 1, 2, 3, 4, 5]
-    assert local_batch.expanded_idx_mapping.tolist() == [0, 0, 0, 0, 1, 1]
-    assert local_batch.expanded_local_pos.tolist() == [0, 1, 2, 3, 0, 1]
+    assert local_batch.num_draft_tokens_per_req.tolist() == [3]
+    assert local_batch.cu_num_logits_np.tolist() == [0, 4]
+    assert local_batch.input_ids.tolist() == [101, 201, 202, 203]
+    assert local_batch.logits_indices.tolist() == [0, 1, 2, 3]
+    assert local_batch.expanded_idx_mapping.tolist() == [0, 0, 0, 0]
+    assert local_batch.expanded_local_pos.tolist() == [0, 1, 2, 3]
+
+    global_slots = torch.arange(10, 16, dtype=torch.int64, device=device).view(1, -1)
+    gathered_slots = rank0_manager._convert_to_gathered_slot_mappings(global_slots)
+    assert gathered_slots.tolist() == [[10, 11, 12, 13, 14, 15, -1, -1]]
+
+    req_states.req_id_to_index = {"req-0": 1, "req-1": 0}
+    rank1_batch = _make_manager(device, req_states, rank=1).partition_batch(
+        global_batch
+    )
+    assert rank1_batch.num_tokens == 2
+    assert rank1_batch.num_tokens_after_padding == 4
+    assert rank1_batch.num_draft_tokens == 1
+    assert rank1_batch.num_draft_tokens_per_req is not None
+    assert rank1_batch.num_draft_tokens_per_req.tolist() == [1]
+    assert rank1_batch.cu_num_logits_np.tolist() == [0, 2]
+    assert rank1_batch.input_ids.tolist() == [102, 211, 0, 0]
+    assert rank1_batch.logits_indices.tolist() == [0, 1]
+    assert rank1_batch.expanded_idx_mapping.tolist() == [1, 1]
+    assert rank1_batch.expanded_local_pos.tolist() == [0, 1]
+
+
+def test_pcp_pads_rank_without_owned_decode():
+    device = torch.device("cuda")
+    req_states, global_batch = _make_batch(
+        device,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        num_computed_tokens=np.array([10], dtype=np.int32),
+        prefill_lens=np.array([5], dtype=np.int32),
+        num_draft_tokens_per_req=np.array([0], dtype=np.int32),
+    )
+
+    local_batch = _make_manager(device, req_states, rank=1).partition_batch(
+        global_batch
+    )
+
+    assert local_batch.num_tokens == 0
+    assert local_batch.num_tokens_after_padding == 1
+    assert local_batch.input_ids.tolist() == [0]
+    assert local_batch.is_padding.tolist() == [True]
+    assert local_batch.logits_indices.numel() == 0
+
+
+def test_pcp_spreads_serial_requests_across_owner_ranks():
+    device = torch.device("cuda")
+    req_states, _ = _make_batch(
+        device,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        num_computed_tokens=np.array([10], dtype=np.int32),
+        prefill_lens=np.array([5], dtype=np.int32),
+        num_draft_tokens_per_req=np.array([0], dtype=np.int32),
+    )
+    manager = _make_manager(device, req_states)
+
+    owners = set()
+    for index in range(8):
+        req_id = f"serial-{index}"
+        req_states.req_id_to_index = {req_id: 0}
+        owners.add(int(manager._get_decode_owner_ranks([req_id])[0]))
+
+    assert owners == {0, 1}
 
 
 def test_pcp_partitions_mixed_prefill_and_mtp_decode_batch():

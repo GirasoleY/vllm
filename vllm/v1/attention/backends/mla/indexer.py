@@ -924,7 +924,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(chunks)
 
         decode_metadata = None
-        if num_decodes > 0:
+        if num_decode_tokens > 0:
             torch.diff(
                 common_attn_metadata.query_start_loc[: num_decodes + 1],
                 out=self.decode_lens_buffer[:num_decodes],

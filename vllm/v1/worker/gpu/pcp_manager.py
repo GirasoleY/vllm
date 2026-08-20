@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import hashlib
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -73,6 +74,7 @@ class PCPManager:
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
+        self._decode_owner_by_req_id: dict[str, int] = {}
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
         self._input_buffers = (
@@ -203,6 +205,7 @@ class PCPManager:
         num_computed_tokens: np.ndarray,
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
+        decode_owner_ranks: np.ndarray,
     ) -> list[RankSegment]:
         """Build one rank's attention-compatible DualChunkSwap rows.
 
@@ -226,9 +229,11 @@ class PCPManager:
             if bool(is_prefilling[global_batch_req_idx]):
                 chunk_size = (query_len + num_chunks - 1) // num_chunks
                 chunk_indices = (rank, num_chunks - 1 - rank)
-            else:  # decodes are replicated
+            elif rank == int(decode_owner_ranks[global_batch_req_idx]):
                 chunk_size = query_len
                 chunk_indices = (0,)
+            else:
+                continue
 
             for chunk_idx in chunk_indices:
                 chunk_offset = chunk_idx * chunk_size
@@ -259,6 +264,7 @@ class PCPManager:
         num_computed_tokens: np.ndarray,
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
+        decode_owner_ranks: np.ndarray,
     ) -> tuple[list[list[RankSegment]], list[int]]:
         segments_by_rank = []
         per_rank_num_tokens = []
@@ -269,6 +275,7 @@ class PCPManager:
                 num_computed_tokens,
                 is_prefilling,
                 query_start_loc_np,
+                decode_owner_ranks,
             )
             num_rank_tokens = sum(segment.num_tokens for segment in segments)
             segments_by_rank.append(segments)
@@ -299,9 +306,6 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
-                # Cache insertion pairs one slot entry with each rank's local decode.
-                if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
-                    continue
                 gathered_kv_write_mask[padded_gathered_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(
                     padded_gathered_slice.start,
@@ -320,6 +324,35 @@ class PCPManager:
         )
         return segments_by_rank, per_rank_num_tokens
 
+    def _get_decode_owner_ranks(self, req_ids: list[str]) -> np.ndarray:
+        assert self._req_states is not None
+        # Request-state slots are rank-local, so ownership must use request IDs.
+        active_req_ids = self._req_states.req_id_to_index.keys()
+        self._decode_owner_by_req_id = {
+            req_id: owner
+            for req_id, owner in self._decode_owner_by_req_id.items()
+            if req_id in active_req_ids
+        }
+
+        owner_load = np.bincount(
+            list(self._decode_owner_by_req_id.values()),
+            minlength=self.pcp_world_size,
+        )
+        new_req_ids = sorted(set(req_ids) - self._decode_owner_by_req_id.keys())
+        for req_id in new_req_ids:
+            least_loaded = np.flatnonzero(owner_load == owner_load.min())
+            digest = hashlib.blake2b(req_id.encode(), digest_size=8).digest()
+            tie_breaker = int.from_bytes(digest, "little")
+            owner = int(least_loaded[tie_breaker % len(least_loaded)])
+            self._decode_owner_by_req_id[req_id] = owner
+            owner_load[owner] += 1
+
+        return np.fromiter(
+            (self._decode_owner_by_req_id[req_id] for req_id in req_ids),
+            dtype=np.intp,
+            count=len(req_ids),
+        )
+
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
         assert self._req_states is not None
         assert self._input_buffers is not None
@@ -332,12 +365,14 @@ class PCPManager:
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
         is_prefilling = global_batch.is_prefilling_np
+        decode_owner_ranks = self._get_decode_owner_ranks(global_batch.req_ids)
 
         segments_by_rank, per_rank_num_tokens = self._build_batch_layout(
             num_scheduled_tokens,
             num_computed_tokens,
             is_prefilling,
             global_batch.query_start_loc_np,
+            decode_owner_ranks,
         )
 
         local_segments = segments_by_rank[self.pcp_rank]
@@ -506,17 +541,21 @@ class PCPManager:
             )
             expanded_idx_mapping = local_to_global_req_idx[:0]
             expanded_local_pos = torch.empty(0, dtype=torch.int32, device=self.device)
-        logits_indices = combine_sampled_and_draft_tokens(
-            input_buffers.input_ids,
-            local_to_global_req_idx,
-            req_states.last_sampled_tokens,
-            local_query_start_loc,
-            seq_lens,
-            req_states.prefill_len.gpu,
-            req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            1,
+        logits_indices = (
+            combine_sampled_and_draft_tokens(
+                input_buffers.input_ids,
+                local_to_global_req_idx,
+                req_states.last_sampled_tokens,
+                local_query_start_loc,
+                seq_lens,
+                req_states.prefill_len.gpu,
+                req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                1,
+            )
+            if total_num_logits
+            else torch.empty(0, dtype=torch.int64, device=self.device)
         )
 
         local_prefill_len_np = global_batch.prefill_len_np[

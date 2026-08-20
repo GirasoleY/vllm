@@ -365,7 +365,7 @@ def sparse_attn_indexer(
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
-    has_decode = attn_metadata_narrowed.num_decodes > 0
+    has_decode = attn_metadata_narrowed.num_decode_tokens > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
 

@@ -51,6 +51,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def set_pcp_manager(self, manager: "PCPManager") -> None:
         self.pcp_manager = manager
+        # DualChunkSwap can create two rank-local segments per global request.
+        self.input_buffers = InputBuffers(
+            max_num_reqs=2 * self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            device=self.device,
+        )
         self.pcp_input_ids = torch.empty_like(self.input_buffers.input_ids)
 
     def load_model(self, target_model: nn.Module) -> None:
@@ -291,10 +297,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.input_buffers.input_ids[:local_num_tokens].copy_(local_input_ids)
             self.input_buffers.positions[:local_num_tokens].copy_(local_batch.positions)
             self.input_buffers.query_start_loc[: local_batch.num_reqs + 1].copy_(
-                local_batch.query_start_loc
+                local_batch.query_start_loc[: local_batch.num_reqs + 1]
             )
             self.input_buffers.seq_lens[: local_batch.num_reqs].copy_(
-                local_batch.seq_lens
+                local_batch.seq_lens[: local_batch.num_reqs]
             )
             prefill_input_batch = local_batch
 

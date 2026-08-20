@@ -517,24 +517,13 @@ __global__ void fused_norm_rope_pcp_combine_kernel(
     uint8_t* __restrict__ mla_cache, int64_t mla_block_stride,
     int64_t mla_token_stride, uint8_t* __restrict__ index_cache,
     int64_t index_block_stride, int world_size, int local_tokens,
-    int num_decode_tokens, int max_local_tokens, int cache_block_size,
+    bool rank_major_mapping, int max_local_tokens, int cache_block_size,
     bool has_indexer) {
   int cache_token = blockIdx.x;
-  int source;
-  int source_token;
-  int mapping_token;
-  if (cache_token < num_decode_tokens) {
-    source = 0;
-    source_token = cache_token;
-    mapping_token = cache_token;
-  } else {
-    int local_prefill_tokens = local_tokens - num_decode_tokens;
-    int prefill_token = cache_token - num_decode_tokens;
-    source = prefill_token / local_prefill_tokens;
-    source_token =
-        num_decode_tokens + prefill_token - source * local_prefill_tokens;
-    mapping_token = source * local_tokens + source_token;
-  }
+  int source = rank_major_mapping ? cache_token / local_tokens : 0;
+  int source_token =
+      rank_major_mapping ? cache_token % local_tokens : cache_token;
+  int mapping_token = cache_token;
   int parity = static_cast<uint32_t>(epoch[0]) & 1u;
   int64_t row_offset =
       (static_cast<int64_t>(parity) * world_size * max_local_tokens +
@@ -833,9 +822,10 @@ void fused_norm_rope_pcp_combine(
                   "invalid local token count");
   STD_TORCH_CHECK(num_decode_tokens >= 0 && num_decode_tokens <= local_tokens,
                   "invalid decode token count");
-  int64_t required_mapping_tokens = num_decode_tokens == local_tokens
-                                        ? num_decode_tokens
-                                        : world_size * local_tokens;
+  bool rank_major_mapping =
+      mla_slot_mapping.numel() >= world_size * local_tokens;
+  int64_t required_mapping_tokens =
+      rank_major_mapping ? world_size * local_tokens : local_tokens;
   auto valid_mapping = [&](const torch::stable::Tensor& mapping) {
     return mapping.is_cuda() && mapping.is_contiguous() &&
            mapping.scalar_type() == ScalarType::Long &&
@@ -881,8 +871,7 @@ void fused_norm_rope_pcp_combine(
 
   const torch::stable::accelerator::DeviceGuard device_guard(device);
   cudaStream_t stream = get_current_cuda_stream(device);
-  int blocks = static_cast<int>(
-      num_decode_tokens + world_size * (local_tokens - num_decode_tokens));
+  int blocks = static_cast<int>(required_mapping_tokens);
   auto launch = [&]<typename Config>() {
     fused_norm_rope_pcp_combine_kernel<Config><<<blocks, 128, 0, stream>>>(
         reinterpret_cast<const uint8_t*>(received_payload.const_data_ptr()),
@@ -893,7 +882,7 @@ void fused_norm_rope_pcp_combine(
         mla_cache.stride(0), mla_cache.stride(1),
         reinterpret_cast<uint8_t*>(index_cache.mutable_data_ptr()),
         has_indexer ? index_cache.stride(0) : 0, static_cast<int>(world_size),
-        static_cast<int>(local_tokens), static_cast<int>(num_decode_tokens),
+        static_cast<int>(local_tokens), rank_major_mapping,
         static_cast<int>(max_local_tokens), static_cast<int>(mla_cache.size(1)),
         has_indexer);
   };

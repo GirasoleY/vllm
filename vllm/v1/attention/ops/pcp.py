@@ -29,10 +29,10 @@ logger = init_logger(__name__)
 class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
     """Persistent NVLS workspace for sparse-MLA PCP cache dispatch.
 
-    Each rank contributes the same number of local tokens. Decode rows are
-    replicated, while prefill rows are sequence-sharded. The dispatch kernel
-    writes cache-ready payloads into the symmetric window, and the combine kernel
-    scatters the unique rows into local paged caches.
+    Each rank contributes the same padded number of local tokens. The dispatch
+    kernel writes cache-ready payloads into the symmetric window, and the combine
+    kernel uses the rank-major slot mapping to scatter unique rows into every
+    rank's local paged caches.
     """
 
     PACKED_ROW_BYTES = {
@@ -220,41 +220,26 @@ def get_fused_pcp_norm_rope_workspace(
     )
 
 
-def _gather_prefill_cache_inputs(
+def _gather_pcp_cache_inputs(
     tensors: tuple[torch.Tensor, ...],
     slot_mapping: torch.Tensor,
     num_decode_tokens: int,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Keep replicated decode writes local and gather partitioned prefills."""
+    """Gather owner-local cache rows into the rank-major slot layout."""
     local_num_tokens = tensors[0].shape[0]
     assert all(tensor.shape[0] == local_num_tokens for tensor in tensors)
     assert 0 <= num_decode_tokens <= local_num_tokens
 
-    if num_decode_tokens == local_num_tokens:
-        return tensors, slot_mapping[:num_decode_tokens]
-
     pcp_group = get_pcp_group()
-    gathered_prefills = tuple(
-        pcp_group.all_gather(tensor[num_decode_tokens:].contiguous(), dim=0)
-        for tensor in tensors
-    )
-    pcp_size = pcp_group.world_size
-    gathered_slot_mapping = slot_mapping[: pcp_size * local_num_tokens]
-    if num_decode_tokens == 0:
-        return gathered_prefills, gathered_slot_mapping
+    gathered_num_tokens = pcp_group.world_size * local_num_tokens
+    if slot_mapping.numel() < gathered_num_tokens:
+        assert num_decode_tokens == local_num_tokens
+        return tensors, slot_mapping[:local_num_tokens]
 
-    cache_inputs = tuple(
-        torch.cat((tensor[:num_decode_tokens], gathered_prefill), dim=0)
-        for tensor, gathered_prefill in zip(tensors, gathered_prefills)
+    gathered = tuple(
+        pcp_group.all_gather(tensor.contiguous(), dim=0) for tensor in tensors
     )
-    rank_slot_mappings = gathered_slot_mapping.view(pcp_size, local_num_tokens)
-    cache_slot_mapping = torch.cat(
-        (
-            rank_slot_mappings[0, :num_decode_tokens],
-            rank_slot_mappings[:, num_decode_tokens:].flatten(),
-        )
-    )
-    return cache_inputs, cache_slot_mapping
+    return gathered, slot_mapping[:gathered_num_tokens]
 
 
 def maybe_gather_mla_latent_cache_inputs(
@@ -269,7 +254,7 @@ def maybe_gather_mla_latent_cache_inputs(
     assert slot_mapping is not None
     num_tokens = kv_c_normed.shape[0]
     k_pe_flat = k_pe.reshape(num_tokens, -1)
-    (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = _gather_prefill_cache_inputs(
+    (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = _gather_pcp_cache_inputs(
         (kv_c_normed, k_pe_flat),
         slot_mapping,
         num_decode_tokens,
@@ -286,7 +271,7 @@ def maybe_gather_indexer_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not use_pcp:
         return k, slot_mapping
-    (cache_k,), cache_slot_mapping = _gather_prefill_cache_inputs(
+    (cache_k,), cache_slot_mapping = _gather_pcp_cache_inputs(
         (k,), slot_mapping, num_decode_tokens
     )
     return cache_k, cache_slot_mapping
