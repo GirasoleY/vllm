@@ -45,6 +45,11 @@ class AttentionState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor]
 
 
+PrepareCaptureAttn = Callable[
+    [InputBatch], tuple[tuple[torch.Tensor, ...], torch.Tensor]
+]
+
+
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
@@ -475,6 +480,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
+        prepare_capture_attn: PrepareCaptureAttn | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
@@ -521,6 +527,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
+                prepare_capture_attn=prepare_capture_attn,
             )
 
             # Capture with dummy rows marked as padding.
@@ -613,12 +620,16 @@ def prepare_inputs_to_capture(
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
     max_query_len: int | None = None,
+    prepare_capture_attn: PrepareCaptureAttn | None = None,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
-    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    if prepare_capture_attn is None:
+        input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+        slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    else:
+        input_block_tables, slot_mappings = prepare_capture_attn(input_batch)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, kv_cache_config
     )

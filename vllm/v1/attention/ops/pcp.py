@@ -14,9 +14,9 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.logger import init_logger
-from vllm.v1.attention.ops.dcp_utils import (
-    _direct_dcp_multicast_enabled,
-    _DirectDCPWorkspace,
+from vllm.v1.attention.ops.cp_common import (
+    DirectCPWorkspace,
+    direct_cp_multicast_enabled,
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class DirectPCPFusedNormRopeWorkspace(_DirectDCPWorkspace):
+class DirectPCPFusedNormRopeWorkspace(DirectCPWorkspace):
     """Persistent NVLS workspace for sparse-MLA PCP cache dispatch.
 
     Each rank contributes the same padded number of local tokens. The dispatch
@@ -178,7 +178,7 @@ def _get_fused_pcp_norm_rope_workspace(
     num_ubatches: int,
 ) -> DirectPCPFusedNormRopeWorkspace | None:
     group = get_pcp_group()
-    if group.world_size <= 1 or not _direct_dcp_multicast_enabled(
+    if group.world_size <= 1 or not direct_cp_multicast_enabled(
         group,
         torch.uint8,
         envs.VLLM_USE_FUSED_PCP_NORM_ROPE,

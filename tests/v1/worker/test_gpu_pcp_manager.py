@@ -142,6 +142,52 @@ def test_pcp_partitions_mtp_decode_batch():
     assert rank1_batch.expanded_local_pos.tolist() == [0, 1]
 
 
+def test_pcp_decode_cudagraph_shape_uses_max_owner_load():
+    device = torch.device("cuda")
+    req_states, _ = _make_batch(
+        device,
+        num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
+        num_computed_tokens=np.array([10, 20], dtype=np.int32),
+        prefill_lens=np.array([5, 5], dtype=np.int32),
+        num_draft_tokens_per_req=np.array([3, 3], dtype=np.int32),
+    )
+    manager = _make_manager(device, req_states)
+
+    num_reqs, num_tokens = manager.get_decode_cudagraph_shape(
+        ["req-0", "req-1"], np.array([4, 4], dtype=np.int32), 4
+    )
+
+    assert num_reqs == 1
+    assert num_tokens == 4
+
+
+def test_pcp_partition_pads_to_cudagraph_shape():
+    device = torch.device("cuda")
+    req_states, global_batch = _make_batch(
+        device,
+        num_scheduled_tokens=np.array([4, 2], dtype=np.int32),
+        num_computed_tokens=np.array([10, 20], dtype=np.int32),
+        prefill_lens=np.array([5, 5], dtype=np.int32),
+        num_draft_tokens_per_req=np.array([3, 1], dtype=np.int32),
+    )
+    req_states.req_id_to_index = {"req-0": 1, "req-1": 0}
+
+    local_batch = _make_manager(device, req_states, rank=1).partition_batch(
+        global_batch,
+        num_tokens_after_padding=8,
+        num_reqs_after_padding=2,
+    )
+
+    assert local_batch.num_tokens == 2
+    assert local_batch.num_tokens_after_padding == 8
+    assert local_batch.num_reqs == 1
+    assert local_batch.num_reqs_after_padding == 2
+    assert local_batch.input_ids.tolist() == [102, 211, 0, 0, 0, 0, 0, 0]
+    assert local_batch.query_start_loc.tolist() == [0, 2, 2]
+    assert local_batch.seq_lens.tolist() == [22, 0]
+    assert local_batch.is_padding.tolist() == [False, False] + [True] * 6
+
+
 def test_pcp_pads_rank_without_owned_decode():
     device = torch.device("cuda")
     req_states, global_batch = _make_batch(

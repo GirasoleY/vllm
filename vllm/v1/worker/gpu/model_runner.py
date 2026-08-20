@@ -892,10 +892,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.encoder_runner.capture()
 
             if capture_decoder:
+                capture_input_buffers = self.input_buffers
+                prepare_capture_attn = None
+                if self.pcp_manager is not None:
+                    capture_input_buffers = self.pcp_manager.input_buffers
+                    prepare_capture_attn = self.pcp_manager.prepare_dummy_attn
                 self.cudagraph_manager.capture(
                     self.model,
                     self.model_state,
-                    self.input_buffers,
+                    capture_input_buffers,
                     self.intermediate_tensors,
                     self.block_tables,
                     self.attn_groups,
@@ -903,6 +908,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    prepare_capture_attn=prepare_capture_attn,
                 )
                 if self.speculator is not None:
                     with use_workspace_lane(self._draft_workspace_lane):
@@ -1121,9 +1127,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         batch_req_state: "BatchReqState",
         batch_desc: BatchExecutionDescriptor,
+        use_pcp_cudagraph_shape: bool = False,
     ) -> InputBatch:
         num_tokens = batch_req_state.num_tokens
-        num_tokens_after_padding = batch_desc.num_tokens
+        num_tokens_after_padding = (
+            num_tokens if use_pcp_cudagraph_shape else batch_desc.num_tokens
+        )
         assert num_tokens > 0
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
@@ -1186,7 +1195,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        num_reqs_padded = (
+            num_reqs if use_pcp_cudagraph_shape else batch_desc.num_reqs or num_reqs
+        )
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
@@ -1315,7 +1326,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else None
             ),
         )
-        return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+        return pcp.maybe_partition_pcp_batch(
+            self.pcp_manager,
+            input_batch,
+            num_tokens_after_padding=(
+                batch_desc.num_tokens if use_pcp_cudagraph_shape else None
+            ),
+            num_reqs_after_padding=(
+                batch_desc.num_reqs if use_pcp_cudagraph_shape else None
+            ),
+        )
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1470,10 +1490,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        dispatch_num_reqs = num_reqs
+        dispatch_num_toks = num_toks
+        use_pcp_cudagraph_shape = False
+        if (
+            self.pcp_manager is not None
+            and batch_req_state is not None
+            and uniform_tok_count is not None
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            use_pcp_cudagraph_shape = True
+            dispatch_num_reqs, dispatch_num_toks = (
+                self.pcp_manager.get_decode_cudagraph_shape(
+                    batch_req_state.req_ids,
+                    batch_req_state.num_scheduled_tokens,
+                    uniform_tok_count,
+                )
+            )
+
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
-            num_reqs,
-            num_toks,
+            dispatch_num_reqs,
+            dispatch_num_toks,
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
@@ -1492,7 +1530,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc
+                scheduler_output,
+                batch_req_state,
+                batch_desc,
+                use_pcp_cudagraph_shape=use_pcp_cudagraph_shape,
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block

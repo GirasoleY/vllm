@@ -137,6 +137,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.pcp_manager is not None:
+            # PCP target decode is graph-captured; draft cache updates stay eager.
+            cudagraph_mode = CUDAGraphMode.NONE
+
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
