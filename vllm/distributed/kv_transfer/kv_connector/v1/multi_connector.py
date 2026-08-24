@@ -287,6 +287,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.start_load_kv(forward_context, **kwargs)
 
+    def start_load_kv_before_forward(
+        self, forward_context: "ForwardContext", **kwargs
+    ) -> None:
+        for c in self._connectors:
+            c.start_load_kv_before_forward(forward_context, **kwargs)
+
+    def start_deferred_kv_work(self, finished_req_ids: set[str]) -> None:
+        for c in self._connectors:
+            c.start_deferred_kv_work(finished_req_ids)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         for c in self._connectors:
             c.wait_for_layer_load(layer_name)

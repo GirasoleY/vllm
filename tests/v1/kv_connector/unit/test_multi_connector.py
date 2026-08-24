@@ -302,7 +302,7 @@ def test_multi_example_connector_consistency():
         "get_handshake_metadata",
         "handle_preemptions",
         "bind_connector_metadata",
-        "start_load_kv",
+        "start_load_kv_before_forward",
         "wait_for_layer_load",
         "save_kv_layer",
     ]
@@ -321,7 +321,7 @@ def test_multi_example_connector_consistency():
         "get_handshake_metadata",
         "handle_preemptions",
         "bind_connector_metadata",
-        "start_load_kv",
+        "start_load_kv_before_forward",
         "wait_for_layer_load",
         "save_kv_layer",
     ]

@@ -28,7 +28,9 @@ The class provides the following primitives:
         handle_preemptions() - called for handling preempted requests
             or request evicted blocks before they are overwritten
 
-        start_load_kv() - starts loading all KVs (maybe async)
+        start_load_kv_before_forward() - starts work required by this forward
+        start_deferred_kv_work() - starts independent work after the forward
+        start_load_kv() - legacy pre-forward loading hook
         wait_for_layer_load() - blocks until layer i load is done
 
         save_kv_layer() - starts saving KV for layer i (maybe async)
@@ -302,6 +304,21 @@ class KVConnectorBase_V1(ABC):
 
         """
         pass
+
+    def start_load_kv_before_forward(
+        self, forward_context: "ForwardContext", **kwargs: Any
+    ) -> None:
+        """Submit connector work required before the current forward."""
+        self.start_load_kv(forward_context, **kwargs)
+
+    def start_deferred_kv_work(self, finished_req_ids: set[str]) -> None:
+        """Submit connector work after the current model forward.
+
+        Only work that is not consumed by the current forward may be started
+        here. The default is a no-op so existing and layerwise connectors keep
+        their pre-forward ``start_load_kv`` behavior.
+        """
+        return
 
     @abstractmethod
     def wait_for_layer_load(self, layer_name: str) -> None:

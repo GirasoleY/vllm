@@ -83,10 +83,11 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        kv_connector.start_load_kv(get_forward_context())
+        kv_connector.start_load_kv_before_forward(get_forward_context())
         try:
             yield output
         finally:
+            kv_connector.start_deferred_kv_work(scheduler_output.finished_req_ids)
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
 

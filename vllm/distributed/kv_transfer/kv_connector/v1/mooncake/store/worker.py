@@ -1743,33 +1743,15 @@ class MooncakeStoreWorker:
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
 
-    def start_load_kv(
-        self,
-        metadata: MooncakeStoreConnectorMetadata,
-    ):
-        """No-op: loads are issued in get_finished() for overlap."""
-        pass
-
-    def wait_for_save(
-        self,
-        metadata: MooncakeStoreConnectorMetadata,
-    ):
-        """No-op: stores are issued in get_finished() for overlap."""
-        pass
-
-    def get_finished(
+    def start_deferred_kv_work(
         self,
         finished_req_ids: set[str],
         meta: MooncakeStoreConnectorMetadata,
-    ) -> tuple[set[str], set[str]]:
-        """Issue all I/O and get completed send/recv request IDs.
-
-        All load and store I/O requests are issued here (after model
-        compute is launched on the compute stream) for better
-        compute-I/O overlap.
-        """
+    ) -> None:
+        """Issue asynchronous I/O after model work has been submitted."""
         if self._capacity_only:
-            return set(), set()
+            return
+        assert self.load_async, "load_async must be True for deferred loading."
 
         # Issue async loads
         for request in meta.requests:
@@ -1780,7 +1762,6 @@ class MooncakeStoreWorker:
             load_spec.token_len = load_spec.kvpool_cached_tokens
             self.recv_request_queue.put(request)
 
-        assert self.load_async, "load_async must be True for better performance."
         # Issue stores with CUDA event synchronization.
         if self.can_put:
             current_event = None
@@ -1797,6 +1778,11 @@ class MooncakeStoreWorker:
                 assert self.kv_send_thread is not None
                 self.kv_send_thread.add_request(request)
             self._close_ended_store_requests(finished_req_ids, meta)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        """Get completed send/receive request IDs."""
+        if self._capacity_only:
+            return set(), set()
 
         # Blocks read by a store job are released by the scheduler when the job
         # reports back (see build_connector_worker_meta), so no request ever waits

@@ -353,10 +353,34 @@ class NixlPullConnector(NixlBaseConnector):
             )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        self._start_load_kv()
+
+    def _start_load_kv(self) -> None:
         assert self.connector_worker is not None
         assert isinstance(self.connector_worker, NixlPullConnectorWorker)
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+
+    def _should_defer_start_load(self) -> bool:
+        """Whether these READs belong only to requests waiting on remote KV."""
+        worker = self.connector_worker
+        return (
+            self.kv_transfer_config.kv_role == "kv_consumer"
+            and worker is not None
+            and not worker.use_host_buffer
+            and self._vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self._vllm_config.model_config.runner_type == "generate"
+        )
+
+    def start_load_kv_before_forward(
+        self, forward_context: "ForwardContext", **kwargs
+    ) -> None:
+        if not self._should_defer_start_load():
+            self._start_load_kv()
+
+    def start_deferred_kv_work(self, finished_req_ids: set[str]) -> None:
+        if self._should_defer_start_load():
+            self._start_load_kv()
 
 
 class NixlPushConnector(NixlBaseConnector):

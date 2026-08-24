@@ -67,10 +67,10 @@ class ActiveKVConnector(KVConnector):
 
         # TODO: sort out KV Connectors' use of forward_context
         if is_forward_context_available():
-            self.kv_connector.start_load_kv(get_forward_context())
+            self.kv_connector.start_load_kv_before_forward(get_forward_context())
         else:
             with set_forward_context(None, self.vllm_config):
-                self.kv_connector.start_load_kv(get_forward_context())
+                self.kv_connector.start_load_kv_before_forward(get_forward_context())
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
@@ -78,6 +78,7 @@ class ActiveKVConnector(KVConnector):
         if self._disabled:
             return None
 
+        self.kv_connector.start_deferred_kv_work(finished_req_ids)
         output = KVConnectorOutput()
         if wait_for_save:
             self.kv_connector.wait_for_save()

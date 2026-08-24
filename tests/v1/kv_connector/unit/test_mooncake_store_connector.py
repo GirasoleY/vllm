@@ -121,11 +121,13 @@ def test_worker_methods_delegate_to_store_worker():
     connector.bind_connector_metadata(metadata)
 
     connector.register_kv_caches(kv_caches)
+    connector.start_deferred_kv_work(finished_req_ids)
     result = connector.get_finished(finished_req_ids)
     invalid_block_ids = connector.get_block_ids_with_load_errors()
 
     worker.register_kv_caches.assert_called_once_with(kv_caches)
-    worker.get_finished.assert_called_once_with(finished_req_ids, metadata)
+    worker.start_deferred_kv_work.assert_called_once_with(finished_req_ids, metadata)
+    worker.get_finished.assert_called_once_with()
     assert result == ({"req-1"}, {"req-2"})
     worker.get_block_ids_with_load_errors.assert_called_once_with()
     assert invalid_block_ids == {3, 4}
