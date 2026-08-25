@@ -13,11 +13,51 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+    swizzle_mxfp8_scale,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
+
+
+def _quantize_before_dispatch(
+    quant_config: FusedMoEQuantConfig, defer_input_quant: bool
+) -> bool:
+    """Return whether activations must be quantized before DeepEP dispatch."""
+    if defer_input_quant:
+        return False
+    return quant_config.is_block_quantized or quant_config.quant_dtype == "mxfp8"
+
+
+def _pack_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Pack row-major UE8M0 scales into DeepEP's four-byte scale packs.
+
+    DeepEP moves scale factors as opaque four-byte ``sf_pack_t`` values.
+    MXFP8 stores one UE8M0 byte per 32 activation values, so four adjacent
+    scales are reinterpreted as one ``int32`` without changing their bits.
+    """
+    assert scale.dtype == torch.uint8 and scale.ndim == 2, (
+        f"expected 2D uint8 MXFP8 scales, got {scale.shape} {scale.dtype}"
+    )
+    assert scale.size(1) % 4 == 0, (
+        f"MXFP8 dispatch requires hidden_size % {MXFP8_BLOCK_SIZE * 4} == 0, "
+        f"got {scale.size(1)} scale columns"
+    )
+    return scale.contiguous().view(torch.int32)
+
+
+def _unpack_mxfp8_scale(
+    scale: torch.Tensor, hidden_size: int, is_scale_swizzled: bool
+) -> torch.Tensor:
+    """Restore dispatched MXFP8 scales to the expert kernel's layout."""
+    scale = scale.contiguous().view(torch.uint8)
+    if is_scale_swizzled:
+        scale = swizzle_mxfp8_scale(scale, M=scale.size(0), K=hidden_size)
+    return scale
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -266,7 +306,14 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
 
-        if not quant_config.is_block_quantized and not defer_input_quant:
+        if _quantize_before_dispatch(quant_config, defer_input_quant):
+            if quant_config.quant_dtype == "mxfp8" and expert_x_scale is not None:
+                expert_x_scale = _unpack_mxfp8_scale(
+                    expert_x_scale,
+                    hidden_size=expert_x.size(-1),
+                    is_scale_swizzled=quant_config.is_scale_swizzled,
+                )
+        elif not defer_input_quant:
             expert_x_scale = None
             if expert_x.numel() != 0:
                 expert_x, expert_x_scale = moe_kernel_quantize_input(
@@ -307,16 +354,23 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
-        if quant_config.is_block_quantized and not defer_input_quant:
+        if _quantize_before_dispatch(quant_config, defer_input_quant):
+            # Keep scales row-major while DeepEP shuffles tokens. Backends that
+            # require a swizzled layout receive it after dispatch in _receiver.
             a1q, a1q_scale = moe_kernel_quantize_input(
                 a1,
                 quant_config.a1_scale,
                 quant_dtype=quant_config.quant_dtype,
                 per_act_token_quant=quant_config.per_act_token_quant,
                 block_shape=quant_config.block_shape,
+                is_scale_swizzled=False,
+                mx_alignment=quant_config.mx_alignment,
             )
             if a1q_scale is not None and a1q_scale.numel() == 1:
                 a1q_scale = a1q_scale.view(1, 1)
+            if quant_config.quant_dtype == "mxfp8":
+                assert a1q_scale is not None
+                a1q_scale = _pack_mxfp8_scale(a1q_scale)
             a1_post_scale = None
         else:
             a1q = a1
