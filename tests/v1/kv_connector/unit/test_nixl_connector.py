@@ -524,10 +524,9 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         assert expected_engine_id == self.REMOTE_ENGINE_ID
 
         # Adjust remote block length metadata to satisfy heterogeneous TP
-        # invariants enforced during handshake validation.  Use per-rank
-        # head ratio (not tp_ratio) to account for GQA replication capping.
+        # invariants enforced during handshake validation. Use the per-rank
+        # head ratio to account for GQA replication capping.
         remote_block_lens = list(self.block_len_per_layer)
-        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         total_kv = self.transfer_topo.total_num_kv_heads
         local_heads = self.transfer_topo.local_physical_heads
         remote_heads = max(1, total_kv // remote_tp_size)
@@ -537,11 +536,11 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                 for block_len in remote_block_lens
             ]
 
-        # When remote tp_size > local tp_size, handshake with multiple
-        # remote ranks.
-        num_handshakes = 1 if tp_ratio > 0 else -tp_ratio
+        target_ranks = self.transfer_topo.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
+        )
         remote_agents: dict[tuple[int, int], str] = {}
-        for remote_tp_rank in range(num_handshakes):
+        for remote_tp_rank in target_ranks:
             remote_agent_name = self.add_remote_agent(
                 NixlAgentMetadata(
                     engine_id=self.REMOTE_ENGINE_ID,
@@ -556,9 +555,11 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     ssm_sizes=(0, 0),
                     attn_backend_name=self.backend_name,
                     physical_blocks_per_logical_kv_block=1,
+                    dcp_size=remote_dcp_size,
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
+                remote_dcp_size=remote_dcp_size,
             )
             remote_agents[(0, remote_tp_rank)] = remote_agent_name
         # Handshake bypasses zmq, so report a zero clock offset to the peer.

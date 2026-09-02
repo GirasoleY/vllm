@@ -19,6 +19,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_REMOTE_PREFILL_NOTIFICATION_FIELDS = (
+    "remote_block_ids",
+    "remote_engine_id",
+    "remote_request_id",
+    "remote_host",
+    "remote_port",
+)
+
 
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     """Pull-specific scheduler logic (READ-based KV transfer)."""
@@ -224,7 +232,20 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # To avoid stranding the prefill blocks in the prefill instance,
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
-            self._reqs_need_recv[request.request_id] = (request, [], ())
+            missing_fields = [
+                field
+                for field in _REMOTE_PREFILL_NOTIFICATION_FIELDS
+                if params.get(field) is None
+            ]
+            if missing_fields:
+                logger.warning(
+                    "Cannot notify the remote prefill for finished request %s: "
+                    "missing KVTransferParams fields %s.",
+                    request.request_id,
+                    missing_fields,
+                )
+            else:
+                self._reqs_need_recv[request.request_id] = (request, [], ())
             params["do_remote_prefill"] = False
             return False, None
 

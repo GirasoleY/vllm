@@ -407,6 +407,9 @@ class EngineTransferInfo:
     remote_dcp_size: int = 1
     """Remote decode context parallel size."""
 
+    remote_cp_kv_cache_interleave_size: int = 1
+    """Remote rank's token-interleave granularity."""
+
 
 # ---- Transfer topology ----
 
@@ -424,6 +427,7 @@ class TransferTopology:
     total_num_kv_heads: int
     attn_backends: list[type[AttentionBackend]]
     dcp_size: int = 1
+    cp_kv_cache_interleave_size: int = 1
     tensor_shape: torch.Size | None = None
 
     def __post_init__(self):
@@ -618,6 +622,8 @@ class TransferTopology:
             f"remote_pp={remote_pp_rank}, "
             f"local_dcp={self.dcp_size}, "
             f"remote_dcp={info.remote_dcp_size}, "
+            f"local_interleave={self.cp_kv_cache_interleave_size}, "
+            f"remote_interleave={info.remote_cp_kv_cache_interleave_size}, "
             f"local_rank={self.tp_rank}, "
             f"remote_block_len={info.remote_block_len})"
         )

@@ -1170,11 +1170,14 @@ class VllmConfig:
                     "PD with decode_context_parallel_size > 1 is only "
                     "supported for MLA models."
                 )
-                assert not (self.model_config.is_hybrid and dcp_size > 1), (
-                    "PD with decode_context_parallel_size > 1 is not "
-                    "supported for hybrid Mamba/SSM models."
+                assert not (
+                    self.model_config.is_hybrid
+                    and dcp_size > 1
+                    and self.cache_config.mamba_cache_mode != "align"
+                ), (
+                    "PD with decode_context_parallel_size > 1 only supports "
+                    "hybrid Mamba/SSM models with mamba_cache_mode='align'."
                 )
-
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
@@ -2801,11 +2804,13 @@ class VllmConfig:
     def adjust_dcp_kv_cache_interleave_size(
         self, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        """Normalize DCP interleave size against block_size for NIXL P/D.
+        """Normalize the deprecated DCP interleave option.
 
-        Called by each worker (via ensure_kv_transfer_initialized), once it knows its
-        own final block_size via kv_cache_config.
+        Called by each worker (via ensure_kv_transfer_initialized). Preserve the
+        configured CP layout here; each KV connector must validate whether the
+        local and remote layouts are directly transferable.
         """
+        del kv_cache_config
         dcp_size = self.parallel_config.decode_context_parallel_size
         if dcp_size <= 1:
             return
@@ -2822,29 +2827,6 @@ class VllmConfig:
                 "deprecated when PCP is fully supported."
             )
 
-        if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
-            "NixlConnector"
-        ):
-            return
-
-        # Get the kernel block_size, but don't use resolve_kv_cache_block_size to avoid
-        # scaling by dcp_size (we need the local block_size here).
-        local_block_size = min(
-            g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
-        )
-        if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
-            interleave = self.parallel_config.cp_kv_cache_interleave_size
-            self.parallel_config.cp_kv_cache_interleave_size = local_block_size
-            logger.info_once(
-                "When using PD disaggregation with DCP "
-                "(decode_context_parallel_size=%d), "
-                "cp_kv_cache_interleave_size is automatically adjusted "
-                "from %d to block_size %d for block-level alignment.",
-                dcp_size,
-                interleave,
-                local_block_size,
-            )
-
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.
 
@@ -2853,13 +2835,7 @@ class VllmConfig:
         """
         block_size = self.cache_config.block_size
 
-        # Skip DCP interleave-size compatibility for NIXL P/D: the interleave
-        # size is pinned to block_size by each worker.
-        nixl_pd_active = (
-            self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
-        )
-        if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
+        if self.parallel_config.decode_context_parallel_size > 1:
             assert (
                 self.parallel_config.cp_kv_cache_interleave_size <= block_size
                 and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0

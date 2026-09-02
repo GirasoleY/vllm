@@ -486,9 +486,28 @@ class NixlBaseConnectorWorker:
         # DCP support is scoped to MLA, with dcp_size in (1, tp_size): either fully
         # replicated or fully sharded. A DCP rank is always derivable this way.
         self.dcp_rank = self.tp_rank % self.dcp_size
-        if self._has_mamba and self.dcp_size > 1:
-            # Prefix-cache-aware DCP slicing isn't implemented for the Mamba group.
-            raise ValueError("DCP is not supported for hybrid MLA+Mamba models.")
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        # DCP interleaves attention blocks, while align-mode Mamba state is
+        # replicated at block-table level and sharded across TP ranks by state
+        # dimension during transfer. Other hybrid layouts would need their own
+        # group-specific mapping.
+        if (
+            self._has_mamba
+            and self.dcp_size > 1
+            and (
+                mamba_spec.mamba_cache_mode != "align"
+                or any(
+                    not isinstance(spec, (FullAttentionSpec, MambaSpec))
+                    for spec in self._layer_specs.values()
+                )
+            )
+        ):
+            raise ValueError(
+                "DCP with hybrid MLA+Mamba only supports FullAttention "
+                "plus align-mode Mamba cache groups."
+            )
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
@@ -922,6 +941,9 @@ class NixlBaseConnectorWorker:
                     metadata.physical_blocks_per_logical_kv_block
                 ),
                 remote_dcp_size=remote_dcp_size,
+                remote_cp_kv_cache_interleave_size=(
+                    metadata.cp_kv_cache_interleave_size
+                ),
             ),
         )
         return self.nixl_wrapper.add_remote_agent(metadata.agent_metadata)
@@ -1140,6 +1162,7 @@ class NixlBaseConnectorWorker:
             else self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
             dcp_size=self.dcp_size,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             # SSM States come in tuples (ssm, conv)
             tensor_shape=next(iter(kv_caches.values())).shape
             if not self._has_mamba
@@ -1481,6 +1504,7 @@ class NixlBaseConnectorWorker:
             ),
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1830,6 +1854,9 @@ class NixlBaseConnectorWorker:
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
             remote_dcp_size=remote_dcp_size,
+            remote_cp_kv_cache_interleave_size=(
+                nixl_agent_meta.cp_kv_cache_interleave_size
+            ),
         )
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
@@ -1951,6 +1978,50 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
+    def _validate_dcp_interleave_compatibility(
+        self,
+        *,
+        remote_dcp_size: int,
+        remote_interleave: int,
+        remote_block_size: int,
+        remote_physical_per_logical: int,
+        remote_engine_id: str,
+    ) -> None:
+        """Validate whether rank-local pages can be copied without reshuffling."""
+        if self.dcp_size == remote_dcp_size and self.dcp_size > 1:
+            if self.cp_kv_cache_interleave_size != remote_interleave:
+                raise RuntimeError(
+                    "Equal-DCP KV transfer requires identical token interleave "
+                    f"sizes, got local={self.cp_kv_cache_interleave_size}, "
+                    f"remote={remote_interleave} (engine {remote_engine_id})."
+                )
+        elif self.dcp_size != remote_dcp_size:
+            # A raw NIXL page copy cannot transpose cyclic token ownership.
+            # Asymmetric DCP therefore remains supported only when every
+            # sharded side owns one complete rank-local logical page at a time.
+            local_logical_block_size = (
+                self.block_size * self._physical_blocks_per_logical_kv_block
+            )
+            remote_logical_block_size = remote_block_size * remote_physical_per_logical
+            invalid_local = (
+                self.dcp_size > 1
+                and self.cp_kv_cache_interleave_size != local_logical_block_size
+            )
+            invalid_remote = (
+                remote_dcp_size > 1 and remote_interleave != remote_logical_block_size
+            )
+            if invalid_local or invalid_remote:
+                raise RuntimeError(
+                    "Asymmetric-DCP KV transfer requires whole-page interleave "
+                    "on each sharded side; token-interleaved cache pages need "
+                    "equal DCP sizes. Got "
+                    f"local DCP/interleave/page={self.dcp_size}/"
+                    f"{self.cp_kv_cache_interleave_size}/"
+                    f"{local_logical_block_size}, remote={remote_dcp_size}/"
+                    f"{remote_interleave}/{remote_logical_block_size} "
+                    f"(engine {remote_engine_id})."
+                )
+
     def _validate_remote_agent_handshake(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -1967,6 +2038,10 @@ class NixlBaseConnectorWorker:
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
         assert remote_info.remote_dcp_size == remote_dcp_size
+        assert (
+            remote_info.remote_cp_kv_cache_interleave_size
+            == nixl_agent_meta.cp_kv_cache_interleave_size
+        )
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (
@@ -1974,6 +2049,15 @@ class NixlBaseConnectorWorker:
         ), (
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
+        )
+        self._validate_dcp_interleave_compatibility(
+            remote_dcp_size=remote_dcp_size,
+            remote_interleave=nixl_agent_meta.cp_kv_cache_interleave_size,
+            remote_block_size=nixl_agent_meta.block_size,
+            remote_physical_per_logical=(
+                nixl_agent_meta.physical_blocks_per_logical_kv_block
+            ),
+            remote_engine_id=remote_engine_id,
         )
 
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
@@ -1996,6 +2080,15 @@ class NixlBaseConnectorWorker:
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
             and self.vllm_config.cache_config.enable_prefix_caching
+            and not (
+                self.use_mla
+                and (self.dcp_size > 1 or remote_dcp_size > 1)
+                and self.vllm_config.cache_config.mamba_cache_mode == "align"
+                and all(
+                    issubclass(spec_type, (FullAttentionSpec, MambaSpec))
+                    for spec_type in self._group_spec_types
+                )
+            )
         ):
             raise RuntimeError(
                 "Prefix caching with heterogeneous physical_blocks_per_logical "
@@ -2378,16 +2471,21 @@ class NixlBaseConnectorWorker:
                 remote_info.remote_physical_blocks_per_logical
                 != self._physical_blocks_per_logical_kv_block
             )
+            dcp_active = self.dcp_size > 1 or remote_info.remote_dcp_size > 1
             if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
                         continue
                     # Number of remote-sized sub-blocks the transfer covered;
                     # everything past this was clipped and must be zeroed.
-                    covered_sub_blocks = min(
-                        len(local_group) * block_size_ratio,
-                        len(meta.remote.block_ids[g]),
-                    )
+                    if dcp_active:
+                        assert meta.dcp_local_attention_blocks_covered
+                        covered_sub_blocks = meta.dcp_local_attention_blocks_covered[g]
+                    else:
+                        covered_sub_blocks = min(
+                            len(local_group) * block_size_ratio,
+                            len(meta.remote.block_ids[g]),
+                        )
                     block_ids_for_blocksize_post_process[block_size_ratio].append(
                         (local_group, covered_sub_blocks)
                     )
@@ -2668,7 +2766,7 @@ class NixlBaseConnectorWorker:
                 )
         return physical_block_ids
 
-    def _apply_dcp_prefix_caching(
+    def _map_dcp_attention_block_ids(
         self,
         local_ids: list[int],
         remote_ids: list[int],
@@ -2677,46 +2775,75 @@ class NixlBaseConnectorWorker:
         local_dcp_rank: int,
         remote_dcp_size: int,
         local_num_computed_blocks: int,
+        local_physical_per_logical: int,
+        remote_physical_per_logical: int,
     ) -> tuple[list[int], list[int]]:
-        """Match local and remote block IDs by global DCP position.
+        """Map DCP-sharded MLA pages at physical KV-block granularity.
 
-        ``local_ids`` excludes blocks already satisfied by the local prefix
-        cache, while ``remote_ids`` contains the full transferable remote list.
+        Scheduler block IDs describe global token pages. Each rank compacts its
+        owned token stream into a contiguous rank-local page. For equal DCP
+        sizes this is true for token interleave as well as block interleave: the
+        same rank owns the same global positions on both sides. For asymmetric
+        DCP this mapper is used only after the handshake has required whole-page
+        interleave on every sharded side.
 
-        Example:
-            local DCP size 2, rank 0 owns *global positions*=[0, 2, 4, 6]
-            cached_blocks=[0,2,4]
-            to transfer: [6] (the rest is cached)
+        Hybrid memory allocation can make a rank-local page span multiple
+        physical KV blocks, and that span can differ across P and D (Kimi-K3
+        TP8/DCP8 -> TP1 uses 48 -> 384). Matching whole logical IDs would
+        therefore omit seven eighths of a K3 page.
 
-            remote DCP size 4
-            remote rank 0 owns [0, 4] -> no more match, skip the read
-            remote rank 2 owns [2, 6] -> match position 6 and read
-
-        An empty result (rank 0 above) takes the notification-only path, allowing the
-        remote to release its blocks without performing a transfer.
+        Convert each side's page slice to global physical-block positions and
+        pair the intersections. ``local_ids`` has already dropped prefix-cached
+        pages, so its first page has ordinal ``local_num_computed_blocks``.
         """
-        local_size, remote_size = local_dcp_size, remote_dcp_size
+        assert local_dcp_size > 0 and remote_dcp_size > 0
+        assert local_physical_per_logical > 0
+        assert remote_physical_per_logical > 0
 
-        if local_size == remote_size:
-            local_slice = local_ids
-            remote_slice = remote_ids[local_num_computed_blocks:]
-        elif local_size < remote_size:
-            k = remote_size // local_size
-            p = (remote_rank - local_dcp_rank) // local_size
-            start_local = (p - local_num_computed_blocks) % k
-            start_remote = (local_num_computed_blocks + start_local - p) // k
-            local_slice = local_ids[start_local::k]
-            remote_slice = remote_ids[start_remote:]
-        else:
-            k = local_size // remote_size
-            remote_dcp_rank = remote_rank % remote_size
-            c = (local_dcp_rank - remote_dcp_rank) // remote_size
-            start_remote = c + local_num_computed_blocks * k
-            local_slice = local_ids
-            remote_slice = remote_ids[start_remote::k]
+        local_page_span = local_physical_per_logical * local_dcp_size
+        remote_page_span = remote_physical_per_logical * remote_dcp_size
+        remote_dcp_rank = remote_rank % remote_dcp_size
 
-        matched_blocks = min(len(local_slice), len(remote_slice))
-        return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+        mapped_local: list[int] = []
+        mapped_remote: list[int] = []
+        local_idx = remote_idx = 0
+        while local_idx < len(local_ids) and remote_idx < len(remote_ids):
+            local_start = (
+                local_num_computed_blocks + local_idx
+            ) * local_page_span + local_dcp_rank * local_physical_per_logical
+            local_end = local_start + local_physical_per_logical
+            remote_start = (
+                remote_idx * remote_page_span
+                + remote_dcp_rank * remote_physical_per_logical
+            )
+            remote_end = remote_start + remote_physical_per_logical
+
+            overlap_start = max(local_start, remote_start)
+            overlap_end = min(local_end, remote_end)
+            if overlap_start < overlap_end:
+                count = overlap_end - overlap_start
+                local_block_start = (
+                    local_ids[local_idx] * local_physical_per_logical
+                    + overlap_start
+                    - local_start
+                )
+                remote_block_start = (
+                    remote_ids[remote_idx] * remote_physical_per_logical
+                    + overlap_start
+                    - remote_start
+                )
+                mapped_local.extend(range(local_block_start, local_block_start + count))
+                mapped_remote.extend(
+                    range(remote_block_start, remote_block_start + count)
+                )
+
+            if local_end <= remote_end:
+                local_idx += 1
+            if remote_end <= local_end:
+                remote_idx += 1
+
+        assert len(mapped_local) == len(mapped_remote)
+        return mapped_local, mapped_remote
 
     def _apply_prefix_caching(
         self,

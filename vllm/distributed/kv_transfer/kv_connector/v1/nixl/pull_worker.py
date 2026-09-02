@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
+    _is_attention_spec,
 )
 from vllm.logger import init_logger
 
@@ -163,6 +164,25 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         )
         num_groups = len(meta.local_block_ids)
         dcp_active = self.dcp_size > 1 or remote_info.remote_dcp_size > 1
+        if dcp_active and self.block_size != remote_info.remote_block_size:
+            raise ValueError(
+                "DCP KV transfer requires equal local and remote kernel block "
+                f"sizes, got {self.block_size} and {remote_info.remote_block_size}."
+            )
+        if (
+            dcp_active
+            and self._physical_blocks_per_logical_kv_block
+            != remote_info.remote_physical_blocks_per_logical
+            and any(
+                count > 0 and _is_attention_spec(self._group_spec_types[g])
+                for g, count in enumerate(meta.local_num_computed_blocks)
+            )
+        ):
+            raise ValueError(
+                "DCP KV transfer with heterogeneous logical-page geometry does "
+                "not yet support decoder-side prefix-cache hits. Disable prefix "
+                "caching on the KV consumer."
+            )
 
         def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
             return [
@@ -171,33 +191,51 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             ]
 
         read_specs = []
+        dcp_attention_blocks_by_group = [list[int]() for _ in range(num_groups)]
         for rank in plan.all_source_ranks:
             if dcp_active:
-                # DCP interleaves at block granularity, so slicing happens
-                # here on logical blocks, before kernel-block expansion.
+                # DCP ownership is resolved at kernel-block granularity. HMA
+                # can make one logical page span a different number of local
+                # and remote blocks even when both pages cover the same tokens.
                 local_ids = group_ids(meta.local_block_ids, rank)
                 remote_ids = group_ids(remote_logical_block_ids, rank)
-                for g in range(num_groups):
-                    if not local_ids[g]:
-                        continue
-                    # Prefix cache hit may lead to skip some of the remote reads
-                    # TODO (NickLucche) consider unifying prefix cache handling on
-                    # logical blocks here for both dcp and non-dcp
-                    local_ids[g], remote_ids[g] = self._apply_dcp_prefix_caching(
-                        local_ids[g],
-                        remote_ids[g],
-                        remote_rank=rank,
-                        local_dcp_size=self.dcp_size,
-                        local_dcp_rank=self.dcp_rank,
-                        remote_dcp_size=remote_info.remote_dcp_size,
-                        local_num_computed_blocks=meta.local_num_computed_blocks[g],
+                local_physical_ids = [
+                    list(group)
+                    for group in self._logical_to_kernel_block_ids(
+                        local_ids, self._physical_blocks_per_logical_kv_block
                     )
-                local_physical_ids = self._logical_to_kernel_block_ids(
-                    local_ids, self._physical_blocks_per_logical_kv_block
-                )
-                remote_physical_ids = self._logical_to_kernel_block_ids(
-                    remote_ids, remote_info.remote_physical_blocks_per_logical
-                )
+                ]
+                remote_physical_ids = [
+                    list(group)
+                    for group in self._logical_to_kernel_block_ids(
+                        remote_ids, remote_info.remote_physical_blocks_per_logical
+                    )
+                ]
+                for g in range(num_groups):
+                    if not _is_attention_spec(self._group_spec_types[g]):
+                        continue
+                    if not local_ids[g]:
+                        local_physical_ids[g] = []
+                        remote_physical_ids[g] = []
+                        continue
+                    local_physical_ids[g], remote_physical_ids[g] = (
+                        self._map_dcp_attention_block_ids(
+                            local_ids[g],
+                            remote_ids[g],
+                            remote_rank=rank,
+                            local_dcp_size=self.dcp_size,
+                            local_dcp_rank=self.dcp_rank,
+                            remote_dcp_size=remote_info.remote_dcp_size,
+                            local_num_computed_blocks=meta.local_num_computed_blocks[g],
+                            local_physical_per_logical=(
+                                self._physical_blocks_per_logical_kv_block
+                            ),
+                            remote_physical_per_logical=(
+                                remote_info.remote_physical_blocks_per_logical
+                            ),
+                        )
+                    )
+                    dcp_attention_blocks_by_group[g].extend(local_physical_ids[g])
             else:
                 # No DCP realignment needed: reuse the already-expanded full
                 # physical lists instead of re-deriving them from logical ids.
@@ -210,6 +248,24 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_block_ids=remote_physical_ids,
                 )
             )
+
+        if dcp_active:
+            covered_counts = [0] * num_groups
+            for g, covered_blocks in enumerate(dcp_attention_blocks_by_group):
+                if not _is_attention_spec(self._group_spec_types[g]):
+                    continue
+                unique_covered = set(covered_blocks)
+                assert len(unique_covered) == len(covered_blocks), (
+                    f"DCP source reads overlap for KV cache group {g}."
+                )
+                local_group = list(meta.local_physical_block_ids[g])
+                num_covered = len(covered_blocks)
+                assert unique_covered == set(local_group[:num_covered]), (
+                    f"DCP source reads do not cover a contiguous destination "
+                    f"prefix for KV cache group {g}."
+                )
+                covered_counts[g] = num_covered
+            meta.dcp_local_attention_blocks_covered = tuple(covered_counts)
 
         # D may have to perform multiple reads from different remote ranks.
         # Pure MLA reads once because its cache is replicated. Hybrid
@@ -229,7 +285,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 req_id,
             )
             # Get side handles.
-            if tp_ratio < 0 and (not self.use_mla or len(read_specs) > 1):
+            if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
                 split_key = (tp_ratio, remote_block_size)
@@ -335,19 +391,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             == len(local_block_ids)
             == len(self.kv_cache_config.transfer_groups)
         )
-        if not (self.dcp_size > 1 or remote_info.remote_dcp_size > 1):
-            # DCP-active reads were already trimmed (and DCP-realigned, when
-            # sizes mismatch) in _read_blocks_for_req, at logical granularity.
-            local_block_ids, remote_block_ids = self._apply_prefix_caching(
-                decode_block_ids=local_block_ids,
-                prefill_block_ids=remote_block_ids,
-                decode_physical_per_logical=(
-                    self._physical_blocks_per_logical_kv_block
-                ),
-                prefill_physical_per_logical=(
-                    remote_info.remote_physical_blocks_per_logical
-                ),
-            )
+        # DCP attention groups were already trimmed and realigned at physical
+        # kernel-block granularity in _read_blocks_for_req, making this a no-op.
+        # Hybrid Mamba groups are deliberately not DCP-sliced and still need
+        # their replicated state/placeholder lists aligned here.
+        remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
+        local_block_ids, remote_block_ids = self._apply_prefix_caching(
+            decode_block_ids=local_block_ids,
+            prefill_block_ids=remote_block_ids,
+            decode_physical_per_logical=self._physical_blocks_per_logical_kv_block,
+            prefill_physical_per_logical=remote_physical_per_logical,
+        )
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp

@@ -45,9 +45,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   7: Include NIXL transfer mode (push vs pull) in the compatibility hash
 #   8: Add dcp_size and pcp_size to NixlAgentMetadata
 #   9: Add block_strides
-#  10: Add dense virtual transfer pages for compressed MLA caches
+#   10: Add dense virtual transfer pages for compressed MLA caches
+#   11: Add cp_kv_cache_interleave_size for DCP layout compatibility
 #
-NIXL_CONNECTOR_VERSION: int = 10
+NIXL_CONNECTOR_VERSION: int = 11
 
 
 @dataclass
@@ -66,6 +67,7 @@ class NixlAgentMetadata:
     physical_blocks_per_logical_kv_block: int
     dcp_size: int = 1
     pcp_size: int = 1
+    cp_kv_cache_interleave_size: int = 1
 
 
 @dataclass
@@ -236,6 +238,9 @@ class ReqMeta:
     # the remote's; kept per-group since hybrid models (e.g. SWA+FA) can have
     # different cache-hit counts per group.
     local_num_computed_blocks: tuple[int, ...] = ()
+    # Number of destination attention kernel blocks covered by the union of
+    # all DCP source-rank reads, per KV cache group. Empty when DCP is inactive.
+    dcp_local_attention_blocks_covered: tuple[int, ...] = ()
     remote: RemoteMeta | None = None
     # Remote block size, discovered during NIXL handshake (push mode).
     remote_block_size: int | None = None
