@@ -24,6 +24,30 @@ from vllm.v1.worker.gpu.spec_decode.execution import (
 )
 
 
+@pytest.mark.parametrize("is_kv_producer", [False, True])
+def test_proposal_extends_completion_event_for_kv_producer(is_kv_producer: bool):
+    calls = []
+    main_stream = object()
+    copy_stream = SimpleNamespace(
+        wait_stream=lambda stream: calls.append(("wait", stream))
+    )
+    copy_event = SimpleNamespace(record=lambda stream: calls.append(("record", stream)))
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(is_kv_producer=is_kv_producer)
+    )
+    runner.main_stream = main_stream
+    runner.output_copy_stream = copy_stream
+
+    runner._record_kv_producer_completion(
+        SimpleNamespace(copy_event=copy_event)  # type: ignore[arg-type]
+    )
+
+    assert calls == (
+        [("wait", main_stream), ("record", copy_stream)] if is_kv_producer else []
+    )
+
+
 @pytest.mark.parametrize(
     ("attention_source", "reuses_target_dp_sync"),
     [

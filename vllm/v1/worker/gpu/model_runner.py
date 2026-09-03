@@ -2032,6 +2032,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+            self._record_kv_producer_completion(async_output)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -2047,6 +2048,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.ec_connector_output = ec_connector_output
 
         return async_output
+
+    def _record_kv_producer_completion(self, async_output: AsyncOutput) -> None:
+        kv_config = self.vllm_config.kv_transfer_config
+        if kv_config is None or not kv_config.is_kv_producer:
+            return
+        # Proposal can write cache entries needed by a downstream KV consumer.
+        # Extend the completion event past that work rather than publishing
+        # completion after the sampling copy alone.
+        self.output_copy_stream.wait_stream(self.main_stream)
+        async_output.copy_event.record(self.output_copy_stream)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
