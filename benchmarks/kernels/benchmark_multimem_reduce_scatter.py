@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark production TP8 reduce-scatter backends on one SM100/SM103 node.
+"""Benchmark production TP8 reduce-scatter backends in an SM100/SM103 domain.
 
 The multimem candidate includes the device-to-device copy into its persistent
 symmetric input buffer. Timings use pointer-distinct CUDA graphs and report the
@@ -336,6 +336,22 @@ def benchmark_size(
         device_group,
     )
     graphs, graph_keepalive = capture_candidates(candidates, cpu_group)
+    replay_candidates = [
+        Candidate(
+            candidate.name,
+            [graphs[candidate.name][0].replay],
+            [candidate.outputs[0]],
+        )
+        for candidate in candidates
+    ]
+    check_correctness(
+        replay_candidates,
+        inputs[0],
+        rank,
+        world_size,
+        cpu_group,
+        device_group,
+    )
 
     flush = None
     if args.cold_l2:
