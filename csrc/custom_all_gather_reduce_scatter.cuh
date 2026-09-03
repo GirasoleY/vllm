@@ -11,6 +11,8 @@ constexpr int kMnnvlMultimemRsThreads = 1024;
 constexpr int kMnnvlMultimemRsBlockLimit = 8;
 constexpr int kMnnvlMultimemRsVectorBytes = 16;
 constexpr int kMnnvlMultimemRsUnroll = 8;
+static_assert(alignof(Signal) == 128);
+static_assert(sizeof(Signal) % alignof(Signal) == 0);
 
 using CopyPack = array_t<uint64_t, 2>;
 
@@ -54,7 +56,7 @@ __global__ void __launch_bounds__(512, 1)
 
 template <typename T>
 DINLINE void multimem_load_reduce_16(uint32_t (&result)[4], const T* address) {
-#if !defined(USE_ROCM) && CUDA_VERSION >= 12010 && defined(__CUDA_ARCH__) && \
+#if !defined(USE_ROCM) && CUDA_VERSION >= 12020 && defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 900)
   if constexpr (std::is_same<T, nv_bfloat16>::value) {
     asm volatile(
@@ -100,18 +102,55 @@ DINLINE void store_global_16(void* address, const uint32_t (&value)[4]) {
 #endif
 }
 
+DINLINE Signal* mnnvl_multimem_signal(const RankData* peer_buffers,
+                                      uint64_t signal_offset, int peer) {
+  return reinterpret_cast<Signal*>(
+      reinterpret_cast<uintptr_t>(peer_buffers->ptrs[peer]) + signal_offset);
+}
+
+template <bool at_start, int ngpus>
+DINLINE void mnnvl_multimem_peer_barrier(const RankData* peer_buffers,
+                                         uint64_t signal_offset, int rank) {
+  auto* self_signal = mnnvl_multimem_signal(peer_buffers, signal_offset, rank);
+
+  // For the ending barrier, make every result store in this CTA visible before
+  // a thread publishes completion. The same synchronization is harmless at the
+  // start and keeps all threads from racing the generation update.
+  __syncthreads();
+  FlagType flag = self_signal->_flag[blockIdx.x] + 1;
+  if (threadIdx.x < ngpus) {
+    auto* peer_signal =
+        mnnvl_multimem_signal(peer_buffers, signal_offset, threadIdx.x);
+    auto* peer_counter = at_start ? &peer_signal->start[blockIdx.x][rank]
+                                  : &peer_signal->end[blockIdx.x][rank];
+    auto* self_counter = at_start ? &self_signal->start[blockIdx.x][threadIdx.x]
+                                  : &self_signal->end[blockIdx.x][threadIdx.x];
+#if !defined(USE_ROCM)
+    // Symmetric-memory peer mappings can span MNNVL nodes, so both sides of
+    // the doorbell handshake must use system-scope ordering.
+    st_flag_release(peer_counter, flag);
+    while (ld_flag_acquire(self_counter) != flag);
+#else
+    __builtin_trap();
+#endif
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) self_signal->_flag[blockIdx.x] = flag;
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMnnvlMultimemRsThreads, 1)
     mnnvl_multimem_reduce_scatter_kernel(const T* __restrict__ multicast_input,
-                                         T* __restrict__ result, RankSignals sg,
-                                         Signal* self_sg, int rank,
+                                         T* __restrict__ result,
+                                         RankData* peer_buffers,
+                                         uint64_t signal_offset, int rank,
                                          int packs_per_rank) {
   constexpr int kThreadsPerWarp = 32;
   constexpr int kWarpsPerCta = kMnnvlMultimemRsThreads / kThreadsPerWarp;
   constexpr int kPacksPerWarpIteration =
       kThreadsPerWarp * kMnnvlMultimemRsUnroll;
 
-  barrier_at_start_release<ngpus>(sg, self_sg, rank);
+  mnnvl_multimem_peer_barrier<true, ngpus>(peer_buffers, signal_offset, rank);
 
   int lane;
 #if !defined(USE_ROCM)
@@ -149,7 +188,7 @@ __global__ void __launch_bounds__(kMnnvlMultimemRsThreads, 1)
     pack_offset += pack_stride;
   }
 
-  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+  mnnvl_multimem_peer_barrier<false, ngpus>(peer_buffers, signal_offset, rank);
 }
 
 template <typename P>

@@ -82,6 +82,7 @@ class CustomAllreduce {
  public:
   int rank_;
   int world_size_;
+  int device_index_;
   // Full NVLink or xGMI connection between GPUs.
   bool fully_connected_;
 
@@ -123,9 +124,11 @@ class CustomAllreduce {
    * are passed in from the constructor.
    */
   CustomAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz,
-                  int rank, int world_size, bool fully_connected = true)
+                  int rank, int world_size, int device_index,
+                  bool fully_connected = true)
       : rank_(rank),
         world_size_(world_size),
+        device_index_(device_index),
         fully_connected_(fully_connected),
         self_sg_(signals[rank]),
         d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
@@ -342,6 +345,7 @@ class CustomAllreduce {
   template <typename T>
   void mnnvl_multimem_reduce_scatter(cudaStream_t stream,
                                      const T* multicast_input, T* output,
+                                     void* local_buffer, uint64_t signal_offset,
                                      int size, int block_limit);
 
   ~CustomAllreduce() {
