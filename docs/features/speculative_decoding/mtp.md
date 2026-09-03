@@ -67,12 +67,12 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
-## PCP replicated execution
+## PCP execution policy
 
-For a PCP target, the standard MTP implementation defaults its draft PCP size
-to `1` and runs replicated over the global batch on every PCP rank. Specialized
-Gemma 4 and multi-module MTP implementations do not yet support this path. You
-can request the standard MTP policy explicitly:
+For a PCP target, single-module MTP inherits the target PCP size by default and
+runs its initial draft phase on the target's rank-local token layout. The draft
+result is restored to global request order before subsequent draft steps and
+sampling. You can select the replicated alternative explicitly:
 
 ```bash
 vllm serve <mtp-model> \
@@ -85,8 +85,9 @@ vllm serve <mtp-model> \
     }'
 ```
 
-Setting the draft PCP size to the target PCP size is not yet supported. This
-path requires Model Runner V2 and has the limitations listed in the
+Use `"prefill_context_parallel_size": 2` (or omit it for single-module MTP)
+to select sharded drafting in this example. These PCP paths require Model
+Runner V2 and currently have the limitations listed in the
 [draft parallelism policy](README.md#draft-parallelism-policy).
 
 ## Notes

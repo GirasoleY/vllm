@@ -6,10 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-import vllm.v1.worker.gpu.pcp_manager as pcp_module
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, PCPTokenLayoutView
 
 
 def _copy_to_cpu(value, out=None, device=None):
@@ -159,26 +158,171 @@ def test_partition_reuses_gpu_cursor_for_replicated_spec_decode():
     assert local_batch.num_computed_tokens_np.tolist() == [20]
 
 
-def test_restore_hidden_states_appends_zero_graph_padding(monkeypatch):
-    manager = PCPManager(
-        pcp_world_size=4,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-    )
-    manager._global_batch = SimpleNamespace(
+def test_restore_hidden_states_appends_zero_graph_padding():
+    global_batch = SimpleNamespace(
         num_tokens=5,
         num_tokens_after_padding=8,
     )
+    model_batch = SimpleNamespace(num_tokens_after_padding=2)
     restored = torch.arange(10, dtype=torch.float32).reshape(5, 2)
-    manager._hidden_restore_idx = torch.arange(5)
-    monkeypatch.setattr(
-        pcp_module,
-        "get_pcp_group",
-        lambda: SimpleNamespace(all_gather=lambda *_args, **_kwargs: restored),
+    layout = PCPTokenLayoutView(
+        global_batch=global_batch,
+        model_batch=model_batch,
+        local_gather_idx=torch.arange(2),
+        hidden_restore_idx=torch.arange(5),
+        group=SimpleNamespace(all_gather=lambda *_args, **_kwargs: restored),
     )
 
-    actual = manager.restore_hidden_states(torch.empty(0))
+    actual = layout.restore_token_rows(torch.empty(2, 2))
 
     assert actual.shape == (8, 2)
     torch.testing.assert_close(actual[:5], restored)
     torch.testing.assert_close(actual[5:], torch.zeros(3, 2))
+
+
+def test_token_layout_localizes_rows_into_caller_owned_buffer():
+    global_batch = SimpleNamespace(num_tokens=4, num_tokens_after_padding=4)
+    model_batch = SimpleNamespace(
+        num_tokens_after_padding=2,
+        is_padding=torch.zeros(2, dtype=torch.bool),
+    )
+    layout = PCPTokenLayoutView(
+        global_batch=global_batch,
+        model_batch=model_batch,
+        local_gather_idx=torch.tensor([2, 0]),
+        hidden_restore_idx=torch.arange(4),
+        group=SimpleNamespace(),
+    )
+    source = torch.tensor([[10], [11], [12], [13]])
+    out = torch.full((4, 1), -1)
+
+    actual = layout.localize_token_rows(source, out=out)
+
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, torch.tensor([[12], [10]]))
+    torch.testing.assert_close(out[2:], torch.full((2, 1), -1))
+
+
+def test_token_layout_rejects_use_after_new_partition_generation():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    layout = PCPTokenLayoutView(
+        global_batch=SimpleNamespace(num_tokens=2, num_tokens_after_padding=2),
+        model_batch=SimpleNamespace(num_tokens_after_padding=1),
+        local_gather_idx=torch.tensor([0]),
+        hidden_restore_idx=torch.arange(2),
+        group=SimpleNamespace(all_gather=lambda source, **_: source),
+        generation=manager.layout_generation,
+        owner=manager,
+    )
+    manager._layout_generation += 1
+
+    with pytest.raises(RuntimeError, match="token layout is stale"):
+        layout.localize_token_rows(torch.ones(2, 1), out=torch.empty(1, 1))
+    with pytest.raises(RuntimeError, match="token layout is stale"):
+        layout.restore_token_rows(torch.ones(1, 1))
+
+
+def test_token_layout_for_requires_exact_current_model_batch():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    model_batch = SimpleNamespace(num_tokens_after_padding=1)
+    layout = PCPTokenLayoutView(
+        global_batch=SimpleNamespace(num_tokens=1, num_tokens_after_padding=1),
+        model_batch=model_batch,
+        local_gather_idx=torch.tensor([0]),
+        hidden_restore_idx=torch.tensor([0]),
+        group=SimpleNamespace(),
+    )
+    manager._current_token_layout = layout
+
+    assert manager.token_layout_for(model_batch) is layout
+    assert manager.token_layout_for(SimpleNamespace()) is None
+
+
+def test_nonpartitioned_pcp_restore_helper_is_identity():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    batch = SimpleNamespace()
+    hidden_states = torch.ones(2, 3)
+
+    actual_hidden_states, actual_batch = (
+        pcp_manager_module.maybe_restore_pcp_for_sampling(manager, hidden_states, batch)
+    )
+
+    assert actual_hidden_states is hidden_states
+    assert actual_batch is batch
+
+
+def test_mixed_prefill_decode_layout_round_trip_with_graph_padding(monkeypatch):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
+
+    # Five prefill rows are sharded while the two decode/rejection rows are
+    # duplicated on both PCP ranks. Rank-local graph batches are padded to 5.
+    manager._build_batch_layout(
+        num_scheduled_tokens=np.array([5, 2], dtype=np.int32),
+        num_computed_tokens=np.array([0, 20], dtype=np.int32),
+        is_prefilling=np.array([True, False]),
+        query_start_loc_np=np.array([0, 5, 7], dtype=np.int32),
+        padded_num_tokens=5,
+    )
+    assert manager._padded_gather_idx is not None
+    assert manager._hidden_restore_idx is not None
+    torch.testing.assert_close(
+        manager._padded_gather_idx,
+        torch.tensor([5, 6, 0, 1, 0, 2, 3, 4, 5, 6]),
+    )
+
+    global_batch = SimpleNamespace(num_tokens=7, num_tokens_after_padding=8)
+    model_batch = SimpleNamespace(
+        num_tokens_after_padding=5,
+        is_padding=torch.tensor([False, False, False, False, True]),
+    )
+
+    def round_trip(source: torch.Tensor) -> torch.Tensor:
+        local_rows = []
+        for rank in range(2):
+            rank_indices = manager._padded_gather_idx[rank * 5 : (rank + 1) * 5]
+            rows = source[rank_indices].clone()
+            if rank == 0:
+                rows[-1].zero_()
+            local_rows.append(rows)
+        layout = PCPTokenLayoutView(
+            global_batch=global_batch,
+            model_batch=model_batch,
+            local_gather_idx=manager._padded_gather_idx[:5],
+            hidden_restore_idx=manager._hidden_restore_idx,
+            group=SimpleNamespace(
+                all_gather=lambda *_args, **_kwargs: torch.cat(local_rows)
+            ),
+        )
+        localized = layout.localize_token_rows(
+            source,
+            out=torch.empty((5, *source.shape[1:]), dtype=source.dtype),
+        )
+        torch.testing.assert_close(localized, local_rows[0])
+        return layout.restore_token_rows(localized)
+
+    hidden = torch.arange(14, dtype=torch.float32).reshape(7, 2)
+    auxiliary = torch.arange(21, dtype=torch.float32).reshape(7, 3)
+    restored_hidden = round_trip(hidden)
+    restored_auxiliary = round_trip(auxiliary)
+
+    torch.testing.assert_close(restored_hidden[:7], hidden)
+    torch.testing.assert_close(restored_auxiliary[:7], auxiliary)
+    torch.testing.assert_close(restored_hidden[7], torch.zeros(2))
+    torch.testing.assert_close(restored_auxiliary[7], torch.zeros(3))

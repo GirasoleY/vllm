@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -21,6 +22,9 @@ from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
 
 @dataclass(frozen=True)
 class RankSegment:
@@ -31,6 +35,68 @@ class RankSegment:
     @property
     def num_tokens(self) -> int:
         return self.global_batch_slice.stop - self.global_batch_slice.start
+
+
+@dataclass(frozen=True)
+class PCPTokenLayoutView:
+    """Token-row transform bound to one execute/sample step.
+
+    The referenced input buffers remain valid until the next partition, so the
+    runner stores this view directly in that step's ``ExecuteModelState``.
+    """
+
+    global_batch: InputBatch
+    model_batch: InputBatch
+    local_gather_idx: torch.Tensor
+    hidden_restore_idx: torch.Tensor
+    group: "GroupCoordinator"
+    generation: int = 0
+    owner: "PCPManager | None" = None
+
+    def _ensure_current(self) -> None:
+        if self.owner is not None and self.owner.layout_generation != self.generation:
+            raise RuntimeError(
+                "PCP token layout is stale; it cannot be used after the next "
+                "batch partition."
+            )
+
+    def localize_token_rows(
+        self, source: torch.Tensor, *, out: torch.Tensor
+    ) -> torch.Tensor:
+        self._ensure_current()
+        num_local_tokens = self.local_gather_idx.shape[0]
+        torch.index_select(
+            source,
+            0,
+            self.local_gather_idx,
+            out=out[:num_local_tokens],
+        )
+        localized = out[:num_local_tokens]
+        is_padding = self.model_batch.is_padding[:num_local_tokens]
+        padding_shape = (num_local_tokens,) + (1,) * (localized.ndim - 1)
+        localized.masked_fill_(is_padding.view(padding_shape), 0)
+        return localized
+
+    def restore_token_rows(self, source: torch.Tensor) -> torch.Tensor:
+        self._ensure_current()
+        num_local_tokens = self.model_batch.num_tokens_after_padding
+        if source.shape[0] < num_local_tokens:
+            raise ValueError(
+                "PCP-local tensor has fewer rows than its model batch: "
+                f"{source.shape[0]} < {num_local_tokens}."
+            )
+        gathered = self.group.all_gather(source[:num_local_tokens], dim=0)
+        restored = gathered[self.hidden_restore_idx]
+        num_global_tokens = self.global_batch.num_tokens
+        num_global_tokens_padded = self.global_batch.num_tokens_after_padding
+        assert restored.shape[0] == num_global_tokens
+        if num_global_tokens == num_global_tokens_padded:
+            return restored
+
+        padded_shape = (num_global_tokens_padded, *restored.shape[1:])
+        padded = restored.new_zeros(padded_shape)
+        padded[:num_global_tokens].copy_(restored)
+        return padded
 
 
 class PCPManager:
@@ -63,11 +129,12 @@ class PCPManager:
         self.cp_interleave = cp_interleave
 
         self._global_batch: InputBatch | None = None
-        self._local_batch: InputBatch | None = None
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
+        self._current_token_layout: PCPTokenLayoutView | None = None
+        self._layout_generation = 0
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
@@ -362,11 +429,19 @@ class PCPManager:
         assert self._input_buffers is not None
         return self._input_buffers
 
+    @property
+    def layout_generation(self) -> int:
+        return self._layout_generation
+
     def partition_batch(
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
     ) -> InputBatch:
+        # Invalidate the prior step's borrowed view before mutating any shared
+        # PCP input buffers, even if constructing this partition later fails.
+        self._layout_generation += 1
+        self._current_token_layout = None
         assert self._req_states is not None
         assert self._input_buffers is not None
         input_buffers = self._input_buffers
@@ -590,12 +665,17 @@ class PCPManager:
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
         )
-        self._local_batch = local_batch
+        assert self._hidden_restore_idx is not None
+        self._current_token_layout = PCPTokenLayoutView(
+            global_batch=global_batch,
+            model_batch=local_batch,
+            local_gather_idx=local_gather_idx,
+            hidden_restore_idx=self._hidden_restore_idx,
+            group=get_pcp_group(),
+            generation=self._layout_generation,
+            owner=self,
+        )
         return local_batch
-
-    def is_partitioned_batch(self, input_batch: InputBatch) -> bool:
-        """Whether ``input_batch`` is the current rank-local PCP view."""
-        return input_batch is self._local_batch
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -611,6 +691,13 @@ class PCPManager:
         )
         slot_mappings = self.prepare_slot_mappings()
         return block_tables, slot_mappings
+
+    def token_layout_for(self, input_batch: InputBatch) -> PCPTokenLayoutView | None:
+        """Return this step's layout view, never a stale prior view."""
+        layout = self._current_token_layout
+        if layout is None or layout.model_batch is not input_batch:
+            return None
+        return layout
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         assert self._block_tables is not None
@@ -661,25 +748,10 @@ class PCPManager:
         return gathered_kv_slot_mappings
 
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self._global_batch is not None
-        if self._hidden_restore_idx is None:
+        layout = self._current_token_layout
+        if layout is None:
             return hidden_states
-        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
-        restored = gathered[self._hidden_restore_idx]
-        num_tokens = self._global_batch.num_tokens
-        num_tokens_padded = self._global_batch.num_tokens_after_padding
-        assert restored.shape[0] == num_tokens
-        if num_tokens == num_tokens_padded:
-            return restored
-
-        # PCP restore reconstructs only active global tokens, whereas
-        # PIECEWISE graphs keep the target batch padded to a capture size. The
-        # drafter follows that padded shape contract, so append explicit zero
-        # rows rather than aliasing a real token through an arbitrary index.
-        padded_shape = (num_tokens_padded, *restored.shape[1:])
-        padded = restored.new_zeros(padded_shape)
-        padded[:num_tokens].copy_(restored)
-        return padded
+        return layout.restore_token_rows(hidden_states)
 
     def restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Restore a persistent max-token-sized buffer (e.g. the target's
@@ -694,9 +766,12 @@ class PCPManager:
     def restore_for_sampling(
         self,
         hidden_states: torch.Tensor,
+        input_batch: InputBatch,
     ) -> tuple[torch.Tensor, InputBatch]:
-        assert self._global_batch is not None
-        return self.restore_hidden_states(hidden_states), self._global_batch
+        layout = self.token_layout_for(input_batch)
+        if layout is None:
+            raise RuntimeError("PCP sampling received a stale or unpartitioned batch.")
+        return layout.restore_token_rows(hidden_states), layout.global_batch
 
 
 def maybe_partition_pcp_batch(
@@ -728,9 +803,9 @@ def maybe_restore_pcp_for_sampling(
     input_batch: InputBatch,
 ) -> tuple[torch.Tensor, InputBatch]:
     assert hidden_states is not None
-    if manager is None or not manager.is_partitioned_batch(input_batch):
+    if manager is None or manager.token_layout_for(input_batch) is None:
         return hidden_states, input_batch
-    return manager.restore_for_sampling(hidden_states)
+    return manager.restore_for_sampling(hidden_states, input_batch)
 
 
 def maybe_build_pcp_manager(

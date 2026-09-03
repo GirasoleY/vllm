@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
 )
 from vllm.v1.worker.gpu.spec_decode.execution import (
     DraftAttentionMetadataSource,
+    DraftBatchLayout,
     DraftExecutionView,
 )
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import (
@@ -154,6 +155,25 @@ def test_prefill_capture_matches_runtime_attention_owner(
     assert capture_args[4] is (
         draft_attn_groups if uses_draft_resources else target_attn_groups
     )
+
+
+def test_capture_does_not_begin_decode_lifecycle_when_no_graph_is_needed():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.last_token_indices = torch.ones(2, dtype=torch.int64)
+    speculator.idx_mapping = torch.ones(2, dtype=torch.int32)
+    speculator.max_num_reqs = 2
+    speculator.num_speculative_steps = 2
+    speculator.prefill_cudagraph_manager = Mock()
+    speculator.prefill_cudagraph_manager.needs_capture.return_value = False
+    speculator.decode_cudagraph_manager = Mock()
+    speculator.decode_cudagraph_manager.needs_capture.return_value = False
+    speculator.on_multi_step_decode_begin = Mock()
+    speculator.on_multi_step_decode_end = Mock()
+
+    speculator.capture()
+
+    speculator.on_multi_step_decode_begin.assert_not_called()
+    speculator.on_multi_step_decode_end.assert_not_called()
 
 
 @pytest.mark.parametrize(("hc_mult", "expected"), [(None, 64), (4, 256)])
@@ -443,6 +463,132 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
     assert actual_feedback_hidden is hidden
 
 
+def test_target_local_prefill_restores_logits_and_feedback_before_sampling():
+    speculator = object.__new__(_TestSpeculator)
+    local_logits = torch.tensor([[1.0], [2.0]])
+    local_feedback = torch.tensor([[3.0], [4.0]])
+    global_logits = torch.tensor([[1.0], [5.0], [2.0], [6.0]])
+    global_feedback = torch.tensor([[3.0], [7.0], [4.0], [8.0]])
+    global_batch = SimpleNamespace(num_tokens_after_padding=4)
+    model_batch = SimpleNamespace(num_tokens_after_padding=2)
+    restore_token_rows = Mock(side_effect=[global_logits, global_feedback])
+    token_layout = SimpleNamespace(
+        global_batch=global_batch,
+        model_batch=model_batch,
+        restore_token_rows=restore_token_rows,
+    )
+    execution_view = DraftExecutionView(
+        global_batch=global_batch,
+        model_batch=model_batch,
+        last_hidden_states=torch.empty(0),
+        aux_hidden_states=None,
+        attn_metadata=None,
+        slot_mappings=None,
+        dp_sync=None,
+        token_layout=token_layout,
+    )
+    speculator._run_model = Mock(return_value=(local_logits, local_feedback))
+    speculator.last_token_indices = torch.tensor([1, 3])
+    speculator.idx_mapping = torch.tensor([0, 1])
+    speculator.temperature = torch.zeros(2)
+    speculator.seeds = torch.zeros(2, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.draft_logits = None
+    speculator.draft_tokens = torch.zeros((2, 1), dtype=torch.int64)
+    speculator.hidden_states = torch.zeros((4, 1))
+    speculator.sample_src_positions = torch.zeros(2, dtype=torch.int64)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(4, dtype=torch.int64)
+    )
+    speculator.sample_draft = Mock(return_value=torch.tensor([11, 22]))
+    padding = torch.tensor([False, True])
+
+    speculator._prefill(
+        num_reqs=2,
+        num_tokens=2,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        execution_view=execution_view,
+        input_ids=torch.tensor([10, 20]),
+        model_positions=torch.tensor([0, 2]),
+        is_padding=padding,
+    )
+
+    assert torch.equal(speculator.draft_tokens[:, 0], torch.tensor([11, 22]))
+    assert torch.equal(speculator.hidden_states[:2], torch.tensor([[7.0], [8.0]]))
+    assert torch.equal(speculator.input_buffers.positions[:2], torch.tensor([1, 3]))
+    assert torch.equal(
+        speculator.sample_draft.call_args.args[0], torch.tensor([[5.0], [6.0]])
+    )
+    assert speculator._run_model.call_args.kwargs["is_padding"] is padding
+    assert restore_token_rows.call_count == 2
+
+
+def test_target_local_prefill_materializes_global_continuation_block_tables():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.execution_plan = SimpleNamespace(
+        initial=SimpleNamespace(block_table_layout=DraftBatchLayout.TARGET_PCP_LOCAL),
+        continuation=SimpleNamespace(block_table_layout=DraftBatchLayout.PCP_GLOBAL),
+    )
+    speculator.block_tables = SimpleNamespace(gather_block_tables=Mock())
+    global_batch = SimpleNamespace(idx_mapping=torch.tensor([3, 1]))
+    model_batch = object()
+    execution_view = DraftExecutionView(  # type: ignore[arg-type]
+        global_batch=global_batch,
+        model_batch=model_batch,
+        last_hidden_states=torch.empty(0),
+        aux_hidden_states=None,
+        attn_metadata=None,
+        slot_mappings=None,
+        dp_sync=None,
+        token_layout=SimpleNamespace(
+            global_batch=global_batch,
+            model_batch=model_batch,
+        ),
+    )
+
+    speculator._materialize_continuation_block_tables(
+        execution_view,
+        global_batch,
+        num_reqs_padded=4,
+        skip_attn=False,
+    )
+
+    speculator.block_tables.gather_block_tables.assert_called_once_with(
+        global_batch.idx_mapping,
+        num_reqs_padded=4,
+    )
+
+
+def test_target_local_dummy_identity_layout_needs_no_block_table_transition():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.execution_plan = SimpleNamespace(
+        initial=SimpleNamespace(block_table_layout=DraftBatchLayout.TARGET_PCP_LOCAL),
+        continuation=SimpleNamespace(block_table_layout=DraftBatchLayout.PCP_GLOBAL),
+    )
+    speculator.block_tables = SimpleNamespace(gather_block_tables=Mock())
+    dummy_batch = SimpleNamespace(idx_mapping=torch.tensor([0]))
+    execution_view = DraftExecutionView(  # type: ignore[arg-type]
+        global_batch=dummy_batch,
+        model_batch=dummy_batch,
+        last_hidden_states=torch.empty(0),
+        aux_hidden_states=None,
+        attn_metadata=None,
+        slot_mappings=None,
+        dp_sync=None,
+    )
+
+    speculator._materialize_continuation_block_tables(
+        execution_view,
+        dummy_batch,
+        num_reqs_padded=1,
+        skip_attn=False,
+    )
+
+    speculator.block_tables.gather_block_tables.assert_not_called()
+
+
 @pytest.mark.parametrize(
     (
         "method_name",
@@ -491,6 +637,51 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     assert generate_draft.call_count == expected_eager_calls
     assert run_fullgraph.call_count == expected_graph_replays
+
+
+@pytest.mark.parametrize(
+    "method_name", ["_multi_step_decode", "_fused_multi_step_decode"]
+)
+def test_target_local_continuation_is_always_decode_metadata(
+    monkeypatch, method_name: str
+):
+    speculator = object.__new__(_TestSpeculator)
+    speculator.num_speculative_steps = 2
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2),
+        query_start_loc=torch.arange(3),
+    )
+    speculator.idx_mapping = torch.arange(2)
+    speculator.block_tables = SimpleNamespace(
+        compute_slot_mappings=Mock(return_value=torch.arange(2))
+    )
+    speculator.kv_cache_config = object()
+    speculator.execution_plan = SimpleNamespace(uses_target_local_initial=True)
+    speculator.decode_is_prefilling = torch.zeros(2, dtype=torch.bool)
+    speculator._build_draft_attn_metadata = Mock(return_value={})
+    speculator._generate_draft = Mock()
+    speculator._generate_fused_drafts = Mock()
+    monkeypatch.setattr(
+        spec_module, "build_slot_mappings_by_layer", Mock(return_value={})
+    )
+
+    getattr(speculator, method_name)(
+        num_reqs=2,
+        skip_attn=False,
+        batch_desc=BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=2,
+            num_reqs=2,
+        ),
+        seq_lens_cpu_upper_bound=torch.ones(2, dtype=torch.int32),
+        num_tokens_across_dp=None,
+    )
+
+    is_prefilling = speculator._build_draft_attn_metadata.call_args.kwargs[
+        "is_prefilling"
+    ]
+    assert torch.equal(is_prefilling, torch.zeros(2, dtype=torch.bool))
 
 
 def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(

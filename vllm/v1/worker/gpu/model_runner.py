@@ -153,8 +153,8 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.execution import (
     DraftAttentionMetadataSource,
-    DraftBatchLayout,
     DraftExecutionView,
+    DraftTokenLayout,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -715,29 +715,57 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _prepare_draft_execution_view(
         self,
-        input_batch: InputBatch,
+        target_model_batch: InputBatch,
         target_hidden_states: torch.Tensor,
         aux_hidden_states: list[torch.Tensor] | None,
         attn_metadata: dict[str, Any] | None,
         slot_mappings_by_layer: dict[str, torch.Tensor] | None,
         dp_sync: DPSyncState | None,
+        pcp_token_layout: DraftTokenLayout | None,
         *,
-        restore_pcp_hidden_states: bool = False,
-    ) -> DraftExecutionView | None:
-        """Bind target outputs to the identity draft-execution contract."""
+        allow_identity_for_target_local: bool = False,
+    ) -> tuple[DraftExecutionView | None, torch.Tensor, InputBatch]:
+        """Bind one target result to the exact rows/resources used by drafting."""
+        global_batch = target_model_batch
+        global_hidden_states = target_hidden_states
+        if pcp_token_layout is not None:
+            global_batch = pcp_token_layout.global_batch
+            global_hidden_states = pcp_token_layout.restore_token_rows(
+                target_hidden_states
+            )
+
+        if (
+            getattr(self, "pcp_manager", None) is not None
+            and pcp_token_layout is None
+            and not allow_identity_for_target_local
+        ):
+            raise RuntimeError(
+                "PCP sampling requires the token layout saved by the matching "
+                "target execution step."
+            )
+
         if self.speculator is None:
-            return None
+            return None, global_hidden_states, global_batch
 
-        initial_plan = None
-        if isinstance(self.speculator, DraftModelSpeculator):
-            initial_plan = self.speculator.execution_plan.initial
-            if initial_plan.input_layout != DraftBatchLayout.PCP_GLOBAL:
-                raise RuntimeError(
-                    "A non-global draft input layout requires an explicit "
-                    "token-layout adapter."
-                )
+        target_local_initial_plan = (
+            isinstance(self.speculator, DraftModelSpeculator)
+            and self.speculator.execution_plan.uses_target_local_initial
+        )
+        if (
+            target_local_initial_plan
+            and pcp_token_layout is None
+            and not allow_identity_for_target_local
+        ):
+            raise RuntimeError(
+                "The sharded draft plan requires a target-PCP-local token layout."
+            )
+        # Synthetic dummy batches do not pass through PCP partitioning and are
+        # already identical/global on every rank.
+        uses_target_local_initial = (
+            target_local_initial_plan and pcp_token_layout is not None
+        )
 
-        draft_hidden_states = target_hidden_states
+        draft_input_hidden_states = target_hidden_states
         if hasattr(self.model, "get_mtp_target_hidden_states"):
             mtp_target_hidden_states = self.model.get_mtp_target_hidden_states()
             if mtp_target_hidden_states is None:
@@ -745,58 +773,75 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "The target model did not retain the hidden states required "
                     "by its MTP drafter."
                 )
-            if restore_pcp_hidden_states:
-                assert self.pcp_manager is not None
-                mtp_target_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
-                    mtp_target_hidden_states
+            draft_input_hidden_states = mtp_target_hidden_states
+
+        if uses_target_local_initial:
+            draft_model_batch = target_model_batch
+            num_model_tokens = target_model_batch.num_tokens_after_padding
+            draft_hidden_states = draft_input_hidden_states[:num_model_tokens]
+            draft_aux_hidden_states = (
+                None
+                if aux_hidden_states is None
+                else [hidden[:num_model_tokens] for hidden in aux_hidden_states]
+            )
+        else:
+            draft_model_batch = global_batch
+            if draft_input_hidden_states is target_hidden_states:
+                draft_hidden_states = global_hidden_states
+            elif pcp_token_layout is not None:
+                draft_hidden_states = pcp_token_layout.restore_token_rows(
+                    draft_input_hidden_states
                 )
-            draft_hidden_states = mtp_target_hidden_states[
-                : target_hidden_states.shape[0]
-            ]
+            else:
+                draft_hidden_states = draft_input_hidden_states
+            num_global_tokens = global_batch.num_tokens_after_padding
+            if draft_hidden_states.shape[0] != num_global_tokens:
+                draft_hidden_states = draft_hidden_states[:num_global_tokens]
+            if aux_hidden_states is None or pcp_token_layout is None:
+                draft_aux_hidden_states = aux_hidden_states
+            else:
+                draft_aux_hidden_states = [
+                    pcp_token_layout.restore_token_rows(hidden)[:num_global_tokens]
+                    for hidden in aux_hidden_states
+                ]
 
-        attention_source = DraftAttentionMetadataSource.TARGET
-        reuses_target_dp_sync = True
-        if initial_plan is not None:
-            attention_source = initial_plan.attention_metadata_source
-            reuses_target_dp_sync = initial_plan.reuses_target_dp_sync
-
-        return DraftExecutionView(
-            global_batch=input_batch,
-            model_batch=input_batch,
+        initial_attention_metadata_source = (
+            self.speculator.execution_plan.initial.attention_metadata_source
+            if isinstance(self.speculator, DraftModelSpeculator)
+            else DraftAttentionMetadataSource.TARGET
+        )
+        reuses_target_dp_sync = (
+            self.speculator.execution_plan.initial.reuses_target_dp_sync
+            if isinstance(self.speculator, DraftModelSpeculator)
+            else True
+        )
+        execution_view = DraftExecutionView(
+            global_batch=global_batch,
+            model_batch=draft_model_batch,
             last_hidden_states=draft_hidden_states,
-            aux_hidden_states=aux_hidden_states,
+            aux_hidden_states=draft_aux_hidden_states,
             attn_metadata=(
                 attn_metadata
-                if attention_source == DraftAttentionMetadataSource.TARGET
+                if initial_attention_metadata_source
+                == DraftAttentionMetadataSource.TARGET
                 else None
             ),
             slot_mappings=(
                 slot_mappings_by_layer
-                if attention_source == DraftAttentionMetadataSource.TARGET
+                if initial_attention_metadata_source
+                == DraftAttentionMetadataSource.TARGET
                 else None
             ),
-            dp_sync=dp_sync if reuses_target_dp_sync else None,
+            # A target DPSyncState is valid only for the exact target model
+            # batch. A restored global draft batch synchronizes afresh.
+            dp_sync=(
+                dp_sync
+                if reuses_target_dp_sync and draft_model_batch is target_model_batch
+                else None
+            ),
+            token_layout=(pcp_token_layout if uses_target_local_initial else None),
         )
-
-    def _restore_pcp_outputs(
-        self,
-        input_batch: InputBatch,
-        hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
-    ) -> tuple[InputBatch, torch.Tensor, list[torch.Tensor] | None, bool]:
-        """Restore a rank-local target result to its PCP-global row layout."""
-        manager = self.pcp_manager
-        if manager is None or not manager.is_partitioned_batch(input_batch):
-            return input_batch, hidden_states, aux_hidden_states, False
-
-        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            manager, hidden_states, input_batch
-        )
-        if aux_hidden_states is not None:
-            aux_hidden_states = [
-                manager.restore_hidden_states(hidden) for hidden in aux_hidden_states
-            ]
-        return input_batch, hidden_states, aux_hidden_states, True
+        return execution_view, global_hidden_states, global_batch
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -882,32 +927,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         dp_sync = self.execute_model_state.dp_sync
+        pcp_token_layout = self.execute_model_state.pcp_token_layout
         self.execute_model_state = None
 
         self.step_timing.forward_end()
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
-        input_batch, hidden_states, aux_hidden_states, restored_pcp = (
-            self._restore_pcp_outputs(
-                input_batch,
-                hidden_states,
-                aux_hidden_states,
-            )
+        execution_view, hidden_states, input_batch = self._prepare_draft_execution_view(
+            input_batch,
+            hidden_states,
+            aux_hidden_states,
+            attn_metadata,
+            slot_mappings_by_layer,
+            dp_sync,
+            pcp_token_layout,
+            allow_identity_for_target_local=True,
         )
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
-            assert self.sampler is not None
-            execution_view = self._prepare_draft_execution_view(
-                input_batch,
-                hidden_states,
-                aux_hidden_states,
-                attn_metadata,
-                slot_mappings_by_layer,
-                dp_sync,
-                restore_pcp_hidden_states=restored_pcp,
-            )
             assert execution_view is not None
+            assert self.sampler is not None
             self.step_timing.drafter_start()
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
             if self.speculator.supports_mm_inputs:
@@ -1930,6 +1970,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            pcp_token_layout=(
+                None
+                if self.pcp_manager is None
+                else self.pcp_manager.token_layout_for(input_batch)
+            ),
         )
 
         if not self.is_last_pp_rank:
@@ -1955,6 +2000,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
+        pcp_token_layout = self.execute_model_state.pcp_token_layout
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1977,13 +2023,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
-        # Last rank: sample tokens
         assert hidden_states is not None
-        input_batch, hidden_states, aux_hidden_states, restored_pcp = (
-            self._restore_pcp_outputs(
+        draft_execution_view, hidden_states, input_batch = (
+            self._prepare_draft_execution_view(
                 input_batch,
                 hidden_states,
                 aux_hidden_states,
+                attn_metadata,
+                slot_mappings_by_layer,
+                dp_sync,
+                pcp_token_layout,
             )
         )
 
@@ -2056,20 +2105,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         if self.speculator is not None:
+            assert draft_execution_view is not None
             assert self.sampler is not None
-            execution_view = self._prepare_draft_execution_view(
-                input_batch,
-                hidden_states,
-                aux_hidden_states,
-                attn_metadata,
-                slot_mappings_by_layer,
-                dp_sync,
-                restore_pcp_hidden_states=restored_pcp,
-            )
-            assert execution_view is not None
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
-                    execution_view,
+                    draft_execution_view,
                     num_sampled,
                     num_rejected,
                     self.req_states.last_sampled_tokens,
@@ -2241,6 +2281,7 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
+    pcp_token_layout: DraftTokenLayout | None
 
 
 class BatchReqState(NamedTuple):

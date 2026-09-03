@@ -111,6 +111,17 @@ class DraftModelSpeculator(BaseSpeculator):
             implementation_name=cls.__name__,
         )
 
+    def resolve_initial_cudagraph_mode(self, mode: CUDAGraphMode) -> CUDAGraphMode:
+        """Resolve graph support for the initial draft phase only."""
+        if self.execution_plan.uses_target_local_initial and mode != CUDAGraphMode.NONE:
+            logger.info_once(
+                "%s uses eager draft execution because its target-PCP-local "
+                "initial step does not support CUDA graphs.",
+                type(self).__name__,
+            )
+            return CUDAGraphMode.NONE
+        return mode
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         target_parallel_config = vllm_config.parallel_config
         self.execution_plan = type(self).resolve_draft_execution_plan(vllm_config)
@@ -285,10 +296,9 @@ class DraftModelSpeculator(BaseSpeculator):
             active_layer_names=self.draft_attn_layer_names,
         )
         self.block_tables = block_tables
-        # The target model runner's buffers and attention groups. Draft
-        # prefill reuses the target model's attention metadata, so its
-        # cudagraph capture must build dummy metadata through the same
-        # builders and buffers.
+        # The target model runner's buffers and attention groups. The seed
+        # phase plan selects these when target metadata can be reused; capture
+        # and runtime must make the same selection.
         self.target_input_buffers = target_input_buffers
         self.target_attn_groups = target_attn_groups
 

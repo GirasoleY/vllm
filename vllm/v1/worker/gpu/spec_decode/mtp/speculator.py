@@ -7,7 +7,10 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
-from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionCapabilities
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftExecutionCapabilities,
+    DraftParallelismDefault,
+)
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
@@ -15,7 +18,12 @@ class MTPSpeculator(AutoRegressiveSpeculator):
 
     @classmethod
     def draft_execution_capabilities(cls) -> DraftExecutionCapabilities:
-        return DraftExecutionCapabilities(supports_replicated_pcp=True)
+        return DraftExecutionCapabilities(
+            default_prefill_context_parallelism=DraftParallelismDefault.TARGET,
+            supports_replicated_pcp=True,
+            supports_target_local_initial=True,
+            supports_target_local_kv_layout=True,
+        )
 
     def load_draft_model(
         self,
@@ -34,6 +42,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # steps 1+ reuse them.
         self.share_mtp_topk_indices = (
             getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
+            and not self.execution_plan.uses_target_local_initial
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )

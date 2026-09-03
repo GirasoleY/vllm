@@ -18,11 +18,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.execution import (
-    DraftAttentionMetadataSource,
-    DraftBatchLayout,
-)
-from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+from vllm.v1.worker.gpu.spec_decode.execution import DraftAttentionMetadataSource
 
 
 @pytest.mark.parametrize("is_kv_producer", [False, True])
@@ -64,31 +60,34 @@ def test_prepare_identity_draft_execution_view_honors_phase_ownership(
     runner.model = SimpleNamespace()
     speculator = object.__new__(DFlashSpeculator)
     speculator.execution_plan = SimpleNamespace(
+        uses_target_local_initial=False,
         initial=SimpleNamespace(
-            input_layout=DraftBatchLayout.PCP_GLOBAL,
             attention_metadata_source=attention_source,
             reuses_target_dp_sync=reuses_target_dp_sync,
-        )
+        ),
     )
     runner.speculator = speculator
 
-    batch = SimpleNamespace()
+    batch = SimpleNamespace(num_tokens_after_padding=2)
     hidden_states = torch.zeros(2, 3)
     aux_hidden_states = [torch.ones(2, 3)]
     attn_metadata = {"layer": object()}
     slot_mappings = {"layer": torch.tensor([1, 2])}
     dp_sync = object()
 
-    view = runner._prepare_draft_execution_view(  # type: ignore[arg-type]
+    view, sampling_hidden, sampling_batch = runner._prepare_draft_execution_view(  # type: ignore[arg-type]
         batch,
         hidden_states,
         aux_hidden_states,
         attn_metadata,
         slot_mappings,
         dp_sync,
+        None,
     )
 
     assert view is not None
+    assert sampling_hidden is hidden_states
+    assert sampling_batch is batch
     assert view.global_batch is batch
     assert view.model_batch is batch
     assert view.last_hidden_states is hidden_states
@@ -103,130 +102,232 @@ def test_prepare_identity_draft_execution_view_honors_phase_ownership(
         assert view.dp_sync is None
 
 
-def test_prepare_identity_draft_execution_view_rejects_non_global_plan():
+@pytest.mark.parametrize("target_local", [False, True])
+@pytest.mark.parametrize("uses_pre_hc", [False, True])
+def test_prepare_draft_execution_view_respects_layout_and_ownership(
+    monkeypatch, target_local: bool, uses_pre_hc: bool
+):
+    class FakeDraftModelSpeculator:
+        pass
+
+    monkeypatch.setattr(
+        model_runner_module, "DraftModelSpeculator", FakeDraftModelSpeculator
+    )
+    attention_metadata_source = (
+        DraftAttentionMetadataSource.TARGET
+        if target_local
+        else DraftAttentionMetadataSource.DRAFT
+    )
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model = SimpleNamespace()
-    speculator = object.__new__(DFlashSpeculator)
-    speculator.execution_plan = SimpleNamespace(
+    runner.speculator = FakeDraftModelSpeculator()
+    runner.speculator.execution_plan = SimpleNamespace(
+        uses_target_local_initial=target_local,
         initial=SimpleNamespace(
-            input_layout=DraftBatchLayout.TARGET_PCP_LOCAL,
+            attention_metadata_source=attention_metadata_source,
+            reuses_target_dp_sync=True,
+        ),
+    )
+    runner.pcp_manager = object()
+
+    target_batch = SimpleNamespace(num_tokens_after_padding=2)
+    global_batch = SimpleNamespace(num_tokens_after_padding=4)
+    local_hidden = torch.arange(6).reshape(2, 3)
+    global_hidden = torch.arange(12).reshape(4, 3)
+    local_aux = local_hidden + 100
+    global_aux = global_hidden + 100
+    local_pre_hc = local_hidden + 200
+    global_pre_hc = global_hidden + 200
+    runner.model = (
+        SimpleNamespace(get_mtp_target_hidden_states=lambda: local_pre_hc)
+        if uses_pre_hc
+        else SimpleNamespace()
+    )
+
+    def restore_token_rows(rows):
+        if rows is local_hidden:
+            return global_hidden
+        if rows is local_aux:
+            return global_aux
+        if rows is local_pre_hc:
+            return global_pre_hc
+        raise AssertionError("unexpected token-row buffer")
+
+    token_layout = SimpleNamespace(
+        global_batch=global_batch,
+        model_batch=target_batch,
+        restore_token_rows=restore_token_rows,
+    )
+    attn_metadata = {"layer": object()}
+    slot_mappings = {"layer": torch.arange(2)}
+    dp_sync = object()
+
+    view, sampling_hidden, sampling_batch = runner._prepare_draft_execution_view(
+        target_batch,
+        local_hidden,
+        [local_aux],
+        attn_metadata,
+        slot_mappings,
+        dp_sync,  # type: ignore[arg-type]
+        token_layout,  # type: ignore[arg-type]
+    )
+
+    assert view is not None
+    assert view.global_batch is global_batch
+    assert sampling_batch is global_batch
+    assert sampling_hidden is global_hidden
+    if target_local:
+        assert view.model_batch is target_batch
+        assert torch.equal(
+            view.last_hidden_states,
+            local_pre_hc if uses_pre_hc else local_hidden,
+        )
+        assert view.aux_hidden_states is not None
+        assert torch.equal(view.aux_hidden_states[0], local_aux)
+        assert view.attn_metadata is attn_metadata
+        assert view.slot_mappings is slot_mappings
+        assert view.dp_sync is dp_sync
+        assert view.token_layout is token_layout
+    else:
+        assert view.model_batch is global_batch
+        assert torch.equal(
+            view.last_hidden_states,
+            global_pre_hc if uses_pre_hc else global_hidden,
+        )
+        assert view.aux_hidden_states is not None
+        assert torch.equal(view.aux_hidden_states[0], global_aux)
+        assert view.attn_metadata is None
+        assert view.slot_mappings is None
+        assert view.dp_sync is None
+        assert view.token_layout is None
+
+
+@pytest.mark.parametrize("has_speculator", [False, True])
+def test_prepare_draft_execution_view_rejects_missing_pcp_layout(
+    monkeypatch, has_speculator: bool
+):
+    class FakeDraftModelSpeculator:
+        pass
+
+    monkeypatch.setattr(
+        model_runner_module, "DraftModelSpeculator", FakeDraftModelSpeculator
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.pcp_manager = object()
+    runner.speculator = FakeDraftModelSpeculator() if has_speculator else None
+    batch = SimpleNamespace(num_tokens_after_padding=2)
+
+    with pytest.raises(RuntimeError, match="PCP sampling requires the token layout"):
+        runner._prepare_draft_execution_view(
+            batch,  # type: ignore[arg-type]
+            torch.empty(2, 3),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def test_target_local_dummy_execution_view_allows_identity_layout(monkeypatch):
+    class FakeDraftModelSpeculator:
+        pass
+
+    monkeypatch.setattr(
+        model_runner_module, "DraftModelSpeculator", FakeDraftModelSpeculator
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.pcp_manager = object()
+    runner.model = SimpleNamespace()
+    runner.speculator = FakeDraftModelSpeculator()
+    runner.speculator.execution_plan = SimpleNamespace(
+        uses_target_local_initial=True,
+        initial=SimpleNamespace(
             attention_metadata_source=DraftAttentionMetadataSource.TARGET,
             reuses_target_dp_sync=True,
-        )
+        ),
     )
-    runner.speculator = speculator
+    batch = SimpleNamespace(num_tokens_after_padding=2)
+    hidden_states = torch.empty(2, 3)
 
-    with pytest.raises(RuntimeError, match="explicit token-layout adapter"):
-        runner._prepare_draft_execution_view(  # type: ignore[arg-type]
-            SimpleNamespace(),
-            torch.zeros(1, 2),
-            None,
-            {},
-            {},
-            None,
-        )
-
-
-def test_replicated_pcp_view_restores_mtp_seed_and_owns_metadata():
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    local_mtp_hidden = torch.arange(6).reshape(2, 3)
-    global_mtp_hidden = torch.arange(12).reshape(4, 3)
-    restored = []
-    runner.model = SimpleNamespace(
-        get_mtp_target_hidden_states=lambda: local_mtp_hidden
-    )
-
-    def restore_hidden_state_buffer(hidden):
-        restored.append(hidden)
-        return global_mtp_hidden
-
-    runner.pcp_manager = SimpleNamespace(
-        restore_hidden_state_buffer=restore_hidden_state_buffer
-    )
-    speculator = object.__new__(MTPSpeculator)
-    speculator.execution_plan = SimpleNamespace(
-        initial=SimpleNamespace(
-            input_layout=DraftBatchLayout.PCP_GLOBAL,
-            attention_metadata_source=DraftAttentionMetadataSource.DRAFT,
-            reuses_target_dp_sync=False,
-        )
-    )
-    runner.speculator = speculator
-
-    batch = SimpleNamespace(num_tokens_after_padding=4)
-    global_hidden = torch.zeros(4, 3)
-    global_aux = [torch.ones(4, 3)]
-    view = runner._prepare_draft_execution_view(  # type: ignore[arg-type]
-        batch,
-        global_hidden,
-        global_aux,
-        {"target": object()},
-        {"target": torch.arange(2)},
-        object(),  # type: ignore[arg-type]
-        restore_pcp_hidden_states=True,
+    view, sampling_hidden, sampling_batch = runner._prepare_draft_execution_view(
+        batch,  # type: ignore[arg-type]
+        hidden_states,
+        None,
+        {},
+        {},
+        None,
+        None,
+        allow_identity_for_target_local=True,
     )
 
     assert view is not None
     assert view.global_batch is batch
     assert view.model_batch is batch
-    torch.testing.assert_close(view.last_hidden_states, global_mtp_hidden)
-    assert view.aux_hidden_states is global_aux
-    assert view.attn_metadata is None
-    assert view.slot_mappings is None
-    assert view.dp_sync is None
     assert view.token_layout is None
-    assert len(restored) == 1
-    assert restored[0] is local_mtp_hidden
+    assert sampling_hidden is hidden_states
+    assert sampling_batch is batch
 
 
-@pytest.mark.parametrize("is_partitioned", [False, True])
-def test_restore_pcp_outputs_handles_real_and_synthetic_batches(is_partitioned: bool):
+def test_shape_changing_drafter_drops_target_dp_sync(monkeypatch):
+    class FakeDraftModelSpeculator:
+        pass
+
+    monkeypatch.setattr(
+        model_runner_module, "DraftModelSpeculator", FakeDraftModelSpeculator
+    )
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    local_batch = SimpleNamespace()
-    global_batch = SimpleNamespace()
-    local_hidden = torch.zeros(2, 3)
-    global_hidden = torch.zeros(4, 3)
-    local_aux = torch.ones(2, 3)
-    global_aux = torch.ones(4, 3)
-    restored_rows = []
-
-    def restore_hidden_states(hidden):
-        restored_rows.append(hidden)
-        if hidden is local_hidden:
-            return global_hidden
-        if hidden is local_aux:
-            return global_aux
-        raise AssertionError("unexpected hidden-state buffer")
-
-    runner.pcp_manager = SimpleNamespace(
-        is_partitioned_batch=lambda batch: is_partitioned and batch is local_batch,
-        restore_for_sampling=lambda hidden: (
-            restore_hidden_states(hidden),
-            global_batch,
+    runner.pcp_manager = None
+    runner.model = SimpleNamespace()
+    runner.speculator = FakeDraftModelSpeculator()
+    runner.speculator.execution_plan = SimpleNamespace(
+        uses_target_local_initial=False,
+        initial=SimpleNamespace(
+            attention_metadata_source=DraftAttentionMetadataSource.DRAFT,
+            reuses_target_dp_sync=False,
         ),
-        restore_hidden_states=restore_hidden_states,
+    )
+    batch = SimpleNamespace(num_tokens_after_padding=2)
+
+    view, _, _ = runner._prepare_draft_execution_view(
+        batch,  # type: ignore[arg-type]
+        torch.empty(2, 3),
+        None,
+        None,
+        None,
+        object(),  # type: ignore[arg-type]
+        None,
     )
 
-    batch, hidden, aux, restored = runner._restore_pcp_outputs(
-        local_batch,  # type: ignore[arg-type]
-        local_hidden,
-        [local_aux],
-    )
+    assert view is not None
+    assert view.dp_sync is None
 
-    if is_partitioned:
-        assert batch is global_batch
-        assert hidden is global_hidden
-        assert aux is not None and aux[0] is global_aux
-        assert restored
-        assert len(restored_rows) == 2
-        assert restored_rows[0] is local_hidden
-        assert restored_rows[1] is local_aux
-    else:
-        assert batch is local_batch
-        assert hidden is local_hidden
-        assert aux is not None and aux[0] is local_aux
-        assert not restored
-        assert restored_rows == []
+
+def test_prepare_draft_execution_view_rejects_missing_pre_hc_state(monkeypatch):
+    class FakeDraftModelSpeculator:
+        pass
+
+    monkeypatch.setattr(
+        model_runner_module, "DraftModelSpeculator", FakeDraftModelSpeculator
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.pcp_manager = None
+    runner.model = SimpleNamespace(get_mtp_target_hidden_states=lambda: None)
+    runner.speculator = FakeDraftModelSpeculator()
+    runner.speculator.execution_plan = SimpleNamespace(
+        uses_target_local_initial=False,
+    )
+    batch = SimpleNamespace(num_tokens_after_padding=2)
+
+    with pytest.raises(RuntimeError, match="did not retain the hidden states"):
+        runner._prepare_draft_execution_view(
+            batch,  # type: ignore[arg-type]
+            torch.empty(2, 3),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

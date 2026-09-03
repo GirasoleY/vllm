@@ -105,23 +105,25 @@ cannot execute.
 The resolved execution contract governs logical token layouts and the
 metadata, slot mappings, and block-table views used to address KV cache. It
 does not assign physical KV-cache ownership: allocation and per-layer sharing
-remain properties of the concrete model and speculator.
+(for example, Gemma 4 assistant layers that share target KV) remain properties
+of the concrete model and speculator.
 
-Integrated drafting stays on the target worker processes and process groups.
-Selecting replicated PCP changes the draft token and attention layout; it does
-not require expert weights already sharded over the target PCP group to become
-physically replicated.
+Integrated drafting also stays on the target worker processes and process
+groups. Selecting replicated PCP changes the draft token/attention layout; it
+does not require MoE expert weights already sharded over the target PCP group
+to become physically replicated.
 
-The standard MTP implementation and DSpark support replicated drafting for a
-PCP target and default draft PCP to `1`. Specialized Gemma 4 and multi-module
-MTP paths do not yet opt in. Other implementations also reject PCP, and
-selecting the target PCP size for sharded drafting is not yet supported. Draft
-DCP topology changes are also rejected.
+PCP and DCP draft policy currently require Model Runner V2 and an integrated
+EAGLE-like GPU speculator. Integrated MRV2 speculators currently require draft
+TP to match target TP. The single-module MTP implementation defaults draft PCP
+to target PCP; setting `prefill_context_parallel_size` to `1` selects the
+replicated MTP path. DSpark defaults to replicated PCP. Other implementations
+must opt in explicitly before either PCP mode is accepted.
 
-Current speculative PCP support is limited to the standard MTP implementation
-and DSpark on MLA targets. MTP requires dense MLA; DSpark may use sparse MLA.
-PCP speculative decoding does not yet support PP, DCP, multimodal inputs, LoRA,
-adaptive verification, or FULL CUDA graphs.
+Current speculative PCP support is limited to single-module MTP and DSpark on
+MLA targets. Sharded MTP supports dense MLA; DSpark uses the replicated path
+and may use sparse MLA. PCP speculative decoding does not yet support PP, DP,
+DCP, multimodal inputs, LoRA, adaptive verification, or FULL CUDA graphs.
 
 !!! note
     Gemma 4 assistant checkpoints are handled as Gemma 4 MTP speculators, not
