@@ -19,7 +19,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot
-from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import (
+    DPSyncState,
+    dispatch_uniform_cg_and_sync_dp,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
@@ -430,13 +433,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
+        batch_desc, batch_sync = dispatch_uniform_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
-            num_query_tokens,
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
+            dp_sync=dp_sync,
             need_eager=is_profile,
         )
 

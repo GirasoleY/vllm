@@ -14,7 +14,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import (
+    DPSyncState,
+    dispatch_cg_and_sync_dp,
+    dispatch_uniform_cg_and_sync_dp,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
@@ -338,13 +342,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
-        decode_batch_desc, decode_batch_sync = dispatch_cg_and_sync_dp(
+        decode_batch_desc, decode_batch_sync = dispatch_uniform_cg_and_sync_dp(
             self.decode_cudagraph_manager,
-            num_reqs,
             num_reqs,
             uniform_token_count=1,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
+            dp_sync=dp_sync,
             need_eager=is_profile,
         )
         num_tokens_across_dp = (
