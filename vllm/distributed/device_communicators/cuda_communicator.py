@@ -108,6 +108,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        self._sp_reduce_scatter_init_result: bool | None = None
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -381,6 +382,35 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if ca_comm is None:
             return None
         return ca_comm.custom_all_gather(input_.contiguous())
+
+    def initialize_sp_reduce_scatter(self) -> bool:
+        """Collectively initialize the model-level SP reduce-scatter backend."""
+        if self._sp_reduce_scatter_init_result is not None:
+            return self._sp_reduce_scatter_init_result
+        if self.is_stateless:
+            self._sp_reduce_scatter_init_result = False
+            return False
+
+        ca_comm = self.ca_comm
+        locally_available = (
+            current_platform.is_cuda() and ca_comm is not None and not ca_comm.disabled
+        )
+        group_available = torch.tensor(
+            int(locally_available), dtype=torch.int32, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            group_available,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.cpu_group,
+        )
+        if not group_available.item():
+            self._sp_reduce_scatter_init_result = False
+            return False
+
+        assert ca_comm is not None
+        result = ca_comm.initialize_mnnvl_multimem_reduce_scatter()
+        self._sp_reduce_scatter_init_result = result
+        return result
 
     def custom_reduce_scatter(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm

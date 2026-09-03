@@ -39,6 +39,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.common.ops.sequence_parallel import (
+    initialize_sp_reduce_scatter,
     sp_all_gather,
     sp_padding_mask,
     sp_reduce_scatter,
@@ -74,6 +75,8 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             parallel_config.use_sequence_parallel_moe
             and parallel_config.pipeline_parallel_size == 1
         )
+        if self.use_sequence_parallel:
+            initialize_sp_reduce_scatter()
 
         self.self_attn = DeepseekV32Attention(
             vllm_config=vllm_config,

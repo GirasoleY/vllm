@@ -23,7 +23,10 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
+from vllm.models.common.ops.sequence_parallel import (
+    initialize_sp_reduce_scatter,
+    sp_reduce_scatter,
+)
 from vllm.platforms import current_platform
 
 from ..utils import (
@@ -350,6 +353,10 @@ def _run_multimem_reduce_scatter_test(
 
         fa = get_tp_group().device_communicator.ca_comm
         assert fa is not None and not fa.disabled
+        assert fa.mnnvl_multimem_rs_buffer is None
+        assert not fa.mnnvl_multimem_rs_multicast_ptr
+        assert initialize_sp_reduce_scatter()
+        assert fa.mnnvl_multimem_rs_buffer is not None
         assert fa.mnnvl_multimem_rs_multicast_ptr
 
         message_bytes = {
@@ -366,6 +373,10 @@ def _run_multimem_reduce_scatter_test(
                     dtype=torch.bfloat16,
                     device=device,
                 )
+                shard_offsets = (
+                    torch.arange(tp_size, dtype=torch.bfloat16, device=device) * 16
+                )
+                inp.add_(shard_offsets[:, None])
                 selected = fa._select_reduce_scatter_backend(inp)
                 if backend == "nccl":
                     assert selected is None
@@ -374,7 +385,8 @@ def _run_multimem_reduce_scatter_test(
                     assert selected == backend
                     out = fa.custom_reduce_scatter(inp)
                     assert out is not None
-                torch.testing.assert_close(out, torch.full_like(out, 36))
+                expected = 36 + 16 * tp_size * rank
+                torch.testing.assert_close(out, torch.full_like(out, expected))
 
 
 @pytest.mark.skipif(

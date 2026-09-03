@@ -12,6 +12,14 @@ from vllm.distributed import (
 )
 
 
+def initialize_sp_reduce_scatter() -> bool:
+    """Initialize an optional backend used by model-level SP collectives."""
+    device_communicator = get_tp_group().device_communicator
+    if device_communicator is None:
+        return False
+    return device_communicator.initialize_sp_reduce_scatter()
+
+
 def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
     device_communicator = get_tp_group().device_communicator
     if device_communicator is None:

@@ -88,6 +88,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.common.ops.sequence_parallel import (
+    initialize_sp_reduce_scatter,
     sp_all_gather,
     sp_padding_mask,
     sp_reduce_scatter,
@@ -885,6 +886,8 @@ class KimiDecoderLayer(nn.Module):
             and parallel_config.tensor_parallel_size > 1
             and (use_mega_moe or parallel_config.data_parallel_size > 1)
         )
+        if self.use_sequence_parallel:
+            initialize_sp_reduce_scatter()
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
             assert kda_config is not None

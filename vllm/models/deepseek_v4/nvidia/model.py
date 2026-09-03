@@ -70,6 +70,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import (
+    initialize_sp_reduce_scatter,
     sp_all_gather,
     sp_padding_mask,
     sp_reduce_scatter,
@@ -1105,6 +1106,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        if self.use_sequence_parallel:
+            initialize_sp_reduce_scatter()
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = _select_dsv4_attn_cls(vllm_config)(

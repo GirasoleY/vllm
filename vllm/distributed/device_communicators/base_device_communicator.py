@@ -185,6 +185,7 @@ class DeviceCommunicatorBase:
         from torch.distributed.distributed_c10d import _world
 
         is_stateless = _world.pg_map.get(cpu_group, None) is None
+        self.is_stateless = is_stateless
 
         if is_stateless:
             # For stateless groups, we can't use torch.distributed methods
@@ -219,6 +220,10 @@ class DeviceCommunicatorBase:
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def initialize_sp_reduce_scatter(self) -> bool:
+        """Initialize an optional backend for model-level SP reduce-scatter."""
+        return False
 
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""

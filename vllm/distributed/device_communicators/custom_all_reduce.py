@@ -160,6 +160,7 @@ class CustomAllreduce:
         is bind to a unique device, and all communicators in this group
         are in the same node.
         """
+        self.group = group
         self._IS_CAPTURING = False
         self._ptr = 0
         self.disabled = True
@@ -180,6 +181,10 @@ class CustomAllreduce:
         self.mnnvl_multimem_rs_buffer_size = 0
         self.mnnvl_multimem_rs_local_ptr = 0
         self.mnnvl_multimem_rs_multicast_ptr = 0
+        self.mnnvl_multimem_rs_init_attempted = False
+        self.max_mnnvl_multimem_reduce_scatter_size = (
+            max_mnnvl_multimem_reduce_scatter_size
+        )
         self.mnnvl_only = False
 
         if not custom_ar:
@@ -190,8 +195,6 @@ class CustomAllreduce:
                 "of missing custom allreduce library"
             )
             return
-
-        self.group = group
 
         assert dist.get_backend(group) != dist.Backend.NCCL, (
             "CustomAllreduce should be attached to a non-NCCL group."
@@ -324,9 +327,6 @@ class CustomAllreduce:
         self.max_mnnvl_all_gather_size = max_mnnvl_all_gather_size
         self.max_reduce_scatter_size = max_reduce_scatter_size
         self.max_mnnvl_reduce_scatter_size = max_mnnvl_reduce_scatter_size
-        self.max_mnnvl_multimem_reduce_scatter_size = (
-            max_mnnvl_multimem_reduce_scatter_size
-        )
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
@@ -340,10 +340,6 @@ class CustomAllreduce:
                 max_mnnvl_reduce_scatter_size,
             )
         )
-        if self.mnnvl_multimem_rs_supported and self.mnnvl_multicast_ptr:
-            self._init_mnnvl_multimem_reduce_scatter_buffer(
-                max_mnnvl_multimem_reduce_scatter_size
-            )
         if not same_node and not self.mnnvl_multicast_ptr:
             logger.warning(
                 "Custom collectives are disabled because this multi-node "
@@ -405,22 +401,110 @@ class CustomAllreduce:
         except RuntimeError as error:
             logger.debug("MNNVL AG/RS initialization failed: %s", error)
 
-    def _init_mnnvl_multimem_reduce_scatter_buffer(self, buffer_size: int) -> None:
+    def _clear_mnnvl_multimem_reduce_scatter_buffer(self) -> None:
+        # The multicast pointer is the selector's readiness sentinel. Clear it
+        # before releasing the objects that own the underlying memory.
+        self.mnnvl_multimem_rs_multicast_ptr = 0
+        self.mnnvl_multimem_rs_local_ptr = 0
+        self.mnnvl_multimem_rs_buffer_size = 0
+        self.mnnvl_multimem_rs_handle = None
+        self.mnnvl_multimem_rs_buffer = None
+
+    def initialize_mnnvl_multimem_reduce_scatter(self) -> bool:
+        """Collectively initialize the optional low-SM reduce-scatter path.
+
+        Every rank in ``self.group`` must call this method in the same order.
+        No resources are published unless every rank is eligible, requests the
+        same capacity, allocates successfully, and obtains multicast access.
+        """
+        if self.mnnvl_multimem_rs_init_attempted:
+            return bool(self.mnnvl_multimem_rs_multicast_ptr)
+        self.mnnvl_multimem_rs_init_attempted = True
+        return self._init_mnnvl_multimem_reduce_scatter_buffer(
+            self.max_mnnvl_multimem_reduce_scatter_size
+        )
+
+    def _init_mnnvl_multimem_reduce_scatter_buffer(self, buffer_size: int) -> bool:
+        self._clear_mnnvl_multimem_reduce_scatter_buffer()
+
+        valid_capacity = (
+            isinstance(buffer_size, int)
+            and not isinstance(buffer_size, bool)
+            and 0 < buffer_size <= torch.iinfo(torch.int64).max
+        )
+        capacity = buffer_size if valid_capacity else 0
+        locally_eligible = (
+            not self.disabled
+            and self.mnnvl_multimem_rs_supported
+            and not envs.VLLM_BATCH_INVARIANT
+            and torch_symm_mem is not None
+            and current_platform.is_cuda()
+            and valid_capacity
+        )
+        preflight = torch.tensor(
+            [int(locally_eligible), capacity, -capacity],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        dist.all_reduce(preflight, op=dist.ReduceOp.MIN, group=self.group)
+        if not (preflight[0].item() and preflight[1].item() == -preflight[2].item()):
+            return False
+
         assert torch_symm_mem is not None
+        buffer = None
+        allocation_error = None
         try:
             buffer = torch_symm_mem.empty(
                 buffer_size, dtype=torch.uint8, device=self.device
             )
-            handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
-            if handle.multicast_ptr == 0:
-                return
-            self.mnnvl_multimem_rs_buffer = buffer
-            self.mnnvl_multimem_rs_handle = handle
-            self.mnnvl_multimem_rs_buffer_size = buffer_size
-            self.mnnvl_multimem_rs_local_ptr = buffer.data_ptr()
-            self.mnnvl_multimem_rs_multicast_ptr = handle.multicast_ptr
         except RuntimeError as error:
-            logger.debug("MNNVL multimem RS initialization failed: %s", error)
+            allocation_error = error
+
+        allocated = torch.tensor(
+            int(buffer is not None), dtype=torch.int32, device="cpu"
+        )
+        dist.all_reduce(allocated, op=dist.ReduceOp.MIN, group=self.group)
+        if not allocated.item():
+            logger.debug(
+                "MNNVL multimem RS allocation failed on at least one rank: %s",
+                allocation_error,
+            )
+            return False
+        assert buffer is not None
+
+        # No rank enters rendezvous until allocation has succeeded everywhere.
+        # A rendezvous exception is deliberately not converted into a local
+        # fallback because peers may still be inside the collective call.
+        handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
+        resource_error = None
+        try:
+            local_ptr = int(buffer.data_ptr() or 0)
+            multicast_ptr = int(handle.multicast_ptr or 0)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            resource_error = error
+            local_ptr = 0
+            multicast_ptr = 0
+
+        available = torch.tensor(
+            int(local_ptr != 0 and multicast_ptr != 0),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        dist.all_reduce(available, op=dist.ReduceOp.MIN, group=self.group)
+        if not available.item():
+            logger.debug(
+                "MNNVL multimem RS resources unavailable on at least one rank: %s",
+                resource_error,
+            )
+            return False
+
+        self.mnnvl_multimem_rs_buffer = buffer
+        self.mnnvl_multimem_rs_handle = handle
+        self.mnnvl_multimem_rs_buffer_size = buffer_size
+        self.mnnvl_multimem_rs_local_ptr = local_ptr
+        # Publish the selector's readiness sentinel last.
+        self.mnnvl_multimem_rs_multicast_ptr = multicast_ptr
+        return True
 
     @contextmanager
     def capture(self):
@@ -580,19 +664,22 @@ class CustomAllreduce:
         if inp_size <= 0 or output_size % 16 != 0 or not is_weak_contiguous(inp):
             return None
 
-        if self.mnnvl_multicast_ptr:
-            if inp_size <= self.max_mnnvl_reduce_scatter_size:
-                return "mnnvl_lamport"
-            if (
-                self.mnnvl_multimem_rs_multicast_ptr
-                and not envs.VLLM_BATCH_INVARIANT
-                and inp_size <= self.max_mnnvl_multimem_reduce_scatter_size
-            ):
-                return "mnnvl_multimem"
-            return None
+        if self.mnnvl_multicast_ptr and inp_size <= self.max_mnnvl_reduce_scatter_size:
+            return "mnnvl_lamport"
 
-        if self.fully_connected and inp_size <= self.max_reduce_scatter_size:
+        if (
+            not self.mnnvl_multicast_ptr
+            and self.fully_connected
+            and inp_size <= self.max_reduce_scatter_size
+        ):
             return "legacy"
+
+        if (
+            self.mnnvl_multimem_rs_multicast_ptr
+            and not envs.VLLM_BATCH_INVARIANT
+            and inp_size <= self.mnnvl_multimem_rs_buffer_size
+        ):
+            return "mnnvl_multimem"
         return None
 
     def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
@@ -655,8 +742,7 @@ class CustomAllreduce:
             self.mnnvl_handle = None
             self.mnnvl_buffer = None
             self.mnnvl_lamport_epochs = None
-            self.mnnvl_multimem_rs_handle = None
-            self.mnnvl_multimem_rs_buffer = None
+        self._clear_mnnvl_multimem_reduce_scatter_buffer()
 
     def __del__(self):
         self.close()
