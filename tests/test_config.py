@@ -22,6 +22,7 @@ from vllm.config import (
     CacheConfig,
     CompilationConfig,
     DeviceConfig,
+    DraftParallelismConfig,
     KernelConfig,
     KVTransferConfig,
     ModelConfig,
@@ -53,6 +54,175 @@ DEVICE_TYPE = current_platform.device_type
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallelism_config_parses_as_public_nested_config():
+    draft_parallelism = DraftParallelismConfig(
+        **{
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 2,
+        }
+    )
+
+    assert draft_parallelism == DraftParallelismConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=2,
+    )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("value", [None, 1])
+def test_speculative_config_rejects_top_level_tensor_parallel_size(value):
+    with pytest.raises(ValidationError, match="Unexpected keyword argument"):
+        pydantic.TypeAdapter(SpeculativeConfig).validate_python(
+            {
+                "method": "ngram",
+                "num_speculative_tokens": 1,
+                "tensor_parallel_size": value,
+            }
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallelism_config_rejected_for_non_model_proposer():
+    with pytest.raises(ValueError, match="does not consume it"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_parallel_config={"prefill_context_parallel_size": 1},
+        )
+
+
+@patch("vllm.config.speculative.ModelConfig")
+@pytest.mark.skip_global_cleanup
+def test_auto_detected_mtp_parses_nested_draft_parallelism(mock_model_config_cls):
+    from unittest.mock import MagicMock
+
+    draft_model_config = MagicMock()
+    draft_model_config.model = "draft"
+    draft_model_config.hf_config.model_type = "deepseek_mtp"
+    draft_model_config.hf_config.n_predict = None
+    draft_model_config.architectures = []
+    draft_model_config.max_model_len = 4096
+    mock_model_config_cls.return_value = draft_model_config
+
+    target_model_config = MagicMock()
+    target_model_config.model = "target"
+    target_model_config.model_weights = None
+    target_model_config.quantization = None
+    target_model_config.max_model_len = 4096
+    target_model_config.hf_overrides = {}
+
+    speculative_config = SpeculativeConfig(
+        model="draft",
+        num_speculative_tokens=1,
+        draft_parallel_config={"prefill_context_parallel_size": 2},
+        target_model_config=target_model_config,
+        target_parallel_config=ParallelConfig(
+            prefill_context_parallel_size=2,
+            distributed_executor_backend="mp",
+        ),
+    )
+
+    assert speculative_config.method == "mtp"
+    assert speculative_config.draft_parallel_config == DraftParallelismConfig(
+        prefill_context_parallel_size=2
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallelism_config_rejects_conflicting_legacy_tp():
+    with pytest.raises(ValueError, match="Conflicting draft tensor-parallel sizes"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_parallel_config={"tensor_parallel_size": 2},
+            draft_tensor_parallel_size=1,
+        )
+
+
+@patch("vllm.config.speculative.logger.warning_once")
+@pytest.mark.skip_global_cleanup
+def test_legacy_draft_tensor_parallel_size_emits_deprecation_warning(warning_once):
+    SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        draft_tensor_parallel_size=1,
+    )
+
+    warning_once.assert_called_with(
+        "`draft_tensor_parallel_size` is deprecated. Use "
+        "`draft_parallel_config.tensor_parallel_size` instead."
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallelism_policy_validates_internal_worker_baseline():
+    target = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        decode_context_parallel_size=2,
+        distributed_executor_backend="mp",
+        enable_dbo=True,
+    )
+    policy = DraftParallelismConfig(
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+
+    resolved = SpeculativeConfig.create_draft_worker_parallel_config(
+        target,
+        policy,
+        SimpleNamespace(model_type="draft_model"),
+    )
+
+    assert resolved.tensor_parallel_size == 1
+    # PCP/DCP are resolved only by the concrete MRV2 execution plan. The
+    # standalone worker baseline deliberately preserves its old defaults.
+    assert resolved.prefill_context_parallel_size == 1
+    assert resolved.decode_context_parallel_size == 1
+    assert resolved.distributed_executor_backend == "mp"
+    assert not resolved.enable_dbo
+    assert target.tensor_parallel_size == 2
+    assert target.prefill_context_parallel_size == 2
+    assert target.decode_context_parallel_size == 2
+
+
+@pytest.mark.parametrize(
+    ("field_name", "target_kwargs"),
+    [
+        ("tensor_parallel_size", {"tensor_parallel_size": 4}),
+        (
+            "prefill_context_parallel_size",
+            {"prefill_context_parallel_size": 4},
+        ),
+        (
+            "decode_context_parallel_size",
+            {"tensor_parallel_size": 4, "decode_context_parallel_size": 4},
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_draft_parallelism_policy_rejects_non_target_shard_size(
+    field_name: str,
+    target_kwargs: dict[str, int],
+):
+    target = ParallelConfig(
+        **target_kwargs,
+        distributed_executor_backend="mp",
+    )
+    policy = DraftParallelismConfig(**{field_name: 2})
+
+    with pytest.raises(ValueError, match=field_name):
+        SpeculativeConfig.create_draft_worker_parallel_config(
+            target,
+            policy,
+            SimpleNamespace(model_type="draft_model"),
+        )
 
 
 def test_kda_recoverssm_derivation_is_revalidated():
@@ -750,6 +920,38 @@ def test_v1_model_runner_rejects_v2_only_features():
     )
 
     with pytest.raises(ValueError, match="prefill context parallel"):
+        VllmConfig._validate_v1_model_runner(config)
+
+
+@pytest.mark.parametrize(
+    "draft_parallel_config",
+    [
+        SimpleNamespace(
+            tensor_parallel_size=None,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=None,
+        ),
+        SimpleNamespace(
+            tensor_parallel_size=None,
+            prefill_context_parallel_size=None,
+            decode_context_parallel_size=1,
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_v1_model_runner_rejects_explicit_draft_cp_policy(
+    draft_parallel_config,
+):
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_parallel_config=draft_parallel_config,
+        ),
+    )
+    config._get_v1_model_runner_unsupported_features = lambda: []
+
+    with pytest.raises(
+        ValueError, match="Draft PCP/DCP policy requires Model Runner V2"
+    ):
         VllmConfig._validate_v1_model_runner(config)
 
 

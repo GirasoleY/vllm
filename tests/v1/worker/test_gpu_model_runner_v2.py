@@ -17,6 +17,89 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftAttentionMetadataSource,
+    DraftBatchLayout,
+)
+
+
+@pytest.mark.parametrize(
+    ("attention_source", "reuses_target_dp_sync"),
+    [
+        (DraftAttentionMetadataSource.TARGET, True),
+        (DraftAttentionMetadataSource.DRAFT, False),
+    ],
+)
+def test_prepare_identity_draft_execution_view_honors_phase_ownership(
+    attention_source,
+    reuses_target_dp_sync,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = SimpleNamespace()
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.execution_plan = SimpleNamespace(
+        initial=SimpleNamespace(
+            input_layout=DraftBatchLayout.PCP_GLOBAL,
+            attention_metadata_source=attention_source,
+            reuses_target_dp_sync=reuses_target_dp_sync,
+        )
+    )
+    runner.speculator = speculator
+
+    batch = SimpleNamespace()
+    hidden_states = torch.zeros(2, 3)
+    aux_hidden_states = [torch.ones(2, 3)]
+    attn_metadata = {"layer": object()}
+    slot_mappings = {"layer": torch.tensor([1, 2])}
+    dp_sync = object()
+
+    view = runner._prepare_draft_execution_view(  # type: ignore[arg-type]
+        batch,
+        hidden_states,
+        aux_hidden_states,
+        attn_metadata,
+        slot_mappings,
+        dp_sync,
+    )
+
+    assert view is not None
+    assert view.global_batch is batch
+    assert view.model_batch is batch
+    assert view.last_hidden_states is hidden_states
+    assert view.aux_hidden_states is aux_hidden_states
+    if attention_source == DraftAttentionMetadataSource.TARGET:
+        assert view.attn_metadata is attn_metadata
+        assert view.slot_mappings is slot_mappings
+        assert view.dp_sync is dp_sync
+    else:
+        assert view.attn_metadata is None
+        assert view.slot_mappings is None
+        assert view.dp_sync is None
+
+
+def test_prepare_identity_draft_execution_view_rejects_non_global_plan():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = SimpleNamespace()
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.execution_plan = SimpleNamespace(
+        initial=SimpleNamespace(
+            input_layout=DraftBatchLayout.TARGET_PCP_LOCAL,
+            attention_metadata_source=DraftAttentionMetadataSource.TARGET,
+            reuses_target_dp_sync=True,
+        )
+    )
+    runner.speculator = speculator
+
+    with pytest.raises(RuntimeError, match="explicit token-layout adapter"):
+        runner._prepare_draft_execution_view(  # type: ignore[arg-type]
+            SimpleNamespace(),
+            torch.zeros(1, 2),
+            None,
+            {},
+            {},
+            None,
+        )
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

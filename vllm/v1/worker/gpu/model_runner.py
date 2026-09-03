@@ -151,6 +151,11 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftAttentionMetadataSource,
+    DraftBatchLayout,
+    DraftExecutionView,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
@@ -698,6 +703,64 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             static_forward_context=self.compilation_config.static_forward_context,
         )
 
+    def _prepare_draft_execution_view(
+        self,
+        input_batch: InputBatch,
+        target_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None,
+        dp_sync: DPSyncState | None,
+    ) -> DraftExecutionView | None:
+        """Bind target outputs to the identity draft-execution contract."""
+        if self.speculator is None:
+            return None
+
+        initial_plan = None
+        if isinstance(self.speculator, DraftModelSpeculator):
+            initial_plan = self.speculator.execution_plan.initial
+            if initial_plan.input_layout != DraftBatchLayout.PCP_GLOBAL:
+                raise RuntimeError(
+                    "A non-global draft input layout requires an explicit "
+                    "token-layout adapter."
+                )
+
+        draft_hidden_states = target_hidden_states
+        if hasattr(self.model, "get_mtp_target_hidden_states"):
+            mtp_target_hidden_states = self.model.get_mtp_target_hidden_states()
+            if mtp_target_hidden_states is None:
+                raise RuntimeError(
+                    "The target model did not retain the hidden states required "
+                    "by its MTP drafter."
+                )
+            draft_hidden_states = mtp_target_hidden_states[
+                : target_hidden_states.shape[0]
+            ]
+
+        attention_source = DraftAttentionMetadataSource.TARGET
+        reuses_target_dp_sync = True
+        if initial_plan is not None:
+            attention_source = initial_plan.attention_metadata_source
+            reuses_target_dp_sync = initial_plan.reuses_target_dp_sync
+
+        return DraftExecutionView(
+            global_batch=input_batch,
+            model_batch=input_batch,
+            last_hidden_states=draft_hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            attn_metadata=(
+                attn_metadata
+                if attention_source == DraftAttentionMetadataSource.TARGET
+                else None
+            ),
+            slot_mappings=(
+                slot_mappings_by_layer
+                if attention_source == DraftAttentionMetadataSource.TARGET
+                else None
+            ),
+            dp_sync=dp_sync if reuses_target_dp_sync else None,
+        )
+
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
@@ -788,7 +851,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
+            assert hidden_states is not None
             assert self.sampler is not None
+            execution_view = self._prepare_draft_execution_view(
+                input_batch,
+                hidden_states,
+                aux_hidden_states,
+                attn_metadata,
+                slot_mappings_by_layer,
+                dp_sync,
+            )
+            assert execution_view is not None
             self.step_timing.drafter_start()
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
             if self.speculator.supports_mm_inputs:
@@ -801,21 +874,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                 )
 
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.propose(
-                    input_batch=input_batch,
-                    attn_metadata=attn_metadata,
-                    slot_mappings=slot_mappings_by_layer,
-                    last_hidden_states=spec_hidden_states,
-                    aux_hidden_states=aux_hidden_states,
+                    execution_view=execution_view,
                     num_sampled=torch.ones(
                         input_batch.num_reqs, dtype=torch.int32, device=self.device
                     ),
@@ -826,7 +887,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     next_prefill_tokens=self.req_states.next_prefill_tokens,
                     temperature=self.sampler.sampling_states.temperature.gpu,
                     seeds=self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
                     dummy_run=True,
                     skip_attn_for_dummy_run=skip_attn,
                     mm_inputs=mm_inputs,
@@ -1947,28 +2007,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            execution_view = self._prepare_draft_execution_view(
+                input_batch,
+                hidden_states,
+                aux_hidden_states,
+                attn_metadata,
+                slot_mappings_by_layer,
+                dp_sync,
+            )
+            assert execution_view is not None
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
+                    execution_view,
                     num_sampled,
                     num_rejected,
                     self.req_states.last_sampled_tokens,
                     self.req_states.next_prefill_tokens,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens

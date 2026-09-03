@@ -187,7 +187,7 @@ def test_draft_model_engine_args_tensor_parallelism():
         target_config,
         quant_config=None,
         parallel_config=replace(
-            speculative_config.draft_parallel_config,
+            speculative_config.draft_worker_parallel_config,
             rank=target_config.parallel_config.rank,
         ),
         model_config=speculative_config.draft_model_config,
@@ -291,8 +291,7 @@ def test_draft_model_moe_backend_default_auto():
 
 
 def test_draft_model_engine_args_rejects_invalid_tp_argname():
-    """The user should pass "draft_tensor_parallel_size" rather than
-    "tensor_parallel_size". We enforce this with validation."""
+    """Draft TP belongs in the nested public draft parallelism config."""
 
     engine_args = EngineArgs(
         model="Qwen/Qwen3-1.7B",
@@ -304,7 +303,7 @@ def test_draft_model_engine_args_rejects_invalid_tp_argname():
             "tensor_parallel_size": 1,  # <<< invalid arg name
         },
     )
-    with pytest.raises(ValueError, match="draft_tensor_parallel_size"):
+    with pytest.raises(ValueError, match="Unexpected keyword argument"):
         engine_args.create_engine_config()
 
 

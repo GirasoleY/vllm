@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.worker.gpu.spec_decode import extract_hidden_states as spec_module
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionView
 from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
     ExtractHiddenStatesSpeculator,
 )
@@ -84,11 +85,15 @@ def test_propose_caches_hidden_states_and_returns_sampled_tokens(monkeypatch):
     last_sampled = torch.tensor([[10], [11], [12]], dtype=torch.int64)
 
     draft_tokens = speculator.propose(
-        input_batch=input_batch,
-        attn_metadata=attn_metadata,
-        slot_mappings=slot_mappings,
-        last_hidden_states=torch.empty(0),
-        aux_hidden_states=aux_hidden_states,
+        execution_view=DraftExecutionView(
+            global_batch=input_batch,
+            model_batch=input_batch,
+            attn_metadata=attn_metadata,
+            slot_mappings=slot_mappings,
+            last_hidden_states=torch.empty(0),
+            aux_hidden_states=aux_hidden_states,
+            dp_sync=None,
+        ),
         num_sampled=torch.empty(0),
         num_rejected=torch.empty(0),
         last_sampled=last_sampled,
@@ -118,11 +123,15 @@ def test_propose_requires_aux_hidden_states():
 
     with pytest.raises(ValueError, match="aux_hidden_states are required"):
         speculator.propose(
-            input_batch=input_batch,
-            attn_metadata={},
-            slot_mappings={},
-            last_hidden_states=torch.empty(0),
-            aux_hidden_states=None,
+            execution_view=DraftExecutionView(
+                global_batch=input_batch,
+                model_batch=input_batch,
+                attn_metadata={},
+                slot_mappings={},
+                last_hidden_states=torch.empty(0),
+                aux_hidden_states=None,
+                dp_sync=None,
+            ),
             num_sampled=torch.empty(0),
             num_rejected=torch.empty(0),
             last_sampled=torch.tensor([[10]]),

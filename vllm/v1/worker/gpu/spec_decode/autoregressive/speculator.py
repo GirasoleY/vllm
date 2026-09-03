@@ -14,12 +14,13 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
+from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionView
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
@@ -203,13 +204,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     @torch.inference_mode()
     def propose(
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        # [num_tokens, hidden_size]
-        last_hidden_states: torch.Tensor,
-        # num_layers x [num_tokens, hidden_size]
-        aux_hidden_states: list[torch.Tensor] | None,
+        execution_view: DraftExecutionView,
         # [num_reqs]
         num_sampled: torch.Tensor,
         # [num_reqs]
@@ -222,12 +217,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        input_batch = execution_view.global_batch
+        attn_metadata = execution_view.attn_metadata
+        slot_mappings = execution_view.slot_mappings
+        last_hidden_states = execution_view.last_hidden_states
+        aux_hidden_states = execution_view.aux_hidden_states
+        dp_sync = execution_view.dp_sync
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs

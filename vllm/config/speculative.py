@@ -371,6 +371,27 @@ def _validate_qwen3_omni_dspark(
 
 
 @config
+class DraftParallelismConfig:
+    """Requested parallelism policy for speculative draft execution.
+
+    Unset dimensions are resolved by the selected speculative decoder. The
+    resolved topology and other runtime-only parallel settings remain an
+    internal execution detail rather than being exposed through this API.
+    """
+
+    tensor_parallel_size: int | None = Field(default=None, ge=1)
+    """Requested draft tensor-parallel size. Must be 1 or the target size."""
+
+    prefill_context_parallel_size: int | None = Field(default=None, ge=1)
+    """Requested draft prefill-context-parallel size. Must be 1 or the target
+    size."""
+
+    decode_context_parallel_size: int | None = Field(default=None, ge=1)
+    """Requested draft decode-context-parallel size. Must be 1 or the target
+    size."""
+
+
+@config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
@@ -391,12 +412,12 @@ class SpeculativeConfig:
 
     If using `ngram` method, the related configuration `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
+    draft_parallel_config: DraftParallelismConfig | None = None
+    """Requested TP/PCP/DCP policy for the draft model. Each dimension can be
+    1, the corresponding target-model size, or omitted to use the selected
+    speculative decoder's default."""
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
-    """The degree of the tensor parallelism for the draft model. Can only be 1
-    or the same as the target model's tensor parallel size."""
-    tensor_parallel_size: int | None = None
-    """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
-    warn users when they mistakenly provide the wrong argument."""
+    """Deprecated alias for ``draft_parallel_config.tensor_parallel_size``."""
 
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
@@ -485,8 +506,12 @@ class SpeculativeConfig:
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
-    draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
-    """The parallel configuration for the draft model initialized internal."""
+    draft_worker_parallel_config: SkipValidation[ParallelConfig] = Field(
+        default=None, init=False
+    )  # type: ignore
+    """Internal launch/load baseline for a standalone draft worker. TP is
+    resolved here; integrated MRV2 speculators resolve PCP/DCP and their exact
+    runtime topology later through ``DraftExecutionPlan``."""
 
     # Suffix decoding configuration
     suffix_decoding_max_tree_depth: int = 24
@@ -638,6 +663,24 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config,
                     "index_share_for_mtp_iteration",
                     False,
+                )
+            )
+
+        if self.draft_worker_parallel_config is not None:
+            draft_parallelism = self.draft_parallel_config
+            factors.append(
+                (
+                    self.draft_worker_parallel_config.tensor_parallel_size,
+                    (
+                        None
+                        if draft_parallelism is None
+                        else draft_parallelism.prefill_context_parallel_size
+                    ),
+                    (
+                        None
+                        if draft_parallelism is None
+                        else draft_parallelism.decode_context_parallel_size
+                    ),
                 )
             )
 
@@ -1066,6 +1109,10 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        # Validate the legacy TP alias even for proposers that do not build a
+        # draft model, so contradictory user input never gets silently ignored.
+        self._draft_parallelism_with_legacy_tp()
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -1171,7 +1218,7 @@ class SpeculativeConfig:
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
             self.draft_model_config = self.target_model_config
-            self.draft_parallel_config = self.target_parallel_config
+            self.draft_worker_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
         elif self.method == "custom_class":
@@ -1185,7 +1232,7 @@ class SpeculativeConfig:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
-            self.draft_parallel_config = self.target_parallel_config
+            self.draft_worker_parallel_config = self.target_parallel_config
         elif self.method == "extract_hidden_states":
             from vllm.transformers_utils.configs.extract_hidden_states import (
                 ExtractHiddenStatesConfig,
@@ -1212,7 +1259,7 @@ class SpeculativeConfig:
                 self.draft_model_config.hf_config, **hf_config
             )
             self.update_arch_()
-            self.draft_parallel_config = self.target_parallel_config
+            self.draft_worker_parallel_config = self.target_parallel_config
 
         else:
             self.prompt_lookup_max = 0
@@ -1472,12 +1519,17 @@ class SpeculativeConfig:
                         self.num_speculative_tokens,
                     )
 
-                self.draft_tensor_parallel_size = (
-                    SpeculativeConfig._verify_and_get_draft_tp(
+                draft_parallelism = self._draft_parallelism_with_legacy_tp()
+                self.draft_worker_parallel_config = (
+                    SpeculativeConfig.create_draft_worker_parallel_config(
                         self.target_parallel_config,
-                        self.draft_tensor_parallel_size,
+                        draft_parallelism,
                         self.draft_model_config.hf_config,
                     )
+                )
+                # Preserve the resolved value for callers of the legacy field.
+                self.draft_tensor_parallel_size = (
+                    self.draft_worker_parallel_config.tensor_parallel_size
                 )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
@@ -1487,11 +1539,34 @@ class SpeculativeConfig:
                     )
                 )
 
-                self.draft_parallel_config = (
-                    SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
-                    )
-                )
+        # Check the public policy only after checkpoint inspection has selected
+        # the concrete method. Before that, an auto-detected MTP/EAGLE checkpoint
+        # is still temporarily represented as a generic ``draft_model``.
+        if self.draft_parallel_config is not None and self.method in (
+            "ngram",
+            "ngram_gpu",
+            "suffix",
+            "custom_class",
+            "extract_hidden_states",
+        ):
+            raise ValueError(
+                "draft_parallel_config is only supported by proposers that "
+                "execute a draft model; "
+                f"method={self.method!r} does not consume it."
+            )
+        if (
+            self.draft_parallel_config is not None
+            and (
+                self.draft_parallel_config.prefill_context_parallel_size is not None
+                or self.draft_parallel_config.decode_context_parallel_size is not None
+            )
+            and not self.use_eagle()
+        ):
+            raise ValueError(
+                "draft parallel PCP/DCP policy is currently supported only by "
+                "integrated EAGLE-like GPU speculators; "
+                f"method={self.method!r} cannot honor it."
+            )
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:
@@ -1675,26 +1750,99 @@ class SpeculativeConfig:
         self.draft_model_config._model_info = model_info
         self.draft_model_config._architecture = arch
 
-    @staticmethod
-    def create_draft_parallel_config(
-        target_parallel_config: ParallelConfig,
-        speculative_draft_tensor_parallel_size: int,
-    ) -> ParallelConfig:
-        """Create a parallel config for use by the draft worker.
+    def _draft_parallelism_with_legacy_tp(self) -> DraftParallelismConfig:
+        draft_parallelism = self.draft_parallel_config or DraftParallelismConfig()
+        nested_tp = draft_parallelism.tensor_parallel_size
+        legacy_tp = self.draft_tensor_parallel_size
+        if legacy_tp is None:
+            return draft_parallelism
+        logger.warning_once(
+            "`draft_tensor_parallel_size` is deprecated. Use "
+            "`draft_parallel_config.tensor_parallel_size` instead."
+        )
+        if nested_tp is not None and nested_tp != legacy_tp:
+            raise ValueError(
+                "Conflicting draft tensor-parallel sizes: "
+                f"draft_parallel_config.tensor_parallel_size={nested_tp} and "
+                f"draft_tensor_parallel_size={legacy_tp}."
+            )
+        if nested_tp is not None:
+            return draft_parallelism
+        return DraftParallelismConfig(
+            tensor_parallel_size=legacy_tp,
+            prefill_context_parallel_size=(
+                draft_parallelism.prefill_context_parallel_size
+            ),
+            decode_context_parallel_size=(
+                draft_parallelism.decode_context_parallel_size
+            ),
+        )
 
-        This is mostly a copy of the target parallel config, except the tp_size.
+    @staticmethod
+    def _resolve_draft_parallel_size(
+        *,
+        name: str,
+        requested_size: int | None,
+        target_size: int,
+        default_size: int,
+    ) -> int:
+        if requested_size is None:
+            return default_size
+        if requested_size not in (1, target_size):
+            raise ValueError(
+                f"draft_parallel_config.{name}={requested_size} must be 1 or "
+                f"the target model's {name} ({target_size})."
+            )
+        return requested_size
+
+    @staticmethod
+    def create_draft_worker_parallel_config(
+        target_parallel_config: ParallelConfig,
+        draft_parallelism: DraftParallelismConfig,
+        draft_hf_config: PretrainedConfig,
+    ) -> ParallelConfig:
+        """Build the legacy draft-worker launch/load baseline.
+
+        The public policy intentionally exposes only TP/PCP/DCP. PCP/DCP stay
+        deferred until an integrated MRV2 implementation declares its concrete
+        capabilities; this object is not the resolved execution topology.
         """
-        draft_parallel_config = ParallelConfig(
+        requested_tp = draft_parallelism.tensor_parallel_size
+        draft_tp = SpeculativeConfig._verify_and_get_draft_tp(
+            target_parallel_config,
+            requested_tp,
+            draft_hf_config,
+        )
+        # Validate the public policy here, but preserve omitted dimensions for
+        # the concrete draft implementation to resolve later.
+        SpeculativeConfig._resolve_draft_parallel_size(
+            name="prefill_context_parallel_size",
+            requested_size=draft_parallelism.prefill_context_parallel_size,
+            target_size=target_parallel_config.prefill_context_parallel_size,
+            default_size=1,
+        )
+        SpeculativeConfig._resolve_draft_parallel_size(
+            name="decode_context_parallel_size",
+            requested_size=draft_parallelism.decode_context_parallel_size,
+            target_size=target_parallel_config.decode_context_parallel_size,
+            default_size=1,
+        )
+        # Preserve the longstanding standalone-worker whitelist. Integrated
+        # MRV2 execution derives its exact runtime config after selecting the
+        # implementation.
+        return ParallelConfig(
             pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
-            tensor_parallel_size=speculative_draft_tensor_parallel_size,
-            distributed_executor_backend=target_parallel_config.distributed_executor_backend,
-            max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+            tensor_parallel_size=draft_tp,
+            distributed_executor_backend=(
+                target_parallel_config.distributed_executor_backend
+            ),
+            max_parallel_loading_workers=(
+                target_parallel_config.max_parallel_loading_workers
+            ),
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
             ray_workers_use_nsight=target_parallel_config.ray_workers_use_nsight,
             placement_group=target_parallel_config.placement_group,
         )
-
-        return draft_parallel_config
 
     @field_validator("attention_backend", mode="before")
     @classmethod
@@ -1707,12 +1855,6 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
-        if self.tensor_parallel_size is not None:
-            raise ValueError(
-                "'tensor_parallel_size' is not a valid argument in the "
-                "speculative_config. Please pass 'draft_tensor_parallel_size' instead."
-            )
-
         if self.num_speculative_tokens is None:
             raise ValueError(
                 "num_speculative_tokens must be provided with "
@@ -1745,7 +1887,7 @@ class SpeculativeConfig:
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
-                self.draft_parallel_config
+                self.draft_worker_parallel_config
             )
 
         if self.use_heterogeneous_vocab and not self.uses_draft_model():

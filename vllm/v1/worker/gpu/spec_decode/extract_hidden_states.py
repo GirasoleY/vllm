@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any
-
 import torch
 import torch.nn as nn
 
@@ -10,8 +8,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
-from vllm.v1.worker.gpu.dp_utils import DPSyncState
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionView
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 
@@ -87,23 +84,24 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
     @torch.inference_mode()
     def propose(
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        last_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
+        execution_view: DraftExecutionView,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         last_sampled: torch.Tensor,
         next_prefill_tokens: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        input_batch = execution_view.global_batch
+        attn_metadata = execution_view.attn_metadata
+        slot_mappings = execution_view.slot_mappings
+        last_hidden_states = execution_view.last_hidden_states
+        aux_hidden_states = execution_view.aux_hidden_states
+        dp_sync = execution_view.dp_sync
         del (
             last_hidden_states,
             num_sampled,
@@ -128,6 +126,8 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
                 f"Expected {self.num_hidden_states} auxiliary hidden states, "
                 f"got {len(aux_hidden_states)}"
             )
+        assert attn_metadata is not None
+        assert slot_mappings is not None
 
         stacked_hidden_states = torch.stack(aux_hidden_states, dim=1)
         num_tokens = stacked_hidden_states.shape[0]

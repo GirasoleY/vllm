@@ -2738,6 +2738,16 @@ class VllmConfig:
             )
 
     def _validate_v1_model_runner(self) -> None:
+        if self.speculative_config is not None:
+            draft_parallelism = self.speculative_config.draft_parallel_config
+            if draft_parallelism is not None and (
+                draft_parallelism.prefill_context_parallel_size is not None
+                or draft_parallelism.decode_context_parallel_size is not None
+            ):
+                raise ValueError(
+                    "Draft PCP/DCP policy requires Model Runner V2; Model "
+                    "Runner V1 would otherwise ignore these fields."
+                )
         unsupported = self._get_v1_model_runner_unsupported_features()
         if unsupported:
             raise ValueError(

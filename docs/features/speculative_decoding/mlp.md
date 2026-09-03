@@ -15,7 +15,7 @@ llm = LLM(
     tensor_parallel_size=1,
     speculative_config={
         "model": "ibm-ai-platform/llama3-8b-accelerator",
-        "draft_tensor_parallel_size": 1,
+        "draft_parallel_config": {"tensor_parallel_size": 1},
         "method": "mlp_speculator",
     },
 )

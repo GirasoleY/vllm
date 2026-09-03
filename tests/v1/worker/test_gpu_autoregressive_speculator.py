@@ -5,9 +5,11 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
+from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.model_executor.models.exaone4_5_mtp import Exaone4_5_MTP
@@ -24,6 +26,10 @@ from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
+)
+from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionView
+from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import (
+    speculator as multi_module_spec_module,
 )
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
@@ -115,14 +121,19 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
         hf_config=hf_config,
         get_hidden_size=lambda: 64,
         get_vocab_size=lambda: 32,
+        verify_with_parallel_config=lambda _: None,
     )
     speculative_config = SimpleNamespace(
         method="mtp",
         num_speculative_tokens=3,
         draft_model_config=draft_model_config,
+        draft_parallel_config=None,
+        draft_worker_parallel_config=None,
         use_local_argmax_reduction=False,
         draft_sample_method="greedy",
     )
+    parallel_config = ParallelConfig(distributed_executor_backend="mp")
+    speculative_config.draft_worker_parallel_config = parallel_config
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
         scheduler_config=SimpleNamespace(
@@ -134,10 +145,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
             dtype=torch.float32,
             use_fp64_gumbel=False,
         ),
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank=0,
-        ),
+        parallel_config=parallel_config,
     )
 
     speculator = _TestSpeculator(vllm_config, torch.device("cpu"))
@@ -278,6 +286,68 @@ def test_multi_module_mm_support_configured_after_model_load(monkeypatch):
     assert speculator.inputs_embeds.shape == (4, 3)
     assert speculator.cached_draft_input_embeds is not None
     assert speculator.cached_draft_input_embeds.shape == (2, 2, 3)
+
+
+def test_multi_module_dummy_skip_uses_empty_attention_bundle(monkeypatch):
+    speculator = object.__new__(MultiModuleMTPSpeculator)
+    speculator.max_model_len = 16
+    speculator._copy_request_inputs = Mock()
+    speculator.input_buffers = SimpleNamespace(
+        query_start_loc=torch.zeros(2, dtype=torch.int32)
+    )
+    speculator._prepare_inputs = Mock()
+    speculator.cudagraph_manager = object()
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator._prepare_eplb_forward = Mock()
+    speculator._generate_drafts = Mock()
+    speculator.draft_tokens = torch.zeros((1, 1), dtype=torch.int64)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        seq_lens_cpu_upper_bound=torch.tensor([1], dtype=torch.int32),
+        idx_mapping=torch.tensor([0]),
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_np=np.array([0, 1], dtype=np.int32),
+        has_prefill=False,
+    )
+    execution_view = DraftExecutionView(  # type: ignore[arg-type]
+        global_batch=input_batch,
+        model_batch=input_batch,
+        last_hidden_states=torch.zeros((1, 1)),
+        aux_hidden_states=None,
+        attn_metadata=None,
+        slot_mappings=None,
+        dp_sync=None,
+    )
+    monkeypatch.setattr(
+        multi_module_spec_module,
+        "dispatch_cg_and_sync_dp",
+        lambda *_args, **_kwargs: (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=1,
+                num_reqs=1,
+            ),
+            None,
+        ),
+    )
+
+    speculator.propose(
+        execution_view=execution_view,
+        num_sampled=torch.ones(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+        last_sampled=torch.zeros((1, 1), dtype=torch.int64),
+        next_prefill_tokens=torch.zeros((1, 1), dtype=torch.int64),
+        temperature=torch.zeros(1),
+        seeds=torch.zeros(1, dtype=torch.int64),
+        dummy_run=True,
+        skip_attn_for_dummy_run=True,
+    )
+
+    assert speculator._generate_drafts.call_args.args[2:4] == (None, None)
 
 
 @pytest.mark.parametrize(

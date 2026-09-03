@@ -84,13 +84,33 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
 | `method` | `string` | `None` | Speculation method. Common values include `draft_model`, `ngram`, `suffix`, `mtp`, `eagle3`, and `dflash`. If omitted, vLLM infers the method from the provided configuration when possible. |
 | `model` | `string` | `None` | Draft model, EAGLE head, or auxiliary model identifier. For `ngram`, `ngram_gpu`, `suffix`, and `mtp`, this can often be omitted. |
 | `num_speculative_tokens` | `integer > 0` | `None` | Number of speculative tokens to propose per step. Required for methods that do not infer it from model metadata. |
-| `draft_tensor_parallel_size` | `integer >= 1` | `None` | Tensor parallel size for the draft model. |
+| `draft_parallel_config` | `object` | `None` | Requested draft parallelism policy. Supports `tensor_parallel_size`, `prefill_context_parallel_size`, and `decode_context_parallel_size`; each may be 1, the corresponding target size, or omitted for the method default. |
+| `draft_tensor_parallel_size` | `integer >= 1` | `None` | Deprecated alias for `draft_parallel_config.tensor_parallel_size`. |
 | `max_model_len` | `integer >= 1` | `None` | Maximum context length for the draft model. |
 | `parallel_drafting` | `boolean` | `false` | Enable parallel draft token generation. Only compatible with EAGLE and draft-model methods. |
 | `rejection_sample_method` | `string` | `standard` | `standard`, `synthetic`, or `block`. |
 | `synthetic_acceptance_rates` | `list[float]` | `None` | Per-position unconditional acceptance rates for `synthetic` rejection sampling. Each entry in `[0, 1]`; length must equal `num_speculative_tokens`; must be non-increasing. |
 | `synthetic_acceptance_length` | `float` | `None` | Target mean acceptance length for `synthetic`; in `[1, num_speculative_tokens + 1]`. Mutually exclusive with `synthetic_acceptance_rates`. |
 | `use_heterogeneous_vocab` | `boolean` | `false` | Allow draft and target models with different vocabularies. Builds a token-level intersection at initialisation and constrains draft logits to shared tokens only. Only compatible with `method=draft_model`. Probabilistic draft sampling (`draft_sample_method='probabilistic'`) is not yet supported when this option is enabled. |
+
+#### Draft parallelism policy
+
+`draft_parallel_config` is a narrow request policy, not a second
+`ParallelConfig`. It accepts only TP, PCP, and DCP. An explicitly supplied
+dimension must be either `1` (replicated on that target-parallel axis) or the
+corresponding target size. vLLM resolves omitted values only after selecting
+the concrete draft implementation and rejects combinations that implementation
+cannot execute.
+
+The resolved execution contract governs logical token layouts and the
+metadata, slot mappings, and block-table views used to address KV cache. It
+does not assign physical KV-cache ownership: allocation and per-layer sharing
+remain properties of the concrete model and speculator.
+
+This change introduces the policy and execution contract only. No integrated
+GPU speculator currently advertises PCP support, and draft DCP topology changes
+are also rejected. Follow-up implementations can opt in only after validating
+their data-layout, metadata, DP synchronization, and KV-layout requirements.
 
 !!! note
     Gemma 4 assistant checkpoints are handled as Gemma 4 MTP speculators, not
@@ -164,7 +184,7 @@ vllm serve <target-model> \
 
   llm = LLM(
       model="Qwen/Qwen3-8B",
-      speculative_config={                               
+      speculative_config={
           "method": "draft_model",
           "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
           "num_speculative_tokens": 3,
@@ -178,13 +198,14 @@ vllm serve <target-model> \
 
 - `--speculative-config` expects a JSON object on the CLI. In YAML config
   files, use a nested mapping instead of an escaped JSON string.
-- `tensor_parallel_size` is not a valid key in `speculative_config`. Use
-  `draft_tensor_parallel_size` instead.
+- Top-level `tensor_parallel_size` is not a valid key in `speculative_config`.
+  Use `draft_parallel_config.tensor_parallel_size` instead.
 - Keys such as `temperature` and `top_p` are sampling parameters, not
   `--speculative-config` fields.
 - Internal fields such as `target_model_config`, `draft_model_config`,
-  `target_parallel_config`, `draft_parallel_config`, and `draft_load_config`
-  are populated by vLLM and are not intended to be set by users.
+  `target_parallel_config`, `draft_worker_parallel_config`, and
+  `draft_load_config` are populated by vLLM and are not intended to be set by
+  users.
 - `use_heterogeneous_vocab` currently supports greedy draft sampling only. Probabilistic acceptance (temperature > 0 draft sampling) is not yet supported and will be added in a future release.
 
 ## Lossless guarantees of Speculative Decoding

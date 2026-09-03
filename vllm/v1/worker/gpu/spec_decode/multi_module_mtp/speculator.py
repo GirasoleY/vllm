@@ -12,12 +12,17 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftAttentionMetadataPolicy,
+    DraftExecutionCapabilities,
+    DraftExecutionView,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
@@ -25,6 +30,12 @@ logger = init_logger(__name__)
 
 
 class MultiModuleMTPSpeculator(DraftModelSpeculator):
+    @classmethod
+    def draft_execution_capabilities(cls) -> DraftExecutionCapabilities:
+        return DraftExecutionCapabilities(
+            initial_attention_metadata_policy=DraftAttentionMetadataPolicy.ALWAYS_DRAFT,
+        )
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
@@ -131,13 +142,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
     @torch.inference_mode()
     def propose(
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        # [num_tokens, hidden_size]
-        last_hidden_states: torch.Tensor,
-        # num_layers x [num_tokens, hidden_size]
-        aux_hidden_states: list[torch.Tensor] | None,
+        execution_view: DraftExecutionView,
         # [num_reqs]
         num_sampled: torch.Tensor,
         # [num_reqs]
@@ -150,12 +155,16 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        input_batch = execution_view.global_batch
+        last_hidden_states = execution_view.last_hidden_states
+        dp_sync = execution_view.dp_sync
+        attn_metadata = execution_view.attn_metadata
+        slot_mappings = execution_view.slot_mappings
         num_reqs = input_batch.num_reqs
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()

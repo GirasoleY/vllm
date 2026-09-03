@@ -19,11 +19,16 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot
-from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftAttentionMetadataPolicy,
+    DraftExecutionCapabilities,
+    DraftExecutionView,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
@@ -33,6 +38,13 @@ logger = init_logger(__name__)
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+
+    @classmethod
+    def draft_execution_capabilities(cls) -> DraftExecutionCapabilities:
+        return DraftExecutionCapabilities(
+            initial_attention_metadata_policy=DraftAttentionMetadataPolicy.ALWAYS_DRAFT,
+            reuses_target_dp_sync=False,
+        )
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -287,6 +299,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         causal: bool | Mapping[int, bool] = False,
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
@@ -301,18 +314,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=causal,
             query_start_loc_np=query_start_loc_np,
             dcp_local_seq_lens=dcp_local_seq_lens,
+            is_prefilling=is_prefilling,
         )
 
     @torch.inference_mode()
     def propose(
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        # [num_tokens, hidden_size]
-        last_hidden_states: torch.Tensor,
-        # num_layers x [num_tokens, hidden_size]
-        aux_hidden_states: list[torch.Tensor] | None,
+        execution_view: DraftExecutionView,
         # [num_reqs]
         num_sampled: torch.Tensor,
         # [num_reqs]
@@ -325,12 +333,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        input_batch = execution_view.global_batch
+        last_hidden_states = execution_view.last_hidden_states
+        aux_hidden_states = execution_view.aux_hidden_states
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -362,13 +372,24 @@ class DFlashSpeculator(DraftModelSpeculator):
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)
+            _, query_batch_sync = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=True,
+            )
             self._generate_draft(
                 num_reqs,
                 num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
                 num_tokens_across_dp=(
-                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                    query_batch_sync.num_tokens_across_dp
+                    if query_batch_sync is not None
+                    else None
                 ),
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )

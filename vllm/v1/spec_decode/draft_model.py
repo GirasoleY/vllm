@@ -69,12 +69,13 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # To prevent this error, we assert that both TP sizes must be the same.
         spec_cfg = self.speculative_config
         tgt_tp = spec_cfg.target_parallel_config.tensor_parallel_size
-        draft_tp = spec_cfg.draft_parallel_config.tensor_parallel_size
+        draft_tp = spec_cfg.draft_worker_parallel_config.tensor_parallel_size
         if draft_tp != tgt_tp:
             raise ValueError(
-                f"Currently, 'draft_tensor_parallel_size' and 'tensor_parallel_size' "
-                f"must be the same. Got {draft_tp} and {tgt_tp}. "
-                "Please pass 'draft_tensor_parallel_size' in the speculative_config."
+                "Currently, draft and target tensor-parallel sizes must be the "
+                f"same. Got {draft_tp} and {tgt_tp}. Set "
+                "'draft_parallel_config.tensor_parallel_size' in the "
+                "speculative_config."
             )
 
     @override
@@ -86,7 +87,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             base,
             quant_config=None,
             parallel_config=replace(
-                spec.draft_parallel_config,
+                spec.draft_worker_parallel_config,
                 rank=self.vllm_config.parallel_config.rank,
             ),
             model_config=spec.draft_model_config,

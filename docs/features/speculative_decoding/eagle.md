@@ -15,7 +15,7 @@ llm = LLM(
     tensor_parallel_size=4,
     speculative_config={
         "model": "yuhuili/EAGLE-LLaMA3-Instruct-8B",
-        "draft_tensor_parallel_size": 1,
+        "draft_parallel_config": {"tensor_parallel_size": 4},
         "num_speculative_tokens": 2,
         "method": "eagle",
     },
@@ -28,6 +28,11 @@ for output in outputs:
     generated_text = output.outputs[0].text
     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 ```
+
+The integrated Model Runner V2 EAGLE implementation currently requires draft
+TP to match target TP, so both values are `4` in this example. The nested
+`draft_parallel_config` is the public place to request draft TP/PCP/DCP policy;
+it does not expose the target's full internal parallel configuration.
 
 ## Eagle3 Drafter Example
 
@@ -42,7 +47,7 @@ llm = LLM(
     tensor_parallel_size=2,
     speculative_config={
         "model": "RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3",
-        "draft_tensor_parallel_size": 2,
+        "draft_parallel_config": {"tensor_parallel_size": 2},
         "num_speculative_tokens": 2,
         "method": "eagle3",
     },

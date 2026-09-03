@@ -8,7 +8,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import (
+    DraftParallelismConfig,
+    SpeculativeConfig,
+    VllmConfig,
+    get_layers_from_vllm_config,
+    replace,
+)
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
@@ -22,10 +28,14 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.dp_utils import DPSyncState
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftExecutionCapabilities,
+    DraftExecutionPlan,
+    DraftExecutionView,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -56,13 +66,7 @@ class BaseSpeculator(ABC):
     @abstractmethod
     def propose(
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        # [num_tokens, hidden_size]
-        last_hidden_states: torch.Tensor,
-        # num_layers x [num_tokens, hidden_size]
-        aux_hidden_states: list[torch.Tensor] | None,
+        execution_view: DraftExecutionView,
         # [num_reqs]
         num_sampled: torch.Tensor,
         # [num_reqs]
@@ -75,7 +79,6 @@ class BaseSpeculator(ABC):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
@@ -85,12 +88,53 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
+    @classmethod
+    def draft_execution_capabilities(cls) -> DraftExecutionCapabilities:
+        return DraftExecutionCapabilities()
+
+    @classmethod
+    def resolve_draft_execution_plan(
+        cls, vllm_config: VllmConfig
+    ) -> DraftExecutionPlan:
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        worker_parallel_config = speculative_config.draft_worker_parallel_config
+        assert worker_parallel_config is not None
+        draft_parallelism = (
+            speculative_config.draft_parallel_config or DraftParallelismConfig()
+        )
+        return DraftExecutionPlan.resolve(
+            target_parallel_config=vllm_config.parallel_config,
+            draft_worker_parallel_config=worker_parallel_config,
+            draft_parallelism=draft_parallelism,
+            capabilities=cls.draft_execution_capabilities(),
+            implementation_name=cls.__name__,
+        )
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        target_parallel_config = vllm_config.parallel_config
+        self.execution_plan = type(self).resolve_draft_execution_plan(vllm_config)
+        draft_runtime_parallel_config = (
+            self.execution_plan.derive_runtime_parallel_config(target_parallel_config)
+        )
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        assert speculative_config.draft_model_config is not None
+        self.speculative_config: SpeculativeConfig = speculative_config
+        # Validate the exact configuration used below to construct the
+        # integrated drafter. In particular, inherited EP/EPLB/DP settings
+        # must not bypass draft-model validation when only TP/PCP/DCP change.
+        self.speculative_config.draft_model_config.verify_with_parallel_config(
+            draft_runtime_parallel_config
+        )
+        if draft_runtime_parallel_config is not target_parallel_config:
+            vllm_config = replace(
+                vllm_config,
+                parallel_config=draft_runtime_parallel_config,
+            )
         self.vllm_config = vllm_config
         self.device = device
 
-        assert vllm_config.speculative_config is not None
-        self.speculative_config = vllm_config.speculative_config
         self.method = self.speculative_config.method
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
@@ -259,6 +303,7 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -326,6 +371,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            is_prefilling=is_prefilling,
         )
         return attn_metadata
 
