@@ -27,7 +27,10 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_mod
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
-from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionView
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftAttentionMetadataSource,
+    DraftExecutionView,
+)
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import (
     speculator as multi_module_spec_module,
 )
@@ -108,6 +111,49 @@ def _make_speculator(
     speculator.hidden_states = torch.zeros(4, 3)
     speculator.model = _DraftModel(output)
     return speculator
+
+
+@pytest.mark.parametrize(
+    ("attention_metadata_source", "uses_draft_resources"),
+    [
+        (DraftAttentionMetadataSource.TARGET, False),
+        (DraftAttentionMetadataSource.DRAFT, True),
+    ],
+)
+def test_prefill_capture_matches_runtime_attention_owner(
+    attention_metadata_source: DraftAttentionMetadataSource,
+    uses_draft_resources: bool,
+):
+    speculator = object.__new__(_TestSpeculator)
+    speculator.last_token_indices = torch.ones(2, dtype=torch.int64)
+    speculator.idx_mapping = torch.ones(2, dtype=torch.int32)
+    speculator.max_num_reqs = 2
+    speculator.num_speculative_steps = 1
+    speculator.execution_plan = SimpleNamespace(
+        initial=SimpleNamespace(attention_metadata_source=attention_metadata_source)
+    )
+    speculator.input_buffers = draft_buffers = object()
+    speculator.target_input_buffers = target_buffers = object()
+    speculator.attn_groups = draft_attn_groups = object()
+    speculator.target_attn_groups = target_attn_groups = object()
+    speculator.model_state = object()
+    speculator.block_tables = object()
+    speculator.kv_cache_config = object()
+    speculator.on_prefill_begin = Mock()
+    speculator.on_prefill_end = Mock()
+    manager = Mock()
+    manager.use_breakable_cg = False
+    speculator.prefill_cudagraph_manager = manager
+
+    speculator.capture()
+
+    capture_args = manager.capture.call_args.args
+    assert capture_args[2] is (
+        draft_buffers if uses_draft_resources else target_buffers
+    )
+    assert capture_args[4] is (
+        draft_attn_groups if uses_draft_resources else target_attn_groups
+    )
 
 
 @pytest.mark.parametrize(("hc_mult", "expected"), [(None, 64), (4, 256)])

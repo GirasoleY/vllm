@@ -12,7 +12,9 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.execution import (
     DraftAttentionMetadataPolicy,
     DraftAttentionMetadataSource,
@@ -26,6 +28,7 @@ from vllm.v1.worker.gpu.spec_decode.execution import (
 from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
     ExtractHiddenStatesSpeculator,
 )
+from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import Gemma4Speculator
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
@@ -104,7 +107,13 @@ def test_replicated_plan_cannot_reuse_target_local_dp_sync():
 
     assert plan.pcp_mode == DraftPCPMode.REPLICATED
     assert plan.initial.input_layout == DraftBatchLayout.PCP_GLOBAL
+    assert plan.initial.model_output_layout == DraftBatchLayout.PCP_GLOBAL
+    assert plan.initial.result_layout == DraftBatchLayout.PCP_GLOBAL
+    assert plan.initial.attention_metadata_source == DraftAttentionMetadataSource.DRAFT
+    assert plan.initial.block_table_layout == DraftBatchLayout.PCP_GLOBAL
     assert not plan.initial.reuses_target_dp_sync
+    assert not plan.initial.restores_output
+    assert plan.uses_replicated_pcp
 
 
 def test_plan_requires_explicit_target_local_kv_capability():
@@ -172,19 +181,26 @@ def test_effective_worker_tp_rejects_intermediate_size_when_policy_is_omitted():
         )
 
 
-def test_concrete_speculators_do_not_advertise_pcp_support():
-    classes = (
+def test_only_end_to_end_supported_speculators_advertise_replicated_pcp():
+    unsupported_classes = (
         AutoRegressiveSpeculator,
         DFlashSpeculator,
-        DSparkSpeculator,
+        DFlash2Speculator,
+        EagleSpeculator,
         ExtractHiddenStatesSpeculator,
-        MTPSpeculator,
+        Gemma4Speculator,
         MultiModuleMTPSpeculator,
     )
 
-    for speculator_cls in classes:
+    for speculator_cls in unsupported_classes:
         capabilities = speculator_cls.draft_execution_capabilities()
         assert not capabilities.supports_replicated_pcp
+        assert not capabilities.supports_target_local_initial
+        assert not capabilities.supports_target_local_kv_layout
+
+    for speculator_cls in (DSparkSpeculator, MTPSpeculator):
+        capabilities = speculator_cls.draft_execution_capabilities()
+        assert capabilities.supports_replicated_pcp
         assert not capabilities.supports_target_local_initial
         assert not capabilities.supports_target_local_kv_layout
 
@@ -194,8 +210,23 @@ def test_concrete_speculators_do_not_advertise_pcp_support():
     )
 
 
+@pytest.mark.parametrize("speculator_cls", [DSparkSpeculator, MTPSpeculator])
+def test_supported_speculators_default_to_replicated_pcp(speculator_cls):
+    plan = DraftExecutionPlan.resolve(
+        target_parallel_config=_parallel_config(pcp=2),
+        draft_worker_parallel_config=_parallel_config(),
+        draft_parallelism=DraftParallelismConfig(),
+        capabilities=speculator_cls.draft_execution_capabilities(),
+        implementation_name=speculator_cls.__name__,
+    )
+
+    assert plan.pcp_mode == DraftPCPMode.REPLICATED
+    assert plan.topology.prefill_context_parallel_size == 1
+
+
 def test_draft_owned_implementations_declare_metadata_and_dp_contract():
     dflash = DFlashSpeculator.draft_execution_capabilities()
+    dspark = DSparkSpeculator.draft_execution_capabilities()
     multi_module = MultiModuleMTPSpeculator.draft_execution_capabilities()
 
     assert (
@@ -203,6 +234,11 @@ def test_draft_owned_implementations_declare_metadata_and_dp_contract():
         == DraftAttentionMetadataPolicy.ALWAYS_DRAFT
     )
     assert not dflash.reuses_target_dp_sync
+    assert (
+        dspark.initial_attention_metadata_policy
+        == DraftAttentionMetadataPolicy.ALWAYS_DRAFT
+    )
+    assert not dspark.reuses_target_dp_sync
     assert (
         multi_module.initial_attention_metadata_policy
         == DraftAttentionMetadataPolicy.ALWAYS_DRAFT

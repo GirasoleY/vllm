@@ -67,6 +67,28 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## PCP replicated execution
+
+For a PCP target, the standard MTP implementation defaults its draft PCP size
+to `1` and runs replicated over the global batch on every PCP rank. Specialized
+Gemma 4 and multi-module MTP implementations do not yet support this path. You
+can request the standard MTP policy explicitly:
+
+```bash
+vllm serve <mtp-model> \
+    --tensor-parallel-size 2 \
+    --prefill-context-parallel-size 2 \
+    --speculative-config '{
+        "method":"mtp",
+        "num_speculative_tokens":1,
+        "draft_parallel_config":{"prefill_context_parallel_size":1}
+    }'
+```
+
+Setting the draft PCP size to the target PCP size is not yet supported. This
+path requires Model Runner V2 and has the limitations listed in the
+[draft parallelism policy](README.md#draft-parallelism-policy).
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.

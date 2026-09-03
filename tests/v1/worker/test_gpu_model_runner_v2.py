@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.execution import (
     DraftAttentionMetadataSource,
     DraftBatchLayout,
 )
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 
 @pytest.mark.parametrize("is_kv_producer", [False, True])
@@ -124,6 +125,108 @@ def test_prepare_identity_draft_execution_view_rejects_non_global_plan():
             {},
             None,
         )
+
+
+def test_replicated_pcp_view_restores_mtp_seed_and_owns_metadata():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    local_mtp_hidden = torch.arange(6).reshape(2, 3)
+    global_mtp_hidden = torch.arange(12).reshape(4, 3)
+    restored = []
+    runner.model = SimpleNamespace(
+        get_mtp_target_hidden_states=lambda: local_mtp_hidden
+    )
+
+    def restore_hidden_state_buffer(hidden):
+        restored.append(hidden)
+        return global_mtp_hidden
+
+    runner.pcp_manager = SimpleNamespace(
+        restore_hidden_state_buffer=restore_hidden_state_buffer
+    )
+    speculator = object.__new__(MTPSpeculator)
+    speculator.execution_plan = SimpleNamespace(
+        initial=SimpleNamespace(
+            input_layout=DraftBatchLayout.PCP_GLOBAL,
+            attention_metadata_source=DraftAttentionMetadataSource.DRAFT,
+            reuses_target_dp_sync=False,
+        )
+    )
+    runner.speculator = speculator
+
+    batch = SimpleNamespace(num_tokens_after_padding=4)
+    global_hidden = torch.zeros(4, 3)
+    global_aux = [torch.ones(4, 3)]
+    view = runner._prepare_draft_execution_view(  # type: ignore[arg-type]
+        batch,
+        global_hidden,
+        global_aux,
+        {"target": object()},
+        {"target": torch.arange(2)},
+        object(),  # type: ignore[arg-type]
+        restore_pcp_hidden_states=True,
+    )
+
+    assert view is not None
+    assert view.global_batch is batch
+    assert view.model_batch is batch
+    torch.testing.assert_close(view.last_hidden_states, global_mtp_hidden)
+    assert view.aux_hidden_states is global_aux
+    assert view.attn_metadata is None
+    assert view.slot_mappings is None
+    assert view.dp_sync is None
+    assert view.token_layout is None
+    assert len(restored) == 1
+    assert restored[0] is local_mtp_hidden
+
+
+@pytest.mark.parametrize("is_partitioned", [False, True])
+def test_restore_pcp_outputs_handles_real_and_synthetic_batches(is_partitioned: bool):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    local_batch = SimpleNamespace()
+    global_batch = SimpleNamespace()
+    local_hidden = torch.zeros(2, 3)
+    global_hidden = torch.zeros(4, 3)
+    local_aux = torch.ones(2, 3)
+    global_aux = torch.ones(4, 3)
+    restored_rows = []
+
+    def restore_hidden_states(hidden):
+        restored_rows.append(hidden)
+        if hidden is local_hidden:
+            return global_hidden
+        if hidden is local_aux:
+            return global_aux
+        raise AssertionError("unexpected hidden-state buffer")
+
+    runner.pcp_manager = SimpleNamespace(
+        is_partitioned_batch=lambda batch: is_partitioned and batch is local_batch,
+        restore_for_sampling=lambda hidden: (
+            restore_hidden_states(hidden),
+            global_batch,
+        ),
+        restore_hidden_states=restore_hidden_states,
+    )
+
+    batch, hidden, aux, restored = runner._restore_pcp_outputs(
+        local_batch,  # type: ignore[arg-type]
+        local_hidden,
+        [local_aux],
+    )
+
+    if is_partitioned:
+        assert batch is global_batch
+        assert hidden is global_hidden
+        assert aux is not None and aux[0] is global_aux
+        assert restored
+        assert len(restored_rows) == 2
+        assert restored_rows[0] is local_hidden
+        assert restored_rows[1] is local_aux
+    else:
+        assert batch is local_batch
+        assert hidden is local_hidden
+        assert aux is not None and aux[0] is local_aux
+        assert not restored
+        assert restored_rows == []
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

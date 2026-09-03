@@ -1,10 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.v1.worker.cp_utils as cp_utils
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
+from vllm.v1.worker.cp_utils import (
+    check_attention_cp_compatibility,
+    should_skip_dcp_context_attention,
+)
+
+
+def test_draft_layer_is_validated_against_effective_dcp_config(monkeypatch):
+    draft_layer = SimpleNamespace(
+        impl=SimpleNamespace(need_to_return_lse_for_decode=False)
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": draft_layer},
+    )
+    draft_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=object(),
+    )
+
+    with pytest.raises(AssertionError, match="Decode Context Parallelism"):
+        check_attention_cp_compatibility(draft_config, layer_names={"draft"})
 
 
 def test_skip_gate_only_for_zero_context():

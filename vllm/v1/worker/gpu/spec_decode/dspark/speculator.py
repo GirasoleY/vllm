@@ -33,12 +33,24 @@ from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.execution import (
+    DraftAttentionMetadataPolicy,
+    DraftExecutionCapabilities,
+)
 
 logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
+
+    @classmethod
+    def draft_execution_capabilities(cls) -> DraftExecutionCapabilities:
+        return DraftExecutionCapabilities(
+            initial_attention_metadata_policy=DraftAttentionMetadataPolicy.ALWAYS_DRAFT,
+            reuses_target_dp_sync=False,
+            supports_replicated_pcp=True,
+        )
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)

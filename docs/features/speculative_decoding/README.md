@@ -107,10 +107,21 @@ metadata, slot mappings, and block-table views used to address KV cache. It
 does not assign physical KV-cache ownership: allocation and per-layer sharing
 remain properties of the concrete model and speculator.
 
-This change introduces the policy and execution contract only. No integrated
-GPU speculator currently advertises PCP support, and draft DCP topology changes
-are also rejected. Follow-up implementations can opt in only after validating
-their data-layout, metadata, DP synchronization, and KV-layout requirements.
+Integrated drafting stays on the target worker processes and process groups.
+Selecting replicated PCP changes the draft token and attention layout; it does
+not require expert weights already sharded over the target PCP group to become
+physically replicated.
+
+The standard MTP implementation and DSpark support replicated drafting for a
+PCP target and default draft PCP to `1`. Specialized Gemma 4 and multi-module
+MTP paths do not yet opt in. Other implementations also reject PCP, and
+selecting the target PCP size for sharded drafting is not yet supported. Draft
+DCP topology changes are also rejected.
+
+Current speculative PCP support is limited to the standard MTP implementation
+and DSpark on MLA targets. MTP requires dense MLA; DSpark may use sparse MLA.
+PCP speculative decoding does not yet support PP, DCP, multimodal inputs, LoRA,
+adaptive verification, or FULL CUDA graphs.
 
 !!! note
     Gemma 4 assistant checkpoints are handled as Gemma 4 MTP speculators, not

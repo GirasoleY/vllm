@@ -7,10 +7,15 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.execution import DraftExecutionCapabilities
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+
+    @classmethod
+    def draft_execution_capabilities(cls) -> DraftExecutionCapabilities:
+        return DraftExecutionCapabilities(supports_replicated_pcp=True)
 
     def load_draft_model(
         self,

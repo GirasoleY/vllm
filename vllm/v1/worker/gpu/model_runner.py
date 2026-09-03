@@ -662,8 +662,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
         )
-        check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
+            assert target_attn_layer_names is not None
+            check_attention_cp_compatibility(
+                self.vllm_config,
+                layer_names=target_attn_layer_names,
+            )
+            check_attention_cp_compatibility(
+                self.speculator.vllm_config,
+                layer_names=self.speculator.draft_attn_layer_names,
+            )
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state,
@@ -672,6 +680,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 self.attn_groups,
             )
+        else:
+            check_attention_cp_compatibility(self.vllm_config)
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
@@ -711,6 +721,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         attn_metadata: dict[str, Any] | None,
         slot_mappings_by_layer: dict[str, torch.Tensor] | None,
         dp_sync: DPSyncState | None,
+        *,
+        restore_pcp_hidden_states: bool = False,
     ) -> DraftExecutionView | None:
         """Bind target outputs to the identity draft-execution contract."""
         if self.speculator is None:
@@ -732,6 +744,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 raise RuntimeError(
                     "The target model did not retain the hidden states required "
                     "by its MTP drafter."
+                )
+            if restore_pcp_hidden_states:
+                assert self.pcp_manager is not None
+                mtp_target_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
+                    mtp_target_hidden_states
                 )
             draft_hidden_states = mtp_target_hidden_states[
                 : target_hidden_states.shape[0]
@@ -760,6 +777,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             dp_sync=dp_sync if reuses_target_dp_sync else None,
         )
+
+    def _restore_pcp_outputs(
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> tuple[InputBatch, torch.Tensor, list[torch.Tensor] | None, bool]:
+        """Restore a rank-local target result to its PCP-global row layout."""
+        manager = self.pcp_manager
+        if manager is None or not manager.is_partitioned_batch(input_batch):
+            return input_batch, hidden_states, aux_hidden_states, False
+
+        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+            manager, hidden_states, input_batch
+        )
+        if aux_hidden_states is not None:
+            aux_hidden_states = [
+                manager.restore_hidden_states(hidden) for hidden in aux_hidden_states
+            ]
+        return input_batch, hidden_states, aux_hidden_states, True
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -849,9 +886,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
+        assert hidden_states is not None  # Last PP rank always has hidden_states
+        input_batch, hidden_states, aux_hidden_states, restored_pcp = (
+            self._restore_pcp_outputs(
+                input_batch,
+                hidden_states,
+                aux_hidden_states,
+            )
+        )
+
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
-            assert hidden_states is not None
             assert self.sampler is not None
             execution_view = self._prepare_draft_execution_view(
                 input_batch,
@@ -860,6 +905,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 attn_metadata,
                 slot_mappings_by_layer,
                 dp_sync,
+                restore_pcp_hidden_states=restored_pcp,
             )
             assert execution_view is not None
             self.step_timing.drafter_start()
@@ -894,7 +940,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             self.step_timing.drafter_end()
 
-        assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -1933,8 +1978,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
-        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            self.pcp_manager, hidden_states, input_batch
+        assert hidden_states is not None
+        input_batch, hidden_states, aux_hidden_states, restored_pcp = (
+            self._restore_pcp_outputs(
+                input_batch,
+                hidden_states,
+                aux_hidden_states,
+            )
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -2014,6 +2064,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 attn_metadata,
                 slot_mappings_by_layer,
                 dp_sync,
+                restore_pcp_hidden_states=restored_pcp,
             )
             assert execution_view is not None
             with use_workspace_lane(self._draft_workspace_lane):
