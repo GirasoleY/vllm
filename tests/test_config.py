@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import json
 import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import patch
 
 import pydantic
@@ -388,18 +388,29 @@ def test_dsa_models_select_matching_mtp(model_type, expected_architecture):
     assert hf_config.architectures == [expected_architecture]
 
 
-def test_v2_model_runner_supports_extract_hidden_states():
-    config = VllmConfig()
-    config.speculative_config = cast(
-        SpeculativeConfig,
-        SimpleNamespace(
+@pytest.mark.skip_global_cleanup
+def test_v2_model_runner_draft_parallelism_support():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(),
+        parallel_config=ParallelConfig(),
+        speculative_config=SimpleNamespace(
             method="extract_hidden_states",
             parallel_drafting=False,
-            enable_adaptive_verification=False,
+            has_independent_draft_parallelism=lambda: False,
         ),
+        model_config=None,
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+    )
+    config._get_v2_model_runner_unsupported_features = lambda: (
+        VllmConfig._get_v2_model_runner_unsupported_features(config)
     )
 
     assert config._get_v2_model_runner_unsupported_features() == []
+    config.speculative_config.method = "mtp"
+    config.speculative_config.has_independent_draft_parallelism = lambda: True
+    assert config._get_v2_model_runner_unsupported_features() == [
+        "independent draft TP/PCP/DCP topology"
+    ]
 
 
 def test_dflash2_draft_forces_v2_model_runner():
@@ -734,6 +745,7 @@ def test_models_default_to_v2_model_runner(model_config, expected, monkeypatch):
     assert VllmConfig.use_v2_model_runner.fget(config) is expected
 
 
+@pytest.mark.skip_global_cleanup
 def test_v1_model_runner_rejects_v2_only_features():
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -750,6 +762,15 @@ def test_v1_model_runner_rejects_v2_only_features():
     )
 
     with pytest.raises(ValueError, match="prefill context parallel"):
+        VllmConfig._validate_v1_model_runner(config)
+
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        enable_adaptive_verification=False,
+        has_independent_draft_parallelism=lambda: True,
+    )
+    with pytest.raises(ValueError, match="independent draft TP/PCP/DCP topology"):
         VllmConfig._validate_v1_model_runner(config)
 
 
@@ -2355,7 +2376,45 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "draft_parallel_config",
+    [ParallelConfig(tensor_parallel_size=2), {"tensor_parallel_size": "2"}],
+)
+def test_draft_parallel_config_rejects_conflicting_legacy_tp(
+    draft_parallel_config,
+):
+    with pytest.raises(ValueError, match="conflicts"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_parallel_config=draft_parallel_config,
+            draft_tensor_parallel_size=1,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_config_validates_positional_input():
+    with pytest.raises(ValueError, match="unsupported fields: enable_dbo"):
+        SpeculativeConfig(
+            None,
+            1,
+            None,
+            "mtp",
+            {"enable_dbo": False},  # type: ignore
+        )
+    with pytest.raises(ValueError, match="not supported"):
+        SpeculativeConfig(
+            None,
+            1,
+            None,
+            "ngram",
+            {"prefill_context_parallel_size": 1},  # type: ignore
+        )
+
+
 @patch("vllm.config.speculative.ModelConfig")
+@pytest.mark.skip_global_cleanup
 def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     """Regression test: MTP + runai_streamer should use model_weights (original
     S3 URL) for the draft model, not model (local cache dir set by
@@ -2370,6 +2429,7 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     mock_draft.hf_config.model_type = "deepseek_mtp"
     mock_draft.hf_config.n_predict = None
     mock_draft.max_model_len = 4096
+    mock_draft.is_moe = False
     mock_model_config_cls.return_value = mock_draft
 
     target_config = MagicMock()
@@ -2379,15 +2439,133 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     target_config.quantization = None
     target_config.max_model_len = 4096
 
-    SpeculativeConfig(
-        method="mtp",
-        num_speculative_tokens=1,
-        target_model_config=target_config,
-        target_parallel_config=ParallelConfig(),
+    target_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        disable_custom_all_reduce=True,
+    )
+
+    def make_speculative_config(*, target_parallel=target_parallel_config, **overrides):
+        return SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=1,
+            target_model_config=target_config,
+            target_parallel_config=target_parallel,
+            **overrides,
+        )
+
+    requested_draft_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        disable_custom_all_reduce=True,
+    )
+    speculative_config = make_speculative_config(
+        draft_parallel_config=requested_draft_parallel_config,
     )
 
     actual_model = mock_model_config_cls.call_args.kwargs["model"]
     assert actual_model == s3_url
+    actual_draft_parallel_config = speculative_config.draft_parallel_config
+    assert actual_draft_parallel_config is not requested_draft_parallel_config
+    assert speculative_config.draft_tensor_parallel_size is None
+    assert actual_draft_parallel_config.disable_custom_all_reduce
+    assert not speculative_config.has_independent_draft_parallelism()
+
+    with pytest.raises(ValueError, match="unsupported fields: enable_dbo"):
+        make_speculative_config(
+            draft_parallel_config={"enable_dbo": False},  # type: ignore
+        )
+
+    mismatched_draft_parallel_config = copy.copy(target_parallel_config)
+    mismatched_draft_parallel_config.enable_dbo = True
+    with pytest.raises(ValueError, match="mismatched fields: enable_dbo"):
+        make_speculative_config(
+            draft_parallel_config=mismatched_draft_parallel_config,
+        )
+
+    parsed_speculative_config = make_speculative_config(
+        draft_parallel_config={  # type: ignore
+            "prefill_context_parallel_size": 1
+        },
+    )
+    assert isinstance(parsed_speculative_config.draft_parallel_config, ParallelConfig)
+    assert parsed_speculative_config.draft_parallel_config.tensor_parallel_size == 2
+    assert (
+        parsed_speculative_config.draft_parallel_config.prefill_context_parallel_size
+        == 1
+    )
+    assert (
+        parsed_speculative_config.draft_parallel_config.decode_context_parallel_size
+        == 1
+    )
+    assert parsed_speculative_config.draft_parallel_config.disable_custom_all_reduce
+    assert parsed_speculative_config.has_independent_draft_parallelism()
+
+    ep_target_parallel_config = copy.copy(target_parallel_config)
+    ep_target_parallel_config.enable_expert_parallel = True
+    replicated_draft_parallel_config = copy.copy(ep_target_parallel_config)
+    replicated_draft_parallel_config.prefill_context_parallel_size = 1
+    replicated_draft_parallel_config.enable_expert_parallel = False
+    with pytest.raises(ValueError, match="mismatched fields: enable_expert_parallel"):
+        make_speculative_config(
+            draft_parallel_config=replicated_draft_parallel_config,
+            target_parallel=ep_target_parallel_config,
+        )
+    replicated_speculative_config = make_speculative_config(
+        draft_parallel_config={"prefill_context_parallel_size": 1},  # type: ignore
+        target_parallel=ep_target_parallel_config,
+    )
+    assert (
+        not replicated_speculative_config.draft_parallel_config.enable_expert_parallel
+    )
+
+    default_speculative_config = make_speculative_config()
+    assert default_speculative_config.draft_parallel_config.tensor_parallel_size == 2
+    assert (
+        default_speculative_config.draft_parallel_config.prefill_context_parallel_size
+        == 2
+    )
+    assert default_speculative_config.draft_parallel_config.world_size == 4
+    assert target_parallel_config.prefill_context_parallel_size == 2
+    assert default_speculative_config.draft_tensor_parallel_size == 2
+    assert not default_speculative_config.has_independent_draft_parallelism()
+    assert (
+        parsed_speculative_config.compute_hash()
+        != default_speculative_config.compute_hash()
+    )
+
+    dcp_speculative_config = make_speculative_config(
+        target_parallel=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+    )
+    assert (
+        dcp_speculative_config.draft_parallel_config.decode_context_parallel_size == 2
+    )
+
+    tp1_dcp_speculative_config = make_speculative_config(
+        draft_tensor_parallel_size=1,
+        target_parallel=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+    )
+    assert (
+        tp1_dcp_speculative_config.draft_parallel_config.decode_context_parallel_size
+        == 1
+    )
+
+    mock_draft.hf_config.model_type = "llama"
+    with pytest.raises(ValueError, match="not supported"):
+        SpeculativeConfig(
+            method="draft_model",
+            model="draft",
+            num_speculative_tokens=1,
+            draft_parallel_config=ParallelConfig(),
+            target_model_config=target_config,
+            target_parallel_config=ParallelConfig(),
+        )
 
 
 def _make_qwen3_omni_dspark_configs():

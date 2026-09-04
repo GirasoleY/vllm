@@ -291,8 +291,8 @@ def test_draft_model_moe_backend_default_auto():
 
 
 def test_draft_model_engine_args_rejects_invalid_tp_argname():
-    """The user should pass "draft_tensor_parallel_size" rather than
-    "tensor_parallel_size". We enforce this with validation."""
+    """Standalone draft models use draft_tensor_parallel_size rather than the
+    removed top-level tensor_parallel_size alias."""
 
     engine_args = EngineArgs(
         model="Qwen/Qwen3-1.7B",
@@ -304,7 +304,7 @@ def test_draft_model_engine_args_rejects_invalid_tp_argname():
             "tensor_parallel_size": 1,  # <<< invalid arg name
         },
     )
-    with pytest.raises(ValueError, match="draft_tensor_parallel_size"):
+    with pytest.raises(ValueError, match="tensor_parallel_size"):
         engine_args.create_engine_config()
 
 

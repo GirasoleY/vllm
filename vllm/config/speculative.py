@@ -4,9 +4,11 @@
 import copy
 import functools
 from collections.abc import Callable, Mapping
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
+from pydantic_core import ArgsKwargs
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
@@ -14,7 +16,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
-from vllm.config.utils import config
+from vllm.config.utils import config, is_init_field
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
@@ -33,6 +35,15 @@ else:
     )
 
 logger = init_logger(__name__)
+
+_DRAFT_PARALLEL_OVERRIDE_FIELDS = frozenset(
+    {
+        "tensor_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+    }
+)
+
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
@@ -391,12 +402,14 @@ class SpeculativeConfig:
 
     If using `ngram` method, the related configuration `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
+    draft_parallel_config: ParallelConfig | None = None
+    """TP/PCP/DCP policy for an integrated draft model. A mapping is treated
+    as a partial override of the target topology. A ``ParallelConfig`` instance
+    is treated as complete, and its non-policy fields must match the target.
+    Supported layouts depend on the implementation; when omitted, vLLM derives
+    the existing default."""
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
-    """The degree of the tensor parallelism for the draft model. Can only be 1
-    or the same as the target model's tensor parallel size."""
-    tensor_parallel_size: int | None = None
-    """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
-    warn users when they mistakenly provide the wrong argument."""
+    """Legacy shortcut for setting the draft tensor parallel size."""
 
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
@@ -485,9 +498,6 @@ class SpeculativeConfig:
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
-    draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
-    """The parallel configuration for the draft model initialized internal."""
-
     # Suffix decoding configuration
     suffix_decoding_max_tree_depth: int = 24
     """The maximum depth of the suffix decoding global and prompt trees. The
@@ -640,6 +650,9 @@ class SpeculativeConfig:
                     False,
                 )
             )
+
+        if self.draft_parallel_config is not None:
+            factors.append(self.draft_parallel_config.compute_hash())
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -1065,7 +1078,106 @@ class SpeculativeConfig:
         parts = model.split(".")
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_draft_parallel_config_input(cls, data: Any) -> Any:
+        if isinstance(data, ArgsKwargs):
+            init_fields = tuple(
+                parallel_field.name
+                for parallel_field in fields(cls)
+                if is_init_field(cls, parallel_field.name)
+            )
+            positional = dict(zip(init_fields, data.args, strict=False))
+            draft_position = (
+                init_fields.index("draft_parallel_config")
+                if "draft_parallel_config" in positional
+                else None
+            )
+            kwargs = dict(data.kwargs or {})
+            draft_in_kwargs = "draft_parallel_config" in kwargs
+            values = {**positional, **kwargs}
+        elif isinstance(data, dict):
+            draft_position = None
+            draft_in_kwargs = True
+            kwargs = data
+            values = data
+        else:
+            return data
+
+        draft = values.get("draft_parallel_config")
+        if draft is None:
+            return data
+
+        target = values.get("target_parallel_config")
+        legacy_tp = values.get("draft_tensor_parallel_size")
+        if isinstance(draft, Mapping):
+            unsupported = sorted(
+                str(name) for name in set(draft) - _DRAFT_PARALLEL_OVERRIDE_FIELDS
+            )
+            if unsupported:
+                raise ValueError(
+                    "draft_parallel_config only supports TP/PCP/DCP overrides; "
+                    "unsupported fields: " + ", ".join(unsupported)
+                )
+
+            overrides = dict(draft)
+            if legacy_tp is not None:
+                overrides.setdefault("tensor_parallel_size", legacy_tp)
+            elif isinstance(target, ParallelConfig):
+                overrides.setdefault(
+                    "tensor_parallel_size", target.tensor_parallel_size
+                )
+
+            if isinstance(target, ParallelConfig):
+                overrides.setdefault(
+                    "prefill_context_parallel_size",
+                    target.prefill_context_parallel_size,
+                )
+                overrides.setdefault(
+                    "decode_context_parallel_size",
+                    target.decode_context_parallel_size,
+                )
+            kwargs["draft_parallel_config"] = overrides
+            if isinstance(data, ArgsKwargs):
+                if draft_position is not None:
+                    args = list(data.args)
+                    args[draft_position] = overrides
+                    if not draft_in_kwargs:
+                        kwargs.pop("draft_parallel_config", None)
+                    return ArgsKwargs(tuple(args), kwargs)
+                return ArgsKwargs(data.args, kwargs)
+            return kwargs
+
+        if isinstance(draft, ParallelConfig) and isinstance(target, ParallelConfig):
+            mismatched = [
+                parallel_field.name
+                for parallel_field in fields(ParallelConfig)
+                if parallel_field.name != "is_moe_model"
+                and parallel_field.name not in _DRAFT_PARALLEL_OVERRIDE_FIELDS
+                and is_init_field(ParallelConfig, parallel_field.name)
+                and getattr(draft, parallel_field.name)
+                != getattr(target, parallel_field.name)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Only draft TP/PCP/DCP may differ from the target; "
+                    "mismatched fields: " + ", ".join(mismatched)
+                )
+        return data
+
     def __post_init__(self):
+        user_draft_parallel_config = self.draft_parallel_config
+        if (
+            self.draft_tensor_parallel_size is not None
+            and user_draft_parallel_config is not None
+            and user_draft_parallel_config.tensor_parallel_size
+            != self.draft_tensor_parallel_size
+        ):
+            raise ValueError(
+                "draft_tensor_parallel_size conflicts with "
+                "draft_parallel_config.tensor_parallel_size"
+            )
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -1472,13 +1584,36 @@ class SpeculativeConfig:
                         self.num_speculative_tokens,
                     )
 
-                self.draft_tensor_parallel_size = (
-                    SpeculativeConfig._verify_and_get_draft_tp(
-                        self.target_parallel_config,
-                        self.draft_tensor_parallel_size,
-                        self.draft_model_config.hf_config,
-                    )
+                draft_tensor_parallel_size = (
+                    user_draft_parallel_config.tensor_parallel_size
+                    if user_draft_parallel_config is not None
+                    else self.draft_tensor_parallel_size
                 )
+                draft_tensor_parallel_size = SpeculativeConfig._verify_and_get_draft_tp(
+                    self.target_parallel_config,
+                    draft_tensor_parallel_size,
+                    self.draft_model_config.hf_config,
+                )
+                if user_draft_parallel_config is None:
+                    self.draft_tensor_parallel_size = draft_tensor_parallel_size
+                    self.draft_parallel_config = (
+                        SpeculativeConfig.create_draft_parallel_config(
+                            self.target_parallel_config,
+                            draft_tensor_parallel_size,
+                        )
+                    )
+                    if self.use_eagle():
+                        self.draft_parallel_config.prefill_context_parallel_size = (
+                            self.target_parallel_config.prefill_context_parallel_size
+                        )
+                        if (
+                            draft_tensor_parallel_size
+                            % self.target_parallel_config.decode_context_parallel_size
+                            == 0
+                        ):
+                            self.draft_parallel_config.decode_context_parallel_size = (
+                                self.target_parallel_config.decode_context_parallel_size
+                            )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
@@ -1487,11 +1622,20 @@ class SpeculativeConfig:
                     )
                 )
 
-                self.draft_parallel_config = (
-                    SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
-                    )
-                )
+        if user_draft_parallel_config is not None and not self.use_eagle():
+            raise ValueError(
+                "draft_parallel_config is not supported by "
+                f"speculative method {self.method!r}"
+            )
+        if self.use_eagle():
+            assert self.target_parallel_config is not None
+            assert self.draft_parallel_config is not None
+            assert self.draft_model_config is not None
+            self.draft_parallel_config = self._materialize_draft_parallel_config(
+                self.target_parallel_config,
+                self.draft_parallel_config,
+                self.draft_model_config.is_moe,
+            )
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:
@@ -1696,6 +1840,43 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    @staticmethod
+    def _materialize_draft_parallel_config(
+        target: ParallelConfig,
+        requested: ParallelConfig,
+        draft_is_moe: bool,
+    ) -> ParallelConfig:
+        """Bind integrated draft policy to the target's launched topology."""
+        draft = copy.copy(target)
+        for name in _DRAFT_PARALLEL_OVERRIDE_FIELDS:
+            setattr(draft, name, getattr(requested, name))
+
+        replicated_pcp = (
+            target.prefill_context_parallel_size > 1
+            and draft.prefill_context_parallel_size == 1
+        )
+        if replicated_pcp:
+            # Replicated drafters do not have a separate PCP-free EP group.
+            draft.enable_expert_parallel = False
+            draft.enable_eplb = False
+            draft.eplb_config = type(draft.eplb_config)()
+            draft.all2all_backend = ParallelConfig.all2all_backend
+            draft.enable_elastic_ep = False
+            draft.enable_ep_weight_filter = False
+            draft.expert_placement_strategy = ParallelConfig.expert_placement_strategy
+
+        draft._data_parallel_master_port_list = list(
+            target._data_parallel_master_port_list
+        )
+        draft.world_size = (
+            target.world_size
+            * draft.tensor_parallel_size
+            * draft.prefill_context_parallel_size
+            // (target.tensor_parallel_size * target.prefill_context_parallel_size)
+        )
+        draft.is_moe_model = draft_is_moe
+        return draft
+
     @field_validator("attention_backend", mode="before")
     @classmethod
     def _parse_attention_backend(cls, value: Any) -> Any:
@@ -1707,12 +1888,6 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
-        if self.tensor_parallel_size is not None:
-            raise ValueError(
-                "'tensor_parallel_size' is not a valid argument in the "
-                "speculative_config. Please pass 'draft_tensor_parallel_size' instead."
-            )
-
         if self.num_speculative_tokens is None:
             raise ValueError(
                 "num_speculative_tokens must be provided with "
@@ -1744,6 +1919,7 @@ class SpeculativeConfig:
             )
 
         if self.draft_model_config:
+            assert self.draft_parallel_config is not None
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )
@@ -1843,6 +2019,19 @@ class SpeculativeConfig:
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+
+    def has_independent_draft_parallelism(self) -> bool:
+        target = self.target_parallel_config
+        draft = self.draft_parallel_config
+        return (
+            self.use_eagle()
+            and target is not None
+            and draft is not None
+            and any(
+                getattr(draft, name) != getattr(target, name)
+                for name in _DRAFT_PARALLEL_OVERRIDE_FIELDS
+            )
+        )
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""
