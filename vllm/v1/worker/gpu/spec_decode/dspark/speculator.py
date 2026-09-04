@@ -39,6 +39,7 @@ logger = init_logger(__name__)
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
+    supports_replicated_pcp = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)

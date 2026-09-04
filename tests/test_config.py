@@ -389,7 +389,7 @@ def test_dsa_models_select_matching_mtp(model_type, expected_architecture):
 
 
 @pytest.mark.skip_global_cleanup
-def test_v2_model_runner_draft_parallelism_support():
+def test_v2_model_runner_defers_draft_parallelism_validation():
     config = SimpleNamespace(
         compilation_config=CompilationConfig(),
         parallel_config=ParallelConfig(),
@@ -408,9 +408,7 @@ def test_v2_model_runner_draft_parallelism_support():
     assert config._get_v2_model_runner_unsupported_features() == []
     config.speculative_config.method = "mtp"
     config.speculative_config.has_independent_draft_parallelism = lambda: True
-    assert config._get_v2_model_runner_unsupported_features() == [
-        "independent draft TP/PCP/DCP topology"
-    ]
+    assert config._get_v2_model_runner_unsupported_features() == []
 
 
 def test_dflash2_draft_forces_v2_model_runner():
@@ -2523,15 +2521,14 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     assert default_speculative_config.draft_parallel_config.tensor_parallel_size == 2
     assert (
         default_speculative_config.draft_parallel_config.prefill_context_parallel_size
-        == 2
+        == 1
     )
-    assert default_speculative_config.draft_parallel_config.world_size == 4
+    assert default_speculative_config.draft_parallel_config.world_size == 2
     assert target_parallel_config.prefill_context_parallel_size == 2
     assert default_speculative_config.draft_tensor_parallel_size == 2
-    assert not default_speculative_config.has_independent_draft_parallelism()
+    assert default_speculative_config.has_independent_draft_parallelism()
     assert (
-        parsed_speculative_config.compute_hash()
-        != default_speculative_config.compute_hash()
+        speculative_config.compute_hash() != default_speculative_config.compute_hash()
     )
 
     dcp_speculative_config = make_speculative_config(

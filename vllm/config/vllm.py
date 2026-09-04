@@ -2593,11 +2593,6 @@ class VllmConfig:
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
 
-            # No V2 execution path consumes an independent draft policy yet.
-            # Fail closed instead of silently running it with target topology.
-            if speculative_config.has_independent_draft_parallelism():
-                unsupported.append("independent draft TP/PCP/DCP topology")
-
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 

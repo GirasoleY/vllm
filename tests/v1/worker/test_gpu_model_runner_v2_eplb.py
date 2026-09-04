@@ -154,6 +154,23 @@ def test_v2_load_model_with_dummy_weights_skips_eplb_registration(monkeypatch):
     assert runner.eplb_state.async_started is False
 
 
+def test_replicated_draft_does_not_register_with_target_eplb(monkeypatch):
+    controller = eplb.EPLBController(
+        SimpleNamespace(enable_eplb=True), torch.device("cpu")
+    )
+    speculator = SimpleNamespace(
+        model=object(),
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=False)),
+    )
+    monkeypatch.setattr(
+        eplb,
+        "get_mixture_of_experts_model",
+        lambda _: (_ for _ in ()).throw(AssertionError("must not inspect model")),
+    )
+
+    assert not controller.maybe_register_speculator(speculator, object(), False)
+
+
 def test_v2_setup_eplb_from_mapping_rebuilds_state(monkeypatch):
     FakeEplbState.instances.clear()
     FakeEplbState.from_mapping_kwargs = None

@@ -1602,18 +1602,17 @@ class SpeculativeConfig:
                             draft_tensor_parallel_size,
                         )
                     )
-                    if self.use_eagle():
-                        self.draft_parallel_config.prefill_context_parallel_size = (
-                            self.target_parallel_config.prefill_context_parallel_size
+                    if (
+                        self.use_eagle()
+                        and self.target_parallel_config.prefill_context_parallel_size
+                        == 1
+                        and draft_tensor_parallel_size
+                        % self.target_parallel_config.decode_context_parallel_size
+                        == 0
+                    ):
+                        self.draft_parallel_config.decode_context_parallel_size = (
+                            self.target_parallel_config.decode_context_parallel_size
                         )
-                        if (
-                            draft_tensor_parallel_size
-                            % self.target_parallel_config.decode_context_parallel_size
-                            == 0
-                        ):
-                            self.draft_parallel_config.decode_context_parallel_size = (
-                                self.target_parallel_config.decode_context_parallel_size
-                            )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,

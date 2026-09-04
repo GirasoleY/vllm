@@ -8,7 +8,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config import ParallelConfig, SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.parallel import EPLBConfig
+from vllm.model_executor.layers.fused_moe import layer as fused_moe_layer
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.model_executor.models.exaone4_5_mtp import Exaone4_5_MTP
 from vllm.model_executor.models.llama4_eagle import EagleLlama4ForCausalLM
@@ -25,6 +28,8 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_mod
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
@@ -104,22 +109,178 @@ def _make_speculator(
     return speculator
 
 
+@pytest.mark.parametrize("replicated", [False, True])
+def test_prefill_capture_matches_runtime_attention_owner(replicated):
+    speculator = object.__new__(_TestSpeculator)
+    speculator.replicated_pcp = replicated
+    speculator.input_buffers, speculator.attn_groups = draft = object(), object()
+    speculator.target_input_buffers, speculator.target_attn_groups = target = (
+        object(),
+        object(),
+    )
+
+    assert speculator._prefill_capture_context() == (draft if replicated else target)
+
+
+def test_replicated_parallel_config_does_not_inherit_target_ep():
+    target = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        max_parallel_loading_workers=3,
+    )
+    target.enable_expert_parallel = True
+    target.enable_eplb = True
+    target.enable_elastic_ep = True
+    target.enable_ep_weight_filter = True
+    target.eplb_config = EPLBConfig(num_redundant_experts=1)
+    target.all2all_backend = "deepep_high_throughput"
+    target.expert_placement_strategy = "round_robin"
+    requested = ParallelConfig(tensor_parallel_size=2)
+
+    actual = SpeculativeConfig._materialize_draft_parallel_config(
+        target, requested, draft_is_moe=False
+    )
+
+    assert actual.prefill_context_parallel_size == 1
+    assert actual.world_size == target.world_size // 2
+    assert not actual.enable_expert_parallel
+    assert not actual.enable_eplb
+    assert not actual.enable_elastic_ep
+    assert not actual.enable_ep_weight_filter
+    assert actual.eplb_config == EPLBConfig()
+    assert actual.eplb_config is not target.eplb_config
+    assert actual.all2all_backend == ParallelConfig.all2all_backend
+    assert actual.expert_placement_strategy == ParallelConfig.expert_placement_strategy
+    assert actual.is_moe_model is False
+    assert actual.max_parallel_loading_workers == 3
+
+
+def test_sharded_parallel_config_inherits_target_ep():
+    target = ParallelConfig(tensor_parallel_size=2, prefill_context_parallel_size=2)
+    target.enable_expert_parallel = True
+    target.enable_eplb = True
+    target.enable_elastic_ep = True
+    target.enable_ep_weight_filter = True
+    target.eplb_config = EPLBConfig(num_redundant_experts=1)
+    target.all2all_backend = "deepep_high_throughput"
+    target.expert_placement_strategy = "round_robin"
+    requested = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+    )
+
+    actual = SpeculativeConfig._materialize_draft_parallel_config(
+        target, requested, draft_is_moe=True
+    )
+
+    assert actual.enable_expert_parallel
+    assert actual.enable_eplb
+    assert actual.enable_elastic_ep
+    assert actual.enable_ep_weight_filter
+    assert actual.eplb_config is target.eplb_config
+    assert actual.all2all_backend == "deepep_high_throughput"
+    assert actual.expert_placement_strategy == "round_robin"
+    assert actual.is_moe_model is True
+
+
+@pytest.mark.parametrize(
+    ("target_kwargs", "draft_kwargs", "error"),
+    [
+        ({"tensor_parallel_size": 2}, {}, "TP and DCP"),
+        (
+            {"tensor_parallel_size": 2},
+            {"tensor_parallel_size": 2, "decode_context_parallel_size": 2},
+            "TP and DCP",
+        ),
+        (
+            {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
+            {"tensor_parallel_size": 2, "prefill_context_parallel_size": 3},
+            "Draft PCP must be 1 or match",
+        ),
+        (
+            {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
+            {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
+            "PCP-sharded drafting is not supported",
+        ),
+        (
+            {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
+            {"tensor_parallel_size": 2},
+            "does not support replicated PCP drafting",
+        ),
+    ],
+)
+def test_draft_parallel_topology_validation(target_kwargs, draft_kwargs, error):
+    config = SimpleNamespace(
+        parallel_config=ParallelConfig(**target_kwargs),
+        speculative_config=SimpleNamespace(
+            draft_parallel_config=ParallelConfig(**draft_kwargs)
+        ),
+    )
+
+    with pytest.raises((ValueError, NotImplementedError), match=error):
+        _TestSpeculator(config, torch.device("cpu"))
+
+
+def test_replicated_pcp_capability_is_opt_in():
+    assert MTPSpeculator.supports_replicated_pcp
+    assert DSparkSpeculator.supports_replicated_pcp
+    assert not DraftModelSpeculator.supports_replicated_pcp
+    assert not MultiModuleMTPSpeculator.supports_replicated_pcp
+
+
+def test_replicated_parallel_config_controls_fused_moe_pcp(monkeypatch):
+    monkeypatch.setattr(
+        fused_moe_layer,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.config.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    draft_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=1,
+    )
+
+    actual = fused_moe_layer.make_parallel_config(
+        tp_size=2,
+        dp_size=1,
+        pcp_size=None,
+        is_sequence_parallel=False,
+        parallel_config=draft_parallel_config,
+    )
+
+    assert actual.pcp_size == 1
+    assert actual.pcp_rank == 0
+    assert actual.tp_size == 2
+
+
 @pytest.mark.parametrize(("hc_mult", "expected"), [(None, 64), (4, 256)])
 def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected):
     # Qwen4Exp targets expose multi-stream HC residuals to the drafter.
     monkeypatch.setattr(base_spec_module, "_target_feeds_hc_residual", lambda _: True)
+    monkeypatch.setattr(
+        base_spec_module,
+        "replace",
+        lambda config, **kwargs: SimpleNamespace(**{**vars(config), **kwargs}),
+    )
     hf_config = SimpleNamespace()
     if hc_mult is not None:
         hf_config.hc_mult = hc_mult
     draft_model_config = SimpleNamespace(
         hf_config=hf_config,
+        is_moe=False,
         get_hidden_size=lambda: 64,
         get_vocab_size=lambda: 32,
     )
+    parallel_config = ParallelConfig()
     speculative_config = SimpleNamespace(
         method="mtp",
         num_speculative_tokens=3,
         draft_model_config=draft_model_config,
+        draft_parallel_config=parallel_config,
         use_local_argmax_reduction=False,
         draft_sample_method="greedy",
     )
@@ -134,10 +295,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
             dtype=torch.float32,
             use_fp64_gumbel=False,
         ),
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank=0,
-        ),
+        parallel_config=parallel_config,
     )
 
     speculator = _TestSpeculator(vllm_config, torch.device("cpu"))

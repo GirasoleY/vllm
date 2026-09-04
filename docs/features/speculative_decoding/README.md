@@ -187,7 +187,9 @@ vllm serve <target-model> \
   `prefill_context_parallel_size`, and `decode_context_parallel_size`.
   Integrated drafters inherit all other launch, process-group, and loading
   settings from the target.
-- Draft TP/PCP/DCP topology must currently match the target.
+- Independent draft topology requires Model Runner V2. Integrated draft TP and
+  DCP must match the target; MTP and DSpark support PCP-replicated drafting by
+  setting draft PCP to 1.
 - Keys such as `temperature` and `top_p` are sampling parameters, not
   `--speculative-config` fields.
 - Internal fields such as `target_model_config`, `draft_model_config`,
