@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
@@ -154,6 +155,23 @@ def test_v2_load_model_with_dummy_weights_skips_eplb_registration(monkeypatch):
     assert runner.eplb_state.async_started is False
 
 
+def test_replicated_draft_does_not_register_with_target_eplb(monkeypatch):
+    controller = eplb.EPLBController(
+        SimpleNamespace(enable_eplb=True), torch.device("cpu")
+    )
+    speculator = SimpleNamespace(
+        model=object(),
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=False)),
+    )
+    monkeypatch.setattr(
+        eplb,
+        "get_mixture_of_experts_model",
+        lambda _: (_ for _ in ()).throw(AssertionError("must not inspect model")),
+    )
+
+    assert not controller.maybe_register_speculator(speculator, object(), False)
+
+
 def test_v2_setup_eplb_from_mapping_rebuilds_state(monkeypatch):
     FakeEplbState.instances.clear()
     FakeEplbState.from_mapping_kwargs = None
@@ -203,3 +221,57 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     output = mrv2.GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
+
+
+def test_v2_sample_tokens_restores_each_aux_hidden_state_once(monkeypatch):
+    class StopAfterRestoreError(Exception):
+        pass
+
+    local_batch = object()
+    global_batch = object()
+    aux_hidden_states = [torch.tensor([1.0]), torch.tensor([2.0])]
+    restored_aux: list[torch.Tensor] = []
+
+    def restore_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
+        restored_aux.append(hidden_states)
+        return hidden_states
+
+    pcp_manager = SimpleNamespace(
+        is_partitioned_batch=lambda batch: batch is local_batch,
+        restore_hidden_states=restore_hidden_states,
+    )
+    runner = _make_runner(is_last_pp_rank=True, pcp_manager=pcp_manager)
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=local_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.tensor([0.0]),
+        aux_hidden_states=aux_hidden_states,
+        dp_sync=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        routed_experts=None,
+        cudagraph_stats=None,
+    )
+    monkeypatch.setattr(
+        mrv2.pcp,
+        "maybe_restore_pcp_for_sampling",
+        lambda _manager, hidden_states, _input_batch: (
+            hidden_states,
+            global_batch,
+        ),
+    )
+
+    def stop_after_restore(*_args, **_kwargs):
+        raise StopAfterRestoreError
+
+    runner.sample = stop_after_restore
+
+    with pytest.raises(StopAfterRestoreError):
+        mrv2.GPUModelRunner.sample_tokens(runner, None)
+
+    assert len(restored_aux) == len(aux_hidden_states)
+    assert all(
+        actual is expected
+        for actual, expected in zip(restored_aux, aux_hidden_states, strict=True)
+    )

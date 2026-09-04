@@ -63,6 +63,7 @@ class PCPManager:
         self.cp_interleave = cp_interleave
 
         self._global_batch: InputBatch | None = None
+        self._local_batch: InputBatch | None = None
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
@@ -558,7 +559,7 @@ class PCPManager:
             )
             dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_local_reqs]
 
-        return replace(
+        local_batch = replace(
             input_batch,
             req_ids=local_req_ids,
             num_reqs=num_local_reqs,
@@ -592,6 +593,11 @@ class PCPManager:
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
         )
+        self._local_batch = local_batch
+        return local_batch
+
+    def is_partitioned_batch(self, input_batch: InputBatch) -> bool:
+        return input_batch is self._local_batch
 
     def prepare_attn(
         self, input_batch: InputBatch

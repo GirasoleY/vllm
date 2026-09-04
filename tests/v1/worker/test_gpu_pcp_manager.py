@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 import torch
 
-import vllm.v1.worker.gpu.pcp_manager as pcp_module
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -113,24 +112,21 @@ def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_partition_reuses_gpu_cursor_for_replicated_spec_decode():
-    device = torch.device("cuda")
+def test_partition_reuses_gpu_cursor_for_replicated_spec_decode(monkeypatch):
+    device = torch.device("cpu")
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
     global_buffers = InputBuffers(max_num_reqs=1, max_num_tokens=4, device=device)
-    global_batch = InputBatch.make_dummy(
-        num_reqs=1,
-        num_tokens=4,
-        input_buffers=global_buffers,
-    )
+    global_batch = InputBatch.make_dummy(1, 4, global_buffers)
 
     # Model an async step after rejection: the CPU scheduler cursor is still
-    # optimistic, while the GPU cursor used to build positions/seq_lens has
+    # optimistic, while the device cursor used to build positions/seq_lens has
     # already rolled back to the accepted prefix.
     global_batch.num_draft_tokens = 3
     global_batch.num_draft_tokens_per_req = np.array([3], dtype=np.int32)
     global_batch.num_computed_tokens_np[:] = 20
     global_batch.prefill_len_np[:] = 8
     global_batch.num_computed_prefill_tokens_np[:] = 8
+    global_batch.input_ids.copy_(torch.tensor([7, 8, 9, 10], device=device))
     global_batch.positions.copy_(torch.arange(10, 14, device=device))
     global_batch.seq_lens.fill_(14)
 
@@ -148,15 +144,16 @@ def test_partition_reuses_gpu_cursor_for_replicated_spec_decode():
     # follows the corrected GPU cursor, not the stale CPU upper bound.
     assert local_batch.num_reqs == 1
     assert local_batch.num_scheduled_tokens.tolist() == [4]
-    torch.testing.assert_close(
-        local_batch.positions,
-        torch.arange(10, 14, device=device),
-    )
+    assert manager.is_partitioned_batch(local_batch)
+    assert not manager.is_partitioned_batch(global_batch)
+    torch.testing.assert_close(local_batch.input_ids, global_batch.input_ids)
+    torch.testing.assert_close(local_batch.positions, global_batch.positions)
     torch.testing.assert_close(
         local_batch.seq_lens,
         torch.tensor([14], dtype=torch.int32, device=device),
     )
     assert local_batch.num_computed_tokens_np.tolist() == [20]
+    assert local_batch.logits_indices.tolist() == [3]
 
 
 def test_restore_hidden_states_appends_zero_graph_padding(monkeypatch):
@@ -172,7 +169,7 @@ def test_restore_hidden_states_appends_zero_graph_padding(monkeypatch):
     restored = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     manager._hidden_restore_idx = torch.arange(5)
     monkeypatch.setattr(
-        pcp_module,
+        pcp_manager_module,
         "get_pcp_group",
         lambda: SimpleNamespace(all_gather=lambda *_args, **_kwargs: restored),
     )

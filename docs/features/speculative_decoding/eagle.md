@@ -15,7 +15,7 @@ llm = LLM(
     tensor_parallel_size=4,
     speculative_config={
         "model": "yuhuili/EAGLE-LLaMA3-Instruct-8B",
-        "draft_tensor_parallel_size": 1,
+        "draft_tensor_parallel_size": 4,
         "num_speculative_tokens": 2,
         "method": "eagle",
     },

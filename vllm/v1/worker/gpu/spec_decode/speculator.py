@@ -2,14 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import replace as dataclass_replace
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.config import (
+    SpeculativeConfig,
+    VllmConfig,
+    get_layers_from_vllm_config,
+    replace,
+)
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
@@ -86,25 +91,59 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
+    supports_replicated_pcp = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Under PCP the drafter runs replicated over the global batch on
-        # every rank, so its attention groups, forward context, and
-        # cudagraphs must not see PCP.
-        target_parallel_config = vllm_config.parallel_config
-        self.replicated_pcp = target_parallel_config.prefill_context_parallel_size > 1
-        if self.replicated_pcp:
-            vllm_config = replace(
-                vllm_config,
-                parallel_config=replace(
-                    target_parallel_config,
-                    prefill_context_parallel_size=1,
-                ),
+        assert vllm_config.speculative_config is not None
+        self.speculative_config = vllm_config.speculative_config
+        requested = self.speculative_config.draft_parallel_config
+        assert requested is not None
+        target = vllm_config.parallel_config
+        # Integrated drafters reuse the already-launched target workers. Bind
+        # their finalized runtime state and apply supported draft policy.
+        target_pcp = target.prefill_context_parallel_size
+        draft_pcp = requested.prefill_context_parallel_size
+        if target_pcp > 1 and target.decode_context_parallel_size != 1:
+            raise NotImplementedError(
+                "MRV2 PCP speculative decoding does not support DCP yet."
             )
+        if (
+            requested.tensor_parallel_size != target.tensor_parallel_size
+            or requested.decode_context_parallel_size
+            != target.decode_context_parallel_size
+        ):
+            raise NotImplementedError(
+                "Integrated draft TP and DCP must currently match the target."
+            )
+        if draft_pcp not in (1, target_pcp):
+            raise ValueError("Draft PCP must be 1 or match the target PCP size.")
+        self.replicated_pcp = target_pcp > 1 and draft_pcp == 1
+        if target_pcp > 1 and draft_pcp == target_pcp:
+            raise NotImplementedError(
+                "PCP-sharded drafting is not supported yet; set draft PCP to 1."
+            )
+        if self.replicated_pcp and not self.supports_replicated_pcp:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support replicated PCP drafting."
+            )
+        assert self.speculative_config.draft_model_config is not None
+        draft_parallel_config = SpeculativeConfig._materialize_draft_parallel_config(
+            target,
+            requested,
+            self.speculative_config.draft_model_config.is_moe,
+        )
+        vllm_config = replace(
+            vllm_config,
+            parallel_config=draft_parallel_config,
+        )
+        # VllmConfig validation stamps the target model's MoE identity.
+        # Restore the identity of the model this parallel config describes.
+        draft_parallel_config.is_moe_model = (
+            self.speculative_config.draft_model_config.is_moe
+        )
         self.vllm_config = vllm_config
         self.device = device
 
-        assert vllm_config.speculative_config is not None
-        self.speculative_config = vllm_config.speculative_config
         self.method = self.speculative_config.method
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
@@ -434,7 +473,7 @@ class DraftModelSpeculator(BaseSpeculator):
         assert num_reqs * num_query_per_req <= num_batch_tokens, (
             "reusing a DP sync that does not cover this batch's requests"
         )
-        return replace(
+        return dataclass_replace(
             target_dp_sync,
             num_tokens_across_dp=torch.full_like(
                 target_dp_sync.num_tokens_across_dp, num_batch_tokens

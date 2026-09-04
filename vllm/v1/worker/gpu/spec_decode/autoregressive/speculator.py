@@ -183,6 +183,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             decode_query_len=1,
         )
 
+    def _prefill_capture_context(
+        self,
+    ) -> tuple[InputBuffers, list[list[AttentionGroup]]]:
+        if self.replicated_pcp:
+            return self.input_buffers, self.attn_groups
+        return self.target_input_buffers, self.target_attn_groups
+
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
         # Reset indices to zeros to prevent stale values from prior
@@ -195,20 +202,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # For FULL graphs, the entire routine is recorded as one graph.
         # For PIECEWISE, only the model's compiled regions are captured
         # and the rest (compute_logits, gumbel_sample) runs eagerly.
-        # Draft prefill reuses the target model's attention metadata at
-        # runtime, so capture builds its dummy metadata through the target
-        # model runner's builders and buffers.
+        # Capture with the same metadata owner used at runtime.
         assert self.prefill_cudagraph_manager is not None
         if self.prefill_cudagraph_manager.use_breakable_cg:
             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
 
+        input_buffers, attn_groups = self._prefill_capture_context()
         self.on_prefill_begin(self.max_num_reqs)
         self.prefill_cudagraph_manager.capture(
             self._prefill,
             self.model_state,
-            self.target_input_buffers,
+            input_buffers,
             self.block_tables,
-            self.target_attn_groups,
+            attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing prefill CUDA graphs",
         )

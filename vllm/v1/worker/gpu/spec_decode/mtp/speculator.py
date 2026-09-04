@@ -10,6 +10,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
+    supports_replicated_pcp = True
     share_mtp_topk_indices: bool = False
 
     def load_draft_model(

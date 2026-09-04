@@ -344,13 +344,15 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
         hf_config=SimpleNamespace(model_type="qwen3"),
         get_vocab_size=Mock(return_value=99),
     )
+    runtime_parallel_config = object()
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
             draft_model_config=draft_model_config,
-            draft_parallel_config=SimpleNamespace(),
+            draft_parallel_config=object(),
             attention_backend=None,
             kv_cache_dtype=None,
         ),
+        parallel_config=runtime_parallel_config,
         attention_config=SimpleNamespace(backend=None),
         cache_config=SimpleNamespace(),
         model_config=SimpleNamespace(get_vocab_size=Mock(return_value=100)),
@@ -374,7 +376,7 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
         patch(
             "vllm.model_executor.model_loader.get_model",
             return_value=draft_model,
-        ),
+        ) as get_model,
         patch(
             "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
             return_value=False,
@@ -387,6 +389,10 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
         loaded_model = dspark_utils.load_dspark_model(target_model, vllm_config)
 
     assert loaded_model.model.embed_tokens is target_embedding
+    assert (
+        get_model.call_args.kwargs["vllm_config"].parallel_config
+        is runtime_parallel_config
+    )
 
 
 if __name__ == "__main__":

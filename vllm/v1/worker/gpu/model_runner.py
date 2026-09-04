@@ -684,6 +684,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             exclude_layer_names=(
                 self.speculator.draft_attn_layer_names
                 if isinstance(self.speculator, DraftModelSpeculator)
+                and self.speculator.replicated_pcp
                 else None
             ),
         )
@@ -717,6 +718,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def _restore_pcp_outputs(
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> tuple[InputBatch, torch.Tensor, list[torch.Tensor] | None, bool]:
+        manager = self.pcp_manager
+        if manager is None or not manager.is_partitioned_batch(input_batch):
+            return input_batch, hidden_states, aux_hidden_states, False
+
+        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+            manager, hidden_states, input_batch
+        )
+        if aux_hidden_states is not None:
+            aux_hidden_states = [
+                manager.restore_hidden_states(hidden) for hidden in aux_hidden_states
+            ]
+        return input_batch, hidden_states, aux_hidden_states, True
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -816,6 +836,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
+        assert hidden_states is not None
+        input_batch, hidden_states, aux_hidden_states, restored_pcp = (
+            self._restore_pcp_outputs(input_batch, hidden_states, aux_hidden_states)
+        )
+
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
             assert self.sampler is not None
@@ -838,7 +863,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                assert pre_hc_hidden_states is not None
+                if restored_pcp:
+                    assert self.pcp_manager is not None
+                    pre_hc_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
+                        pre_hc_hidden_states
+                    )
+                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
+            draft_dp_sync = (
+                None
+                if isinstance(self.speculator, DraftModelSpeculator)
+                and self.speculator.replicated_pcp
+                else dp_sync
+            )
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.propose(
                     input_batch=input_batch,
@@ -856,7 +893,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     next_prefill_tokens=self.req_states.next_prefill_tokens,
                     temperature=self.sampler.sampling_states.temperature.gpu,
                     seeds=self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
+                    dp_sync=draft_dp_sync,
                     dummy_run=True,
                     skip_attn_for_dummy_run=skip_attn,
                     mm_inputs=mm_inputs,
@@ -864,7 +901,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             self.step_timing.drafter_end()
 
-        assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -1940,16 +1976,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
-        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            self.pcp_manager, hidden_states, input_batch
+        assert hidden_states is not None
+        input_batch, hidden_states, aux_hidden_states, restored_pcp = (
+            self._restore_pcp_outputs(input_batch, hidden_states, aux_hidden_states)
         )
-        # Aux hidden states feed the replicated drafter (e.g. DSpark), so
-        # like the main hidden states they are restored from the rank-local
-        # shard to the global batch layout.
-        if self.pcp_manager is not None and aux_hidden_states is not None:
-            aux_hidden_states = [
-                self.pcp_manager.restore_hidden_states(h) for h in aux_hidden_states
-            ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
@@ -2029,11 +2059,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                if self.pcp_manager is not None:
+                assert pre_hc_hidden_states is not None
+                if restored_pcp:
+                    assert self.pcp_manager is not None
                     pre_hc_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
                         pre_hc_hidden_states
                     )
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
+            draft_dp_sync = (
+                None
+                if isinstance(self.speculator, DraftModelSpeculator)
+                and self.speculator.replicated_pcp
+                else dp_sync
+            )
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2047,7 +2085,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.next_prefill_tokens,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
+                    dp_sync=draft_dp_sync,
                     mm_inputs=mm_inputs,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens

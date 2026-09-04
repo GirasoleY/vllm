@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import json
 import logging
 import os
-from dataclasses import MISSING, Field, asdict, dataclass, field
+from dataclasses import MISSING, Field, asdict, dataclass, field, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import patch
 
 import pydantic
@@ -388,17 +388,29 @@ def test_dsa_models_select_matching_mtp(model_type, expected_architecture):
     assert hf_config.architectures == [expected_architecture]
 
 
-def test_v2_model_runner_supports_extract_hidden_states():
-    config = VllmConfig()
-    config.speculative_config = cast(
-        SpeculativeConfig,
-        SimpleNamespace(
+@pytest.mark.skip_global_cleanup
+def test_v2_model_runner_defers_draft_parallelism_validation():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(),
+        parallel_config=ParallelConfig(),
+        speculative_config=SimpleNamespace(
             method="extract_hidden_states",
             parallel_drafting=False,
-            enable_adaptive_verification=False,
+            has_independent_draft_parallelism=lambda: False,
+        ),
+        model_config=None,
+        cache_config=SimpleNamespace(
+            kv_sharing_fast_prefill=False,
+            mamba_cache_mode="none",
         ),
     )
+    config._get_v2_model_runner_unsupported_features = lambda: (
+        VllmConfig._get_v2_model_runner_unsupported_features(config)
+    )
 
+    assert config._get_v2_model_runner_unsupported_features() == []
+    config.speculative_config.method = "mtp"
+    config.speculative_config.has_independent_draft_parallelism = lambda: True
     assert config._get_v2_model_runner_unsupported_features() == []
 
 
@@ -734,6 +746,7 @@ def test_models_default_to_v2_model_runner(model_config, expected, monkeypatch):
     assert VllmConfig.use_v2_model_runner.fget(config) is expected
 
 
+@pytest.mark.skip_global_cleanup
 def test_v1_model_runner_rejects_v2_only_features():
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -750,6 +763,15 @@ def test_v1_model_runner_rejects_v2_only_features():
     )
 
     with pytest.raises(ValueError, match="prefill context parallel"):
+        VllmConfig._validate_v1_model_runner(config)
+
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        enable_adaptive_verification=False,
+        has_independent_draft_parallelism=lambda: True,
+    )
+    with pytest.raises(ValueError, match="independent draft TP/PCP/DCP topology"):
         VllmConfig._validate_v1_model_runner(config)
 
 
@@ -2371,11 +2393,95 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
-@patch("vllm.config.speculative.ModelConfig")
-def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
-    """Regression test: MTP + runai_streamer should use model_weights (original
-    S3 URL) for the draft model, not model (local cache dir set by
-    pull_runai_model_from_obj_storage)."""
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "draft_parallel_config",
+    [ParallelConfig(tensor_parallel_size=2), {"tensor_parallel_size": "2"}],
+)
+def test_draft_parallel_config_rejects_conflicting_legacy_tp(
+    draft_parallel_config,
+):
+    with pytest.raises(ValueError, match="conflicts"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_parallel_config=draft_parallel_config,
+            draft_tensor_parallel_size=1,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_speculative_tensor_parallel_size_keeps_targeted_diagnostic():
+    with pytest.raises(ValueError, match="draft_tensor_parallel_size.*or"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            tensor_parallel_size=2,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_config_validates_positional_input():
+    baseline = SpeculativeConfig(method="ngram", num_speculative_tokens=1)
+    init_field_names = [
+        config_field.name
+        for config_field in fields(SpeculativeConfig)
+        if config_field.init and not config_field.kw_only
+    ]
+    draft_parallel_config_index = init_field_names.index("draft_parallel_config")
+    positional_args = [
+        getattr(baseline, field_name)
+        for field_name in init_field_names[: draft_parallel_config_index + 1]
+    ]
+
+    positional_args[draft_parallel_config_index] = {"enable_dbo": False}
+    with pytest.raises(ValueError, match="unsupported fields: enable_dbo"):
+        SpeculativeConfig(*positional_args)  # type: ignore[arg-type]
+
+    positional_args[draft_parallel_config_index] = {"prefill_context_parallel_size": 1}
+    with pytest.raises(ValueError, match="not supported"):
+        SpeculativeConfig(*positional_args)  # type: ignore[arg-type]
+
+
+@pytest.mark.skip_global_cleanup
+def test_derived_draft_parallel_config_survives_replacement():
+    target_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        disable_custom_all_reduce=True,
+    )
+    ngram = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        target_parallel_config=target_parallel_config,
+    )
+
+    replaced = replace(ngram)
+
+    assert replaced.draft_parallel_config is target_parallel_config
+    assert replaced._draft_parallel_config_provenance == (False, 2, 1, 1)
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_mapping_validation_does_not_mutate_input():
+    config_input = {
+        "method": "ngram",
+        "num_speculative_tokens": 1,
+        "draft_parallel_config": {"prefill_context_parallel_size": 1},
+        "target_parallel_config": ParallelConfig(
+            tensor_parallel_size=2,
+            prefill_context_parallel_size=2,
+        ),
+    }
+    original_draft_mapping = dict(config_input["draft_parallel_config"])
+
+    with pytest.raises(ValueError, match="not supported"):
+        SpeculativeConfig(**config_input)  # type: ignore[arg-type]
+
+    assert config_input["draft_parallel_config"] == original_draft_mapping
+
+
+@pytest.fixture
+def draft_parallel_test_context():
     from unittest.mock import MagicMock
 
     s3_url = "s3://my-bucket/Qwen3-35B-A3B-FP8"
@@ -2386,7 +2492,8 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     mock_draft.hf_config.model_type = "deepseek_mtp"
     mock_draft.hf_config.n_predict = None
     mock_draft.max_model_len = 4096
-    mock_model_config_cls.return_value = mock_draft
+    mock_draft.is_moe = False
+    mock_draft.get_vocab_size.return_value = 32
 
     target_config = MagicMock()
     target_config.model = local_cache
@@ -2394,16 +2501,255 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     target_config.hf_text_config.model_type = "deepseek_v3"
     target_config.quantization = None
     target_config.max_model_len = 4096
+    target_config.get_vocab_size.return_value = 32
 
-    SpeculativeConfig(
-        method="mtp",
-        num_speculative_tokens=1,
-        target_model_config=target_config,
-        target_parallel_config=ParallelConfig(),
+    target_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        disable_custom_all_reduce=True,
     )
 
-    actual_model = mock_model_config_cls.call_args.kwargs["model"]
-    assert actual_model == s3_url
+    def make_speculative_config(*, target_parallel=target_parallel_config, **overrides):
+        return SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=1,
+            target_model_config=target_config,
+            target_parallel_config=target_parallel,
+            **overrides,
+        )
+
+    with patch("vllm.config.speculative.ModelConfig", return_value=mock_draft) as mock:
+        yield SimpleNamespace(
+            make=make_speculative_config,
+            mock_model_config_cls=mock,
+            mock_draft=mock_draft,
+            target_config=target_config,
+            target_parallel_config=target_parallel_config,
+            s3_url=s3_url,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_mtp_draft_uses_model_weights_not_local_cache(draft_parallel_test_context):
+    """MTP + runai_streamer must use the original weight URL, not its cache."""
+    context = draft_parallel_test_context
+    requested_draft_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        disable_custom_all_reduce=True,
+    )
+    speculative_config = context.make(
+        draft_parallel_config=requested_draft_parallel_config,
+    )
+
+    actual_model = context.mock_model_config_cls.call_args.kwargs["model"]
+    assert actual_model == context.s3_url
+    actual_draft_parallel_config = speculative_config.draft_parallel_config
+    assert actual_draft_parallel_config is not requested_draft_parallel_config
+    assert speculative_config.draft_tensor_parallel_size is None
+    assert actual_draft_parallel_config.disable_custom_all_reduce
+    assert not speculative_config.has_independent_draft_parallelism()
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_config_rejects_non_policy_fields(
+    draft_parallel_test_context,
+):
+    context = draft_parallel_test_context
+    with pytest.raises(ValueError, match="unsupported fields: enable_dbo"):
+        context.make(
+            draft_parallel_config={"enable_dbo": False},  # type: ignore
+        )
+
+    mismatched_draft_parallel_config = copy.copy(context.target_parallel_config)
+    mismatched_draft_parallel_config.enable_dbo = True
+    with pytest.raises(ValueError, match="mismatched fields: enable_dbo"):
+        context.make(
+            draft_parallel_config=mismatched_draft_parallel_config,
+        )
+
+    baseline = context.make()
+    positional_field_names = [
+        config_field.name
+        for config_field in fields(SpeculativeConfig)
+        if config_field.init and not config_field.kw_only
+    ]
+    suffix_index = positional_field_names.index("suffix_decoding_max_tree_depth")
+    positional_args = [
+        getattr(baseline, field_name)
+        for field_name in positional_field_names[: suffix_index + 1]
+    ]
+    draft_index = positional_field_names.index("draft_parallel_config")
+    positional_args[draft_index] = mismatched_draft_parallel_config
+    with pytest.raises(ValueError, match="mismatched fields: enable_dbo"):
+        SpeculativeConfig(*positional_args)  # type: ignore[arg-type]
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_config_resolves_partial_policy_and_hash(
+    draft_parallel_test_context,
+):
+    context = draft_parallel_test_context
+    parsed_speculative_config = context.make(
+        draft_parallel_config={  # type: ignore
+            "prefill_context_parallel_size": 1
+        },
+    )
+    assert isinstance(parsed_speculative_config.draft_parallel_config, ParallelConfig)
+    assert parsed_speculative_config.draft_parallel_config.tensor_parallel_size == 2
+    assert (
+        parsed_speculative_config.draft_parallel_config.prefill_context_parallel_size
+        == 1
+    )
+    assert (
+        parsed_speculative_config.draft_parallel_config.decode_context_parallel_size
+        == 1
+    )
+    assert parsed_speculative_config.draft_parallel_config.disable_custom_all_reduce
+    assert parsed_speculative_config.has_independent_draft_parallelism()
+
+    default_speculative_config = context.make()
+    assert default_speculative_config.draft_parallel_config.tensor_parallel_size == 2
+    assert (
+        default_speculative_config.draft_parallel_config.prefill_context_parallel_size
+        == 1
+    )
+    assert default_speculative_config.draft_parallel_config.world_size == 2
+    assert context.target_parallel_config.prefill_context_parallel_size == 2
+    assert default_speculative_config.draft_tensor_parallel_size == 2
+    assert default_speculative_config.has_independent_draft_parallelism()
+
+    explicit_replicated_parallel_config = copy.copy(context.target_parallel_config)
+    explicit_replicated_parallel_config.prefill_context_parallel_size = 1
+    equivalent_instance = context.make(
+        draft_parallel_config=explicit_replicated_parallel_config,
+    )
+    assert equivalent_instance.compute_hash() == (
+        parsed_speculative_config.compute_hash()
+    )
+    assert parsed_speculative_config.compute_hash() == (
+        default_speculative_config.compute_hash()
+    )
+
+    sharded_speculative_config = context.make(
+        draft_parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            prefill_context_parallel_size=2,
+            disable_custom_all_reduce=True,
+        )
+    )
+    assert sharded_speculative_config.compute_hash() != (
+        default_speculative_config.compute_hash()
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_replicated_draft_parallel_config_normalizes_ep_and_reconstructs(
+    draft_parallel_test_context,
+):
+    context = draft_parallel_test_context
+    ep_target_parallel_config = copy.copy(context.target_parallel_config)
+    ep_target_parallel_config.enable_expert_parallel = True
+    replicated_draft_parallel_config = copy.copy(ep_target_parallel_config)
+    replicated_draft_parallel_config.prefill_context_parallel_size = 1
+    replicated_draft_parallel_config.enable_expert_parallel = False
+    with pytest.raises(ValueError, match="mismatched fields: enable_expert_parallel"):
+        context.make(
+            draft_parallel_config=replicated_draft_parallel_config,
+            target_parallel=ep_target_parallel_config,
+        )
+    replicated_speculative_config = context.make(
+        draft_parallel_config={"prefill_context_parallel_size": 1},  # type: ignore
+        target_parallel=ep_target_parallel_config,
+    )
+    assert (
+        not replicated_speculative_config.draft_parallel_config.enable_expert_parallel
+    )
+    replaced_replicated = replace(
+        replicated_speculative_config,
+        prompt_lookup_min=None,
+        prompt_lookup_max=None,
+    )
+    assert not replaced_replicated.draft_parallel_config.enable_expert_parallel
+
+
+@pytest.mark.skip_global_cleanup
+def test_default_draft_parallel_config_reconstructs(draft_parallel_test_context):
+    default_speculative_config = draft_parallel_test_context.make()
+    replaced_default = replace(
+        default_speculative_config,
+        prompt_lookup_min=None,
+        prompt_lookup_max=None,
+    )
+    assert replaced_default.draft_parallel_config.compute_hash() == (
+        default_speculative_config.draft_parallel_config.compute_hash()
+    )
+    assert not replaced_default.draft_parallel_config.enable_expert_parallel
+
+
+@pytest.mark.skip_global_cleanup
+def test_default_draft_parallel_config_preserves_supported_dcp(
+    draft_parallel_test_context,
+):
+    context = draft_parallel_test_context
+    dcp_speculative_config = context.make(
+        target_parallel=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+    )
+    assert (
+        dcp_speculative_config.draft_parallel_config.decode_context_parallel_size == 2
+    )
+
+    tp1_dcp_speculative_config = context.make(
+        draft_tensor_parallel_size=1,
+        target_parallel=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+    )
+    assert (
+        tp1_dcp_speculative_config.draft_parallel_config.decode_context_parallel_size
+        == 1
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_standalone_derived_parallel_config_reconstructs(
+    draft_parallel_test_context,
+):
+    context = draft_parallel_test_context
+    context.mock_draft.hf_config.model_type = "llama"
+    standalone = SpeculativeConfig(
+        method="draft_model",
+        model="draft",
+        num_speculative_tokens=1,
+        draft_tensor_parallel_size=1,
+        target_model_config=context.target_config,
+        target_parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            disable_custom_all_reduce=True,
+        ),
+    )
+    replaced_standalone = replace(
+        standalone,
+        prompt_lookup_min=None,
+        prompt_lookup_max=None,
+    )
+    assert replaced_standalone.draft_parallel_config.compute_hash() == (
+        standalone.draft_parallel_config.compute_hash()
+    )
+
+    with pytest.raises(ValueError, match="not supported"):
+        SpeculativeConfig(
+            method="draft_model",
+            model="draft",
+            num_speculative_tokens=1,
+            draft_parallel_config=ParallelConfig(prefill_context_parallel_size=2),
+            target_model_config=context.target_config,
+            target_parallel_config=ParallelConfig(prefill_context_parallel_size=2),
+        )
 
 
 def _make_qwen3_omni_dspark_configs():

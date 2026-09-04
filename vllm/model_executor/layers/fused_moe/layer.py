@@ -10,7 +10,6 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import (
     get_dp_group,
-    get_pcp_group,
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -51,7 +50,11 @@ def make_parallel_config(
         tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
     )
     dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
-    pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
+    pcp_size_ = (
+        pcp_size
+        if pcp_size is not None
+        else parallel_config.prefill_context_parallel_size
+    )
     sp_size = tp_size_ if is_sequence_parallel else 1
 
     moe_parallel_config = FusedMoEParallelConfig.make(

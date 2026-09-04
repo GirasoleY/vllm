@@ -62,6 +62,7 @@ class EPLBController:
             speculator is None
             or not hasattr(speculator, "model")
             or not self.parallel_config.enable_eplb
+            or not speculator.vllm_config.parallel_config.enable_eplb
             or load_dummy_weights
         ):
             return False
