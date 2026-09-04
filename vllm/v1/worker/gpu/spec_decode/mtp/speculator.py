@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     supports_replicated_pcp = True
+    supports_sharded_pcp = True
     share_mtp_topk_indices: bool = False
 
     def load_draft_model(
@@ -30,6 +31,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # steps 1+ reuse them.
         self.share_mtp_topk_indices = (
             getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
+            and not self.sharded_pcp
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )

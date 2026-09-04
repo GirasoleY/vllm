@@ -61,6 +61,7 @@ class PCPManager:
 
         self._global_batch: InputBatch | None = None
         self._local_batch: InputBatch | None = None
+        self._local_gather_idx: torch.Tensor | None = None
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
@@ -158,6 +159,24 @@ class PCPManager:
                     "MRV2 PCP speculative decoding does not support adaptive "
                     "verification yet."
                 )
+            draft_parallel_config = speculative_config.draft_parallel_config
+            assert draft_parallel_config is not None
+            sharded_draft = (
+                draft_parallel_config.prefill_context_parallel_size == pcp_size
+            )
+            if sharded_draft:
+                if (
+                    speculative_config.method != "mtp"
+                    or speculative_config.use_multi_module_mtp()
+                ):
+                    raise NotImplementedError(
+                        "MRV2 PCP-sharded drafting only supports single-module MTP."
+                    )
+                if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                    raise NotImplementedError(
+                        "MRV2 PCP-sharded MTP does not support CUDA graphs yet. "
+                        "Set -cc.cudagraph_mode=NONE."
+                    )
         if (
             is_sparse_mla
             and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -464,6 +483,7 @@ class PCPManager:
         local_gather_idx = self._padded_gather_idx[
             rank_token_start : rank_token_start + num_local_tokens_padded
         ]
+        self._local_gather_idx = local_gather_idx
         torch.index_select(
             global_batch.input_ids,
             0,
@@ -591,6 +611,29 @@ class PCPManager:
 
     def is_partitioned_batch(self, input_batch: InputBatch) -> bool:
         return input_batch is self._local_batch
+
+    def local_batch_for(self, global_batch: InputBatch) -> InputBatch | None:
+        """Return this step's local view, never one retained from an older step."""
+        if global_batch is not self._global_batch:
+            return None
+        return self._local_batch
+
+    def localize_input_ids_for_draft(
+        self,
+        global_input_ids: torch.Tensor,
+        local_batch: InputBatch,
+    ) -> torch.Tensor:
+        """Materialize shifted draft IDs in the consumed target input buffer."""
+        assert local_batch is self._local_batch
+        assert self._local_gather_idx is not None
+        torch.index_select(
+            global_input_ids,
+            0,
+            self._local_gather_idx,
+            out=local_batch.input_ids,
+        )
+        local_batch.input_ids.masked_fill_(local_batch.is_padding, 0)
+        return local_batch.input_ids
 
     def prepare_attn(
         self, input_batch: InputBatch

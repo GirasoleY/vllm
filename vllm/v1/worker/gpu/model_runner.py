@@ -632,6 +632,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables,
             cls=self.pcp_manager_cls,
         )
+        if (
+            self.pcp_manager is not None
+            and isinstance(self.speculator, DraftModelSpeculator)
+            and self.speculator.sharded_pcp
+        ):
+            self.speculator.set_pcp_manager(  # type: ignore[attr-defined]
+                self.pcp_manager
+            )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
@@ -814,6 +822,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.forward_end()
 
         assert hidden_states is not None
+        target_hidden_states = hidden_states
+        target_aux_hidden_states = aux_hidden_states
         input_batch, hidden_states, aux_hidden_states, restored_pcp = (
             self._restore_pcp_outputs(input_batch, hidden_states, aux_hidden_states)
         )
@@ -837,16 +847,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
+            sharded_pcp = (
+                isinstance(self.speculator, DraftModelSpeculator)
+                and self.speculator.sharded_pcp
+                and restored_pcp
+            )
+            spec_hidden_states = target_hidden_states if sharded_pcp else hidden_states
+            spec_aux_hidden_states = (
+                target_aux_hidden_states if sharded_pcp else aux_hidden_states
+            )
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 assert pre_hc_hidden_states is not None
-                if restored_pcp:
+                if restored_pcp and not sharded_pcp:
                     assert self.pcp_manager is not None
                     pre_hc_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
                         pre_hc_hidden_states
                     )
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
+                spec_hidden_states = pre_hc_hidden_states[: spec_hidden_states.shape[0]]
             draft_dp_sync = (
                 None
                 if isinstance(self.speculator, DraftModelSpeculator)
@@ -859,7 +877,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata=attn_metadata,
                     slot_mappings=slot_mappings_by_layer,
                     last_hidden_states=spec_hidden_states,
-                    aux_hidden_states=aux_hidden_states,
+                    aux_hidden_states=spec_aux_hidden_states,
                     num_sampled=torch.ones(
                         input_batch.num_reqs, dtype=torch.int32, device=self.device
                     ),
@@ -1917,6 +1935,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Last rank: sample tokens
         assert hidden_states is not None
+        target_hidden_states = hidden_states
+        target_aux_hidden_states = aux_hidden_states
         input_batch, hidden_states, aux_hidden_states, restored_pcp = (
             self._restore_pcp_outputs(input_batch, hidden_states, aux_hidden_states)
         )
@@ -1995,16 +2015,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
+            sharded_pcp = (
+                isinstance(self.speculator, DraftModelSpeculator)
+                and self.speculator.sharded_pcp
+                and restored_pcp
+            )
+            spec_hidden_states = target_hidden_states if sharded_pcp else hidden_states
+            spec_aux_hidden_states = (
+                target_aux_hidden_states if sharded_pcp else aux_hidden_states
+            )
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 assert pre_hc_hidden_states is not None
-                if restored_pcp:
+                if restored_pcp and not sharded_pcp:
                     assert self.pcp_manager is not None
                     pre_hc_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
                         pre_hc_hidden_states
                     )
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
+                spec_hidden_states = pre_hc_hidden_states[: spec_hidden_states.shape[0]]
             draft_dp_sync = (
                 None
                 if isinstance(self.speculator, DraftModelSpeculator)
@@ -2017,7 +2045,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata,
                     slot_mappings_by_layer,
                     spec_hidden_states,
-                    aux_hidden_states,
+                    spec_aux_hidden_states,
                     num_sampled,
                     num_rejected,
                     self.req_states.last_sampled_tokens,

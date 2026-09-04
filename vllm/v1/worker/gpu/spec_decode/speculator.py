@@ -91,6 +91,7 @@ class BaseSpeculator(ABC):
 
 class DraftModelSpeculator(BaseSpeculator):
     supports_replicated_pcp = False
+    supports_sharded_pcp = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         assert vllm_config.speculative_config is not None
@@ -113,9 +114,10 @@ class DraftModelSpeculator(BaseSpeculator):
         if draft_pcp not in (1, target_pcp):
             raise ValueError("Draft PCP must be 1 or match the target PCP size.")
         self.replicated_pcp = target_pcp > 1 and draft_pcp == 1
-        if target_pcp > 1 and draft_pcp == target_pcp:
+        self.sharded_pcp = target_pcp > 1 and draft_pcp == target_pcp
+        if self.sharded_pcp and not self.supports_sharded_pcp:
             raise NotImplementedError(
-                "PCP-sharded drafting is not supported yet; set draft PCP to 1."
+                f"{type(self).__name__} does not support PCP-sharded drafting."
             )
         if self.replicated_pcp and not self.supports_replicated_pcp:
             raise NotImplementedError(
@@ -307,6 +309,7 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -374,6 +377,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            is_prefilling=is_prefilling,
         )
         return attn_metadata
 

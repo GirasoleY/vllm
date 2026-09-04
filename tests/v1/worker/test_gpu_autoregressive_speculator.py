@@ -200,7 +200,7 @@ def test_sharded_parallel_config_inherits_target_ep():
         (
             {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
             {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
-            "PCP-sharded drafting is not supported",
+            "does not support PCP-sharded drafting",
         ),
         (
             {"tensor_parallel_size": 2, "prefill_context_parallel_size": 2},
@@ -221,11 +221,15 @@ def test_draft_parallel_topology_validation(target_kwargs, draft_kwargs, error):
         _TestSpeculator(config, torch.device("cpu"))
 
 
-def test_replicated_pcp_capability_is_opt_in():
+def test_pcp_capabilities_are_opt_in():
     assert MTPSpeculator.supports_replicated_pcp
     assert DSparkSpeculator.supports_replicated_pcp
     assert not DraftModelSpeculator.supports_replicated_pcp
     assert not MultiModuleMTPSpeculator.supports_replicated_pcp
+    assert MTPSpeculator.supports_sharded_pcp
+    assert not DSparkSpeculator.supports_sharded_pcp
+    assert not DraftModelSpeculator.supports_sharded_pcp
+    assert not MultiModuleMTPSpeculator.supports_sharded_pcp
 
 
 def test_replicated_parallel_config_controls_fused_moe_pcp(monkeypatch):
@@ -483,6 +487,105 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+def test_set_pcp_manager_keeps_speculator_owned_buffers():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.input_buffers = input_buffers = object()
+    manager = Mock()
+
+    speculator.set_pcp_manager(manager)
+
+    assert speculator.pcp_manager is manager
+    assert speculator.input_buffers is input_buffers
+
+
+def test_sharded_prefill_restores_outputs_before_global_sampling():
+    speculator = object.__new__(_TestSpeculator)
+    local_logits = torch.tensor([[1.0], [2.0]])
+    local_feedback = torch.tensor([[3.0], [4.0]])
+    global_logits = torch.tensor([[1.0], [5.0], [2.0], [6.0]])
+    global_feedback = torch.tensor([[3.0], [7.0], [4.0], [8.0]])
+    manager = Mock()
+    manager.restore_hidden_states.side_effect = [global_logits, global_feedback]
+    local_batch = SimpleNamespace(
+        input_ids=torch.tensor([10, 20]),
+        positions=torch.tensor([0, 2]),
+        is_padding=torch.tensor([False, True]),
+    )
+    speculator.pcp_manager = manager
+    speculator._run_model = Mock(return_value=(local_logits, local_feedback))
+    speculator.last_token_indices = torch.tensor([1, 3])
+    speculator.idx_mapping = torch.tensor([0, 1])
+    speculator.temperature = torch.zeros(2)
+    speculator.seeds = torch.zeros(2, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.draft_logits = None
+    speculator.draft_tokens = torch.zeros((2, 1), dtype=torch.int64)
+    speculator.hidden_states = torch.zeros((4, 1))
+    speculator.sample_src_positions = torch.zeros(2, dtype=torch.int64)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(4, dtype=torch.int64)
+    )
+    speculator.sample_draft = Mock(return_value=torch.tensor([11, 22]))
+
+    speculator._prefill(
+        num_reqs=2,
+        num_tokens=2,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        pcp_local_batch=local_batch,
+    )
+
+    assert torch.equal(speculator.draft_tokens[:, 0], torch.tensor([11, 22]))
+    assert torch.equal(speculator.hidden_states[:2], torch.tensor([[7.0], [8.0]]))
+    assert torch.equal(
+        speculator.sample_draft.call_args.args[0], torch.tensor([[5.0], [6.0]])
+    )
+    assert torch.equal(speculator.sample_src_positions, torch.tensor([2, 4]))
+    run_kwargs = speculator._run_model.call_args.kwargs
+    assert run_kwargs["input_ids"] is local_batch.input_ids
+    assert run_kwargs["positions"] is local_batch.positions
+    assert torch.equal(run_kwargs["is_padding"], local_batch.is_padding)
+
+
+def test_sharded_continuation_metadata_is_decode_only(monkeypatch):
+    speculator = object.__new__(_TestSpeculator)
+    speculator.sharded_pcp = True
+    speculator.num_speculative_steps = 2
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2),
+        query_start_loc=torch.arange(3),
+    )
+    speculator.idx_mapping = torch.arange(2)
+    speculator.block_tables = SimpleNamespace(
+        compute_slot_mappings=Mock(return_value=torch.arange(2))
+    )
+    speculator.kv_cache_config = object()
+    speculator._build_draft_attn_metadata = Mock(return_value={})
+    speculator._generate_draft = Mock()
+    monkeypatch.setattr(
+        spec_module, "build_slot_mappings_by_layer", Mock(return_value={})
+    )
+
+    speculator._multi_step_decode(
+        num_reqs=2,
+        skip_attn=False,
+        batch_desc=BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=2,
+            num_reqs=2,
+        ),
+        seq_lens_cpu_upper_bound=torch.ones(2, dtype=torch.int32),
+        num_tokens_across_dp=None,
+    )
+
+    is_prefilling = speculator._build_draft_attn_metadata.call_args.kwargs[
+        "is_prefilling"
+    ]
+    assert torch.equal(is_prefilling, torch.zeros(2, dtype=torch.bool))
 
 
 @pytest.mark.parametrize(
