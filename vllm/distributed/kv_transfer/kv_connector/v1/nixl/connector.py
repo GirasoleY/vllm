@@ -76,6 +76,8 @@ logger = init_logger(__name__)
 class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     """Base connector with common logic shared by pull and push modes."""
 
+    _TRANSFER_MODE = "pull"
+
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return True
@@ -101,15 +103,38 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         parallel_config = vllm_config.parallel_config
         pcp_size = parallel_config.prefill_context_parallel_size
         kv_role = vllm_config.kv_transfer_config.kv_role
-        if pcp_size > 1 and kv_role in ("kv_consumer", "kv_both"):
+        self._generic_placement_enabled = (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "enable_generic_placement", False
+            )
+        )
+        if not isinstance(self._generic_placement_enabled, bool):
+            raise ValueError("enable_generic_placement must be a boolean")
+        if (
+            pcp_size > 1
+            and self._generic_placement_enabled
+            and self._TRANSFER_MODE != "pull"
+        ):
             raise NotImplementedError(
-                "NixlConnector PCP currently supports kv_producer only. "
-                "Consumers and kv_both require "
-                "prefill_context_parallel_size=1."
+                "generic NIXL PCP placement is supported only for pull transfers"
+            )
+        generic_pcp_consumer = (
+            kv_role == "kv_consumer"
+            and self._generic_placement_enabled
+            and self._TRANSFER_MODE == "pull"
+        )
+        if (
+            pcp_size > 1
+            and kv_role in ("kv_consumer", "kv_both")
+            and not generic_pcp_consumer
+        ):
+            raise NotImplementedError(
+                "NixlConnector PCP consumers require pull transfer with "
+                "enable_generic_placement=True; kv_both is unsupported."
             )
         if pcp_size > 1 and parallel_config.decode_context_parallel_size > 1:
             raise NotImplementedError(
-                "NixlConnector PCP producers currently require "
+                "NixlConnector PCP endpoints currently require "
                 "decode_context_parallel_size=1."
             )
         # TODO: Support PCP with bidirectional KV transfer by tracking separate
@@ -160,6 +185,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and parallel_config.prefill_context_parallel_size > 1
+            and not self._generic_placement_enabled
         ):
             return (
                 parallel_config.tensor_parallel_size
@@ -217,12 +243,13 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def set_xfer_handshake_metadata_pp_aware(
         self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:
-        """
-        Set handshake metadata keyed by (pp_rank, tp_rank) so the side
-        channel can serve every PP stage's agent metadata.
+        """Set handshake metadata keyed by PP-local placement coordinates.
+
+        The second coordinate is ``pcp_rank * tp_size + tp_rank``. This lets
+        the side channel serve every PCP replica within every PP stage.
 
         Args:
-            metadata (dict): the handshake metadata to set.
+            metadata: Handshake metadata keyed by PP-local placement rank.
         """
         assert self.connector_scheduler is not None
         self.connector_scheduler.set_xfer_handshake_metadata(metadata)
@@ -245,6 +272,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
+            and not self._generic_placement_enabled
         ):
             done_sending.clear()
         return done_sending, done_recving
@@ -326,6 +354,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
+            and not self._generic_placement_enabled
         ):
             return None
         return self.connector_worker.xfer_handshake_metadata
@@ -361,6 +390,8 @@ class NixlPullConnector(NixlBaseConnector):
 
 class NixlPushConnector(NixlBaseConnector):
     """Push-based (WRITE) NIXL KV transfer connector."""
+
+    _TRANSFER_MODE = "push"
 
     def __init__(
         self,

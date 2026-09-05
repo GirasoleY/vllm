@@ -171,12 +171,56 @@ class _PPAwareConnector(_LegacyConnector):
         self.pp_aware_metadata = metadata
 
 
+@pytest.mark.parametrize(
+    ("pcp_size", "pcp_rank", "expected_second_coordinate"),
+    [(1, 0, 3), (3, 2, 11)],
+)
+def test_gpu_worker_flattens_pcp_into_two_axis_handshake_coordinate(
+    monkeypatch: pytest.MonkeyPatch,
+    pcp_size: int,
+    pcp_rank: int,
+    expected_second_coordinate: int,
+) -> None:
+    from vllm.v1.worker import gpu_worker as gpu_worker_module
+
+    metadata = _Metadata()
+    connector = SimpleNamespace(get_handshake_metadata=lambda: metadata)
+    worker = object.__new__(gpu_worker_module.Worker)
+    worker.parallel_config = SimpleNamespace(
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=pcp_size,
+    )
+    monkeypatch.setattr(gpu_worker_module, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(gpu_worker_module, "get_kv_transfer_group", lambda: connector)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=1),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=pcp_rank),
+    )
+
+    assert worker.get_kv_connector_handshake_metadata() == {
+        (1, expected_second_coordinate): metadata
+    }
+
+
 def test_engine_unwraps_handshake_metadata_for_legacy_connector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Engine core always asks workers for `(pp_rank, tp_rank)`-keyed metadata,
-    then unwraps to `{tp_rank: metadata}` for a connector that has not opted
-    into PP-aware handshake (single-PP producer, all `pp_rank == 0`)."""
+    """Engine core asks for two-axis, PP-local-placement-keyed metadata.
+
+    With PCP=1 the second coordinate remains the TP rank, so a connector that
+    has not opted into PP-aware handshake still receives ``{tp_rank: metadata}``.
+    """
     metadata_0 = _Metadata()
     metadata_1 = _Metadata()
     connector = _LegacyConnector()
@@ -213,8 +257,7 @@ def test_engine_rejects_pp_producer_for_legacy_connector(
 def test_engine_passes_handshake_metadata_through_for_pp_aware_connector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PP-aware connector receives the full `(pp_rank, tp_rank)`-keyed dict
-    unchanged."""
+    """A PP-aware connector receives the full two-coordinate dict unchanged."""
     metadata_0 = _Metadata()
     metadata_1 = _Metadata()
     connector = _PPAwareConnector()
@@ -230,4 +273,26 @@ def test_engine_passes_handshake_metadata_through_for_pp_aware_connector(
     assert connector.pp_aware_metadata == {
         (0, 0): metadata_0,
         (1, 0): metadata_1,
+    }
+
+
+def test_engine_preserves_distinct_flattened_pcp_handshake_coordinates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_pcp0 = _Metadata()
+    metadata_pcp1 = _Metadata()
+    connector = _PPAwareConnector()
+
+    _run_engine_core_handshake(
+        monkeypatch,
+        connector,
+        handshake_metadata=[
+            {(0, 0): metadata_pcp0},
+            {(0, 2): metadata_pcp1},
+        ],
+    )
+
+    assert connector.pp_aware_metadata == {
+        (0, 0): metadata_pcp0,
+        (0, 2): metadata_pcp1,
     }

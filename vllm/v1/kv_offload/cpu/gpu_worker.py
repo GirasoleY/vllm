@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.distributed.kv_transfer.kv_placement import CanonicalPageMapping
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
@@ -20,7 +21,6 @@ from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
     CanonicalKVCaches,
-    CanonicalPageMapping,
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingWorker,
@@ -148,7 +148,7 @@ def _build_copy_plan(ref: CanonicalKVCacheRef, gpu_to_cpu: bool) -> CopyPlan:
     for run in mapping.runs:
         for i in range(run.num_fragments):
             local.append(run.local_offset + i * run.local_stride)
-            canonical.append(run.canonical_offset + i * run.canonical_stride)
+            canonical.append(run.storage_offset + i * run.storage_stride)
             sizes.append(run.fragment_size)
     src, dst = (local, canonical) if gpu_to_cpu else (canonical, local)
     return CopyPlan(

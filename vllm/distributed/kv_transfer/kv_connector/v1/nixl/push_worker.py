@@ -88,8 +88,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
-        # Heartbeat handshakes to a PP-sharded producer must be notif-only,
-        # like the PUSH_REG path.
+        # This consumer only notifies the producer in push mode. Keep heartbeat
+        # and PUSH_REG handshakes on the same notif-only endpoint identity.
         self._hb_handshake_notif_only = True
 
         # Push-specific state.
@@ -146,12 +146,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Unblock the writer if it's waiting in the no-active-state branch.
         self._push_writer_wake.set()
         if self._push_writer_thread is not None:
-            self._push_writer_thread.join(timeout=2)
+            # Never release NIXL state beneath a writer that may still be in a
+            # transfer call. The stop event prevents new loop iterations.
+            self._push_writer_thread.join()
             self._push_writer_thread = None
         with self._sending_transfers_lock:
             for handles in self._sending_transfers.values():
                 for handle in handles:
-                    self.nixl_wrapper.release_xfer_handle(handle)
+                    self._release_xfer_handle(handle)
             self._sending_transfers.clear()
         super().shutdown()
 
@@ -163,6 +165,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             return
 
         # D-side: track reqs waiting for P to push.
+        ignored_overlapping_reqs: set[str] = set()
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block
@@ -177,11 +180,25 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 len(meta.local_physical_block_ids),
                 len(meta.remote.block_ids),
             )
-            self._recving_metadata[req_id] = meta
+            with self._handshake_lock:
+                if self._recving_metadata.get(req_id) is not None:
+                    # Push completion and registration state is also keyed only
+                    # by request ID. Do not let an overlapping attempt replace
+                    # the destination buffers still owned by the original.
+                    logger.error(
+                        "Ignoring overlapping NIXL push receive attempt for "
+                        "request ID %s until the original attempt is terminal",
+                        req_id,
+                    )
+                    ignored_overlapping_reqs.add(req_id)
+                    continue
+                self._recving_metadata[req_id] = meta
 
         # --- D-side: registrations to send to P via NIXL ---
         if metadata.push_registrations:
             for req_id, reg_data in metadata.push_registrations.items():
+                if req_id in ignored_overlapping_reqs:
+                    continue
                 self._reg_send_inbox.put((req_id, reg_data))
             self._push_writer_wake.set()
 
@@ -318,6 +335,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             # P's memory in push mode, so it never needs the transfer
             # descriptors set up by the full add_remote_agent path.
             notif_agents_only=True,
+            endpoint_incarnation=reg_data.get("remote_endpoint_incarnation"),
+            request_id=req_id,
         )
         if fut is None:
             self._do_send_reg_notif(req_id, reg_data)
@@ -328,6 +347,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             rid: str = req_id,
             rd: dict[str, Any] = reg_data,
         ) -> None:
+            if self._push_writer_stop.is_set():
+                return
             try:
                 f.result()
             except Exception as e:
@@ -436,6 +457,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             registration_data["decode_host"],
             registration_data["decode_port"],
             registration_data["decode_tp_size"],
+            endpoint_incarnation=registration_data.get("decode_endpoint_incarnation"),
         )
         if fut is not None:
 
@@ -445,6 +467,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 blocks: BlockIds = local_block_ids,
                 rd: dict[str, Any] = registration_data,
             ) -> None:
+                if self._push_writer_stop.is_set():
+                    return
                 if (e := f.exception()) is not None:
                     # The engine reclaims the blocks via the TTL so we dont free here
                     self._log_failure(
@@ -567,7 +591,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 # Multiple targets: write each rank its chunk of local memory.
                 # Hybrid MLA+SSM also lands here: its split handles replicate
                 # the attention descriptors and chunk only the SSM state.
-                split_key = (tp_ratio, remote_block_size)
+                split_key = self._split_local_xfer_handle_key(
+                    tp_ratio, remote_block_size, plan
+                )
                 local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
             else:
                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
@@ -592,8 +618,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Publish all the request's WRITE handles in one locked update: a
         # partial set would let ``_pop_done_transfers`` finish the request
         # early, then double-report it as the remaining writes land.
-        if handles:
-            with self._sending_transfers_lock:
+        with self._sending_transfers_lock:
+            poller = getattr(self, "_request_terminal_poller", None)
+            failed = poller is not None and poller.has_failed("send", req_id)
+            # A submission failure has no handle to publish, but it still
+            # needs an empty request entry so the request-level poller can
+            # report terminal failure after all successfully submitted
+            # sibling handles have drained.
+            if handles or failed:
                 self._sending_transfers[req_id].extend(handles)
 
     def _xfer_blocks(
@@ -694,13 +726,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 dst_engine_id=dst_engine_id,
                 remote_rank=remote_rank,
             )
-            # On the P side this WRITE failure is purely outbound; we
-            # don't have a ``_recving_metadata`` entry to invalidate, so
-            # we just release the handle and let the engine reschedule
-            # via the lease / watchdog.
-            if handle is not None:
-                self.nixl_wrapper.release_xfer_handle(handle)
-            self.xfer_stats.record_failed_transfer()
+            # The P-side WRITE is outbound, so latch it on the send stream:
+            # wait for successfully submitted siblings, but never invalidate
+            # an unrelated receive-side request with the same ID.
+            self._latch_failed_transfer(request_id, handle, stream="send")
             return None
 
     # --- Notification handling on engine main thread ------------------ #
@@ -777,8 +806,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.
+        failed_pushing: set[str] = set()
         with self._sending_transfers_lock:
-            done_pushing = self._pop_done_transfers(self._sending_transfers)
+            done_pushing = self._pop_done_transfers(
+                self._sending_transfers,
+                stream="send",
+                failed_req_ids=failed_pushing,
+            )
+        # Failed requests are terminal for scheduler/block-lifetime purposes,
+        # but are intentionally excluded from any future aggregate success
+        # notification by ``done_pushing - failed_pushing``.
         for req_id in done_pushing:
             self._reqs_to_send.pop(req_id, None)
             self._reqs_to_process.discard(req_id)

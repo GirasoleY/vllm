@@ -6,7 +6,7 @@ from dataclasses import replace
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
+from vllm.distributed.kv_transfer.canonical_mapping import (
     derive_canonical_mappings,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (

@@ -44,12 +44,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    MAX_NIXL_HANDSHAKE_BYTES,
+    MAX_NIXL_HANDSHAKE_RANKS,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.transfer_completion import WorkerIdentity
 from vllm.forward_context import ForwardContext
 from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
@@ -74,6 +77,7 @@ from .utils import (
     create_scheduler,
     create_vllm_config,
     make_kv_cache_config,
+    set_mock_multipart_replies,
 )
 
 
@@ -403,8 +407,9 @@ def test_kv_transfer_handshake(dist_init):
         metadata = prefill_connector.get_handshake_metadata()
 
         # metadata is a NixlHandshakePayload, decode it to get NixlAgentMetadata
-        decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-        expected_agent_metadata = decoder.decode(metadata.agent_metadata_bytes)
+        expected_agent_metadata = NixlAgentMetadata.decode(
+            metadata.agent_metadata_bytes
+        )
 
         # The scheduler connector expects metadata keyed by
         # (pp_rank, tp_rank).
@@ -510,6 +515,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         remote_dcp_size: int = 1,
         remote_pp_size: int = 1,
         notif_agents_only: bool = False,
+        remote_pcp_size: int = 1,
     ) -> tuple[dict[tuple[int, int], str], float]:
         # Mimic slow _nixl_handshake, as well as bypass zmq communication.
         time.sleep(self._hand_shake_latency)
@@ -556,6 +562,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     attn_backend_name=self.backend_name,
                     physical_blocks_per_logical_kv_block=1,
                     dcp_size=remote_dcp_size,
+                    pcp_size=remote_pcp_size,
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
@@ -617,9 +624,160 @@ class TestNixlHandshake:
 
         expected_payload = payload if pcp_rank == 0 else None
         assert connector.get_handshake_metadata() is expected_payload
+        assert connector.get_finished_count() == 1
         done_sending, done_recving = connector.get_finished(set())
         assert done_sending == ({"sent"} if pcp_rank == 0 else set())
         assert done_recving == set()
+
+    @pytest.mark.parametrize("pcp_rank", [0, 1])
+    def test_generic_pcp_producer_tracks_every_replica(self, pcp_rank):
+        worker = object.__new__(NixlConnectorWorker)
+        worker.pcp_rank = pcp_rank
+        worker._enable_generic_placement = True
+        worker._physical_blocks_per_logical_kv_block = 1
+        worker._recving_metadata = {}
+        worker._remote_agents = {}
+        worker._ready_requests = MagicMock()
+        worker._ready_requests.empty.return_value = True
+        worker._refill_direct_read_batch_windows = MagicMock()
+        worker._reqs_to_process = set()
+        worker._reqs_to_send = {}
+        worker._expected_direct_transfer_ids = {}
+        worker._expected_direct_participant_counts = {}
+        worker._expected_direct_participants = {}
+        worker._direct_completion_trackers = {}
+        worker._direct_completion_participant_digests = {}
+        worker._direct_completion_sender_bindings = {}
+        worker._send_heartbeats = MagicMock()
+        worker._local_placement_metadata = cast(Any, object())
+        roster = (
+            WorkerIdentity("decode-0", "boot-0"),
+            WorkerIdentity("decode-1", "boot-1"),
+        )
+        req_id = "req"
+        metadata = NixlConnectorMetadata()
+        metadata.reqs_in_batch.add(req_id)
+        metadata.reqs_to_send[req_id] = time.perf_counter() + 10
+        metadata.reqs_to_send_transfer_ids[req_id] = "attempt"
+        metadata.reqs_to_send_expected_participant_counts[req_id] = len(roster)
+        metadata.reqs_to_send_expected_participants[req_id] = roster
+
+        worker.start_load_kv(metadata)
+
+        assert req_id in worker._reqs_to_process
+        assert req_id in worker._reqs_to_send
+        assert worker._expected_direct_participant_counts[req_id] == len(roster)
+        assert worker._expected_direct_participants[req_id] == roster
+
+        connector = object.__new__(NixlConnector)
+        connector.connector_worker = worker
+        connector.kv_transfer_config = SimpleNamespace(kv_role="kv_producer")
+        connector._generic_placement_enabled = True
+        connector._vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=2,
+            )
+        )
+        assert connector.get_finished_count() is None
+
+        payload = MagicMock(spec=NixlHandshakePayload)
+        worker.xfer_handshake_metadata = payload
+        worker.get_finished = MagicMock(return_value=({"sent"}, set()))
+        assert connector.get_handshake_metadata() is payload
+        assert connector.get_finished(set()) == ({"sent"}, set())
+
+    def test_generic_pcp_rejects_push_and_bidirectional_modes(
+        self, default_vllm_config
+    ):
+        default_vllm_config.parallel_config.prefill_context_parallel_size = 2
+        default_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_generic_placement": True},
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="generic NIXL PCP placement is supported only for pull",
+        ):
+            nixl.NixlPushConnector(
+                default_vllm_config,
+                KVConnectorRole.SCHEDULER,
+                make_kv_cache_config(block_size=16),
+            )
+
+        default_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={
+                "enable_generic_placement": True,
+                "bidirectional_kv_xfer": True,
+            },
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="do not support bidirectional KV transfer",
+        ):
+            NixlConnector(
+                default_vllm_config,
+                KVConnectorRole.SCHEDULER,
+                make_kv_cache_config(block_size=16),
+            )
+
+    def test_generic_pcp_accepts_pull_consumer_and_legacy_stays_rejected(
+        self, default_vllm_config
+    ):
+        default_vllm_config.parallel_config.prefill_context_parallel_size = 2
+        default_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_consumer",
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="PCP consumers require pull transfer",
+        ):
+            NixlConnector(
+                default_vllm_config,
+                KVConnectorRole.SCHEDULER,
+                make_kv_cache_config(block_size=16),
+            )
+
+        default_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"enable_generic_placement": True},
+        )
+        with patch.object(nixl.connector, "NixlPullConnectorScheduler") as scheduler:
+            connector = NixlConnector(
+                default_vllm_config,
+                KVConnectorRole.SCHEDULER,
+                make_kv_cache_config(block_size=16),
+            )
+
+        scheduler.assert_called_once()
+        assert connector.connector_scheduler is scheduler.return_value
+
+    def test_generic_pcp_accepts_same_endpoint_pipeline_parallelism(
+        self, default_vllm_config
+    ):
+        default_vllm_config.parallel_config.prefill_context_parallel_size = 2
+        default_vllm_config.parallel_config.pipeline_parallel_size = 2
+        default_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config={"enable_generic_placement": True},
+        )
+
+        with patch.object(nixl.connector, "NixlPullConnectorScheduler") as scheduler:
+            connector = NixlConnector(
+                default_vllm_config,
+                KVConnectorRole.SCHEDULER,
+                make_kv_cache_config(block_size=16),
+            )
+
+        scheduler.assert_called_once()
+        assert connector.connector_scheduler is scheduler.return_value
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
@@ -821,7 +979,11 @@ class TestNixlHandshake:
             assert remote_info.remote_tp_size == remote_tp_size
             assert -tp_ratio == worker.transfer_topo.tp_ratio(remote_tp_size)
             # ensure src_xfer_handles_by_tp_ratio is populated with tpratio chunks
-            split_key = (-tp_ratio, worker.block_size)
+            split_key = worker._split_local_xfer_handle_key(
+                -tp_ratio,
+                worker.block_size,
+                worker.tp_mappings[remote_engine_id],
+            )
             assert split_key in worker.src_xfer_handles_by_tp_ratio
             assert len(worker.src_xfer_handles_by_tp_ratio[split_key]) == tp_ratio
             assert remote_engine_id in worker.dst_xfer_side_handles
@@ -2191,17 +2353,18 @@ def test_kv_buffer_to_nixl_memory_types(
 )
 def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
     """Test that shutdown() properly cleans up all resources."""
-    vllm_config = create_vllm_config()
+    # CPU_ATTN only exposes kernel block sizes that are multiples of 32.
+    vllm_config = create_vllm_config(block_size=32)
 
     scheduler = NixlConnectorScheduler(
         vllm_config,
         vllm_config.kv_transfer_config.engine_id,
-        make_kv_cache_config(block_size=16),
+        make_kv_cache_config(block_size=32),
     )
     worker = NixlConnectorWorker(
         vllm_config,
         vllm_config.kv_transfer_config.engine_id,
-        make_kv_cache_config(block_size=16),
+        make_kv_cache_config(block_size=32),
     )
     nixl_wrapper = worker.nixl_wrapper
 
@@ -2235,7 +2398,7 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
         worker.shutdown()
         worker.shutdown()
 
-        mock_exec.shutdown.assert_called_with(wait=False)
+        mock_exec.shutdown.assert_called_with(wait=True, cancel_futures=True)
 
         # Same sequence on scheduler.shutdown()
         scheduler.shutdown()
@@ -2256,6 +2419,778 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
 
 
 # ── TTL-based remote engine eviction tests ──────────────────────────
+
+
+def test_multirank_handshake_rolls_back_imported_agents_on_failure():
+    worker = object.__new__(NixlConnectorWorker)
+
+    def fail_after_one_import(*args):
+        imported_agents = args[7]
+        imported_agents.append("decode-agent-0")
+        raise RuntimeError("rank 1 handshake failed")
+
+    worker._nixl_handshake_impl = MagicMock(side_effect=fail_after_one_import)
+    worker._rollback_incomplete_handshake = MagicMock()
+
+    with pytest.raises(RuntimeError, match="rank 1 handshake failed"):
+        worker._nixl_handshake("decode-host", 1234, 2, "decode-engine")
+
+    worker._rollback_incomplete_handshake.assert_called_once_with(
+        "decode-engine", ["decode-agent-0"]
+    )
+
+
+def test_incomplete_handshake_rollback_clears_all_per_engine_state():
+    worker = object.__new__(NixlConnectorWorker)
+    worker.nixl_wrapper = MagicMock()
+    worker.transfer_topo = MagicMock()
+    worker.dst_xfer_side_handles = defaultdict(dict, {"decode": {0: 10, 1: 11}})
+    worker._remote_agents = defaultdict(dict, {"decode": {(0, 0): "agent-committed"}})
+    worker.kv_caches_base_addr = defaultdict(dict, {"decode": {0: [1000]}})
+    worker.dst_num_blocks = {"decode": 64}
+    worker.tp_mappings = {"decode": object()}
+    worker._remote_placement_indexes = {"decode": object()}
+    worker._generic_only_remote_engines = {"decode"}
+    worker._engine_clock_offset = {"decode": 0.1}
+    worker._engine_last_active = {"decode": 1.0}
+    worker._remote_handshake_specs = {"decode": object()}
+    worker._stale_remote_engines = {"decode"}
+
+    worker._rollback_incomplete_handshake(
+        "decode", ["agent-imported", "agent-committed"]
+    )
+
+    assert "decode" not in worker.dst_xfer_side_handles
+    assert "decode" not in worker._remote_agents
+    assert "decode" not in worker.kv_caches_base_addr
+    assert "decode" not in worker.dst_num_blocks
+    assert "decode" not in worker.tp_mappings
+    assert "decode" not in worker._remote_placement_indexes
+    assert "decode" not in worker._generic_only_remote_engines
+    assert "decode" not in worker._engine_clock_offset
+    assert "decode" not in worker._engine_last_active
+    assert "decode" not in worker._remote_handshake_specs
+    assert "decode" not in worker._stale_remote_engines
+    assert {
+        item.args[0] for item in worker.nixl_wrapper.release_dlist_handle.call_args_list
+    } == {10, 11}
+    assert {
+        item.args[0] for item in worker.nixl_wrapper.remove_remote_agent.call_args_list
+    } == {"agent-imported", "agent-committed"}
+    worker.transfer_topo.unregister_remote_engine.assert_called_once_with("decode")
+
+
+def _minimal_handshake_agent(
+    pp_local_rank: int,
+    *,
+    placement: bool,
+    tp_size: int = 4,
+    dcp_size: int = 1,
+    pcp_size: int = 1,
+    pp_size: int = 1,
+    pp_rank: int = 0,
+    kv_cache_layout: str = "LBHNC",
+) -> NixlAgentMetadata:
+    pcp_rank, tp_rank = divmod(pp_local_rank, tp_size)
+    return NixlAgentMetadata(
+        engine_id="prefill-engine",
+        agent_metadata=f"agent-{pp_local_rank}".encode(),
+        kv_caches_base_addr=[1000 + pp_local_rank * 100],
+        device_id=pp_local_rank,
+        num_blocks=8,
+        block_lens=[4],
+        block_strides=[4],
+        kv_cache_layout=kv_cache_layout,
+        block_size=4,
+        ssm_sizes=(0, 0),
+        attn_backend_name="test",
+        physical_blocks_per_logical_kv_block=1,
+        dcp_size=dcp_size,
+        pcp_size=pcp_size,
+        cp_kv_cache_interleave_size=1,
+        placement_metadata=(
+            cast(
+                Any,
+                SimpleNamespace(
+                    rank_placement=SimpleNamespace(
+                        tp_size=tp_size,
+                        tp_rank=tp_rank,
+                        dcp_size=dcp_size,
+                        dcp_rank=tp_rank % dcp_size,
+                        pcp_size=pcp_size,
+                        pcp_rank=pcp_rank,
+                        pp_size=pp_size,
+                        pp_rank=pp_rank,
+                        cp_interleave=1,
+                    )
+                ),
+            )
+            if placement
+            else None
+        ),
+    )
+
+
+def _minimal_handshake_worker(
+    *,
+    legacy_target_ranks: list[int],
+    dcp_size: int = 1,
+    use_mla: bool = True,
+    kv_cache_layout: str = "LBHNC",
+    local_tp_size: int = 1,
+    total_num_kv_heads: int = 8,
+) -> NixlConnectorWorker:
+    worker = object.__new__(NixlConnectorWorker)
+    worker._is_csa_linear = False
+    worker.use_host_buffer = False
+    worker.device_id = 0
+    worker.transfer_topo = SimpleNamespace(
+        handshake_target_ranks=lambda *_: legacy_target_ranks,
+        tp_size=local_tp_size,
+        total_num_kv_heads=total_num_kv_heads,
+    )
+    worker._local_placement_metadata = cast(Any, object())
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.dcp_size = dcp_size
+    worker.cp_kv_cache_interleave_size = 1
+    worker.block_size = 4
+    worker.use_mla = use_mla
+    worker.kv_cache_layout = kv_cache_layout
+    worker.host_buffer_kv_cache_layout = kv_cache_layout
+    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=False)
+    worker._is_hma_required = False
+    worker.pp_size = 1
+    worker.compat_hash = "strict"
+    worker.placement_compat_hash = "placement"
+    worker.enforce_compat_hash = False
+    worker._remote_placement_indexes = {}
+    worker._generic_only_remote_engines = set()
+    worker._validate_remote_parallel_config = MagicMock()
+    worker.add_remote_agent = MagicMock(
+        side_effect=lambda _metadata, rank, *_args, **_kwargs: f"agent-{rank}"
+    )
+    return worker
+
+
+def _run_minimal_handshake(
+    worker: NixlConnectorWorker,
+    metadata_by_rank: list[NixlAgentMetadata],
+    *,
+    remote_dcp_size: int | None = None,
+    remote_pcp_size: int | None = None,
+    remote_pp_size: int = 1,
+    remote_perf: float | None = None,
+) -> tuple[dict[tuple[int, int], str], MagicMock]:
+    requested_pcp_size = (
+        metadata_by_rank[0].pcp_size if remote_pcp_size is None else remote_pcp_size
+    )
+    assert len(metadata_by_rank) % requested_pcp_size == 0
+    requested_tp_size = len(metadata_by_rank) // requested_pcp_size
+    payload = NixlHandshakePayload(
+        compatibility_hash="strict",
+        placement_compatibility_hash="placement",
+        agent_metadata_bytes=b"agent-metadata",
+    )
+    socket = MagicMock()
+    set_mock_multipart_replies(
+        socket,
+        [
+            [
+                b"handshake",
+                msgspec.msgpack.encode(
+                    time.perf_counter() if remote_perf is None else remote_perf
+                ),
+            ]
+            for _ in metadata_by_rank
+        ],
+    )
+    remote_index = SimpleNamespace(workers=())
+    with (
+        patch.object(NixlHandshakePayload, "decode", return_value=payload),
+        patch.object(NixlAgentMetadata, "decode", side_effect=list(metadata_by_rank)),
+        patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(
+            nixl.base_worker,
+            "index_remote_nixl_placements",
+            return_value=remote_index,
+        ) as mock_index,
+        patch.object(nixl.base_worker, "validate_complete_nixl_placement_endpoint"),
+        patch.object(current_platform, "set_device"),
+    ):
+        mock_zmq_ctx.return_value.__enter__.return_value = socket
+        agents, _ = worker._nixl_handshake_impl(
+            host="prefill-host",
+            port=1234,
+            remote_tp_size=requested_tp_size,
+            expected_engine_id="prefill-engine",
+            remote_dcp_size=(
+                metadata_by_rank[0].dcp_size
+                if remote_dcp_size is None
+                else remote_dcp_size
+            ),
+            remote_pp_size=remote_pp_size,
+            imported_agents=[],
+            remote_pcp_size=requested_pcp_size,
+        )
+        assert (
+            mock_zmq_ctx.call_args.kwargs["max_message_size"]
+            == MAX_NIXL_HANDSHAKE_BYTES
+        )
+    return agents, mock_index
+
+
+def test_optional_generic_handshake_preserves_legacy_registration_targets():
+    worker = _minimal_handshake_worker(legacy_target_ranks=[1])
+    agents, mock_index = _run_minimal_handshake(
+        worker,
+        [_minimal_handshake_agent(rank, placement=True) for rank in range(4)],
+    )
+
+    assert set(agents) == {(0, rank) for rank in range(4)}
+    registration_modes = {
+        call.args[1]: call.kwargs["generic_registration"]
+        for call in worker.add_remote_agent.call_args_list
+    }
+    assert registration_modes == {0: True, 1: False, 2: True, 3: True}
+    mock_index.assert_called_once()
+
+
+def test_handshake_forces_generic_registration_without_local_legacy_fast_path():
+    worker = _minimal_handshake_worker(legacy_target_ranks=[1])
+    worker._legacy_fast_path_available = False
+
+    agents, mock_index = _run_minimal_handshake(
+        worker,
+        [_minimal_handshake_agent(rank, placement=True) for rank in range(4)],
+    )
+
+    assert set(agents) == {(0, rank) for rank in range(4)}
+    assert all(
+        call.kwargs["generic_registration"] is True
+        for call in worker.add_remote_agent.call_args_list
+    )
+    assert worker._generic_only_remote_engines == {"prefill-engine"}
+    mock_index.assert_called_once()
+
+
+def test_optional_generic_handshake_keeps_legacy_peer_descriptor_count():
+    worker = _minimal_handshake_worker(legacy_target_ranks=[1])
+    agents, mock_index = _run_minimal_handshake(
+        worker,
+        [_minimal_handshake_agent(rank, placement=False) for rank in range(4)],
+    )
+
+    assert agents == {(0, 1): "agent-1"}
+    worker.add_remote_agent.assert_called_once()
+    assert worker.add_remote_agent.call_args.args[1] == 1
+    assert worker.add_remote_agent.call_args.kwargs["generic_registration"] is False
+    mock_index.assert_not_called()
+
+
+def test_generic_pcp_handshake_queries_flattened_pcp_tp_cohort():
+    worker = _minimal_handshake_worker(legacy_target_ranks=[0])
+    agents, mock_index = _run_minimal_handshake(
+        worker,
+        [
+            _minimal_handshake_agent(
+                pp_local_rank,
+                placement=True,
+                tp_size=2,
+                pcp_size=2,
+            )
+            for pp_local_rank in range(4)
+        ],
+        remote_pcp_size=2,
+    )
+
+    assert set(agents) == {(0, pp_local_rank) for pp_local_rank in range(4)}
+    assert [call.args[1] for call in worker.add_remote_agent.call_args_list] == [
+        0,
+        1,
+        0,
+        1,
+    ]
+    assert all(
+        call.kwargs["generic_registration"] is True
+        for call in worker.add_remote_agent.call_args_list
+    )
+    mock_index.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("local_dcp", "remote_dcp", "use_mla", "local_layout", "remote_layout"),
+    [
+        (2, 3, True, "LBHNC", "LBHNC"),
+        (1, 1, False, "LBNHC", "LBHNC"),
+    ],
+)
+def test_legacy_unrepresentable_layout_selects_generic_with_hash_check_disabled(
+    local_dcp: int,
+    remote_dcp: int,
+    use_mla: bool,
+    local_layout: str,
+    remote_layout: str,
+):
+    remote_tp_size = remote_dcp
+    worker = _minimal_handshake_worker(
+        legacy_target_ranks=[0],
+        dcp_size=local_dcp,
+        use_mla=use_mla,
+        kv_cache_layout=local_layout,
+    )
+    agents, _ = _run_minimal_handshake(
+        worker,
+        [
+            _minimal_handshake_agent(
+                rank,
+                placement=True,
+                tp_size=remote_tp_size,
+                dcp_size=remote_dcp,
+                kv_cache_layout=remote_layout,
+            )
+            for rank in range(remote_tp_size)
+        ],
+    )
+
+    assert len(agents) == remote_tp_size
+    assert all(
+        call.kwargs["generic_registration"] is True
+        for call in worker.add_remote_agent.call_args_list
+    )
+    assert worker._generic_only_remote_engines == {"prefill-engine"}
+
+
+def test_equal_nhd_layout_with_heterogeneous_tp_selects_generic():
+    worker = _minimal_handshake_worker(
+        legacy_target_ranks=[0],
+        use_mla=False,
+        kv_cache_layout="LBNHC",
+        local_tp_size=1,
+    )
+    agents, _ = _run_minimal_handshake(
+        worker,
+        [
+            _minimal_handshake_agent(
+                rank,
+                placement=True,
+                tp_size=2,
+                kv_cache_layout="LBNHC",
+            )
+            for rank in range(2)
+        ],
+    )
+
+    assert len(agents) == 2
+    assert all(
+        call.kwargs["generic_registration"] is True
+        for call in worker.add_remote_agent.call_args_list
+    )
+    assert worker._generic_only_remote_engines == {"prefill-engine"}
+
+
+def test_nondivisible_tp_topology_selects_generic_without_legacy_targets():
+    worker = _minimal_handshake_worker(
+        legacy_target_ranks=[],
+        use_mla=False,
+        local_tp_size=2,
+    )
+    worker.transfer_topo.handshake_target_ranks = MagicMock(
+        side_effect=AssertionError("non-divisible TP")
+    )
+    agents, _ = _run_minimal_handshake(
+        worker,
+        [
+            _minimal_handshake_agent(rank, placement=True, tp_size=3)
+            for rank in range(3)
+        ],
+    )
+
+    assert len(agents) == 3
+    assert all(
+        call.kwargs["generic_registration"] is True
+        for call in worker.add_remote_agent.call_args_list
+    )
+
+
+def test_handshake_rejects_router_and_payload_dcp_mismatch_before_registration():
+    worker = _minimal_handshake_worker(legacy_target_ranks=[0])
+    metadata = [
+        _minimal_handshake_agent(
+            rank,
+            placement=True,
+            tp_size=2,
+            dcp_size=2,
+        )
+        for rank in range(2)
+    ]
+
+    with pytest.raises(RuntimeError, match="DCP size does not match"):
+        _run_minimal_handshake(worker, metadata, remote_dcp_size=1)
+
+    worker.add_remote_agent.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "pcp_size", "pp_size", "error"),
+    [
+        (MAX_NIXL_HANDSHAKE_RANKS + 1, 1, 1, "Remote TP size exceeds"),
+        (65, 1, 64, "Remote endpoint has 4160 placement ranks"),
+    ],
+)
+def test_handshake_rejects_excessive_remote_topology(tp_size, pcp_size, pp_size, error):
+    with pytest.raises(RuntimeError, match=error):
+        NixlConnectorWorker._validate_requested_remote_topology(
+            remote_tp_size=tp_size,
+            remote_dcp_size=1,
+            remote_pcp_size=pcp_size,
+            remote_pp_size=pp_size,
+        )
+
+
+def test_handshake_accepts_config_valid_pcp_pp_topology():
+    NixlConnectorWorker._validate_requested_remote_topology(
+        remote_tp_size=2,
+        remote_dcp_size=1,
+        remote_pcp_size=2,
+        remote_pp_size=2,
+    )
+
+
+def test_handshake_rejects_excessive_endpoint_metadata():
+    worker = _minimal_handshake_worker(legacy_target_ranks=[0])
+    metadata = [_minimal_handshake_agent(0, placement=True)]
+
+    with (
+        patch.object(nixl.base_worker, "MAX_NIXL_ENDPOINT_HANDSHAKE_BYTES", 1),
+        pytest.raises(RuntimeError, match="aggregate limit"),
+    ):
+        _run_minimal_handshake(worker, metadata)
+
+
+@pytest.mark.parametrize("remote_perf", [float("nan"), float("inf"), float("-inf")])
+def test_handshake_rejects_nonfinite_remote_timestamp(remote_perf):
+    worker = _minimal_handshake_worker(legacy_target_ranks=[0])
+    metadata = [_minimal_handshake_agent(0, placement=True)]
+
+    with pytest.raises(RuntimeError, match="expected a finite value"):
+        _run_minimal_handshake(worker, metadata, remote_perf=remote_perf)
+
+
+@pytest.mark.parametrize(
+    ("local_pcp", "local_dcp", "remote_pcp", "remote_dcp"),
+    [
+        (2, 1, 1, 2),
+        (1, 2, 2, 1),
+    ],
+)
+def test_push_rejects_cross_endpoint_pcp_dcp(
+    local_pcp, local_dcp, remote_pcp, remote_dcp
+):
+    worker = SimpleNamespace(pcp_size=local_pcp, dcp_size=local_dcp)
+    remote = SimpleNamespace(pcp_size=remote_pcp, dcp_size=remote_dcp)
+
+    with pytest.raises(NotImplementedError, match="generic segmented-direct"):
+        nixl.NixlPushConnectorWorker._validate_remote_parallel_config(worker, remote)
+
+
+def test_pull_allows_cross_endpoint_pcp_dcp_with_generic_placement():
+    worker = SimpleNamespace(pcp_size=2, dcp_size=1)
+    remote = SimpleNamespace(pcp_size=1, dcp_size=2)
+
+    nixl.NixlPullConnectorWorker._validate_remote_parallel_config(
+        worker,
+        remote,
+        generic_placement_available=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tp_size", 3),
+        ("dcp_size", 2),
+        ("pcp_size", 2),
+        ("pp_size", 2),
+    ],
+)
+def test_handshake_rejects_nested_placement_topology_mismatch(field, value):
+    metadata = _minimal_handshake_agent(0, placement=True, tp_size=1)
+    setattr(metadata.placement_metadata.rank_placement, field, value)
+
+    with pytest.raises(RuntimeError, match="placement topology does not match"):
+        NixlConnectorWorker._validate_remote_metadata_topology(
+            metadata,
+            remote_tp_size=1,
+            remote_dcp_size=1,
+            remote_pcp_size=1,
+            remote_pp_size=1,
+            remote_tp_rank=0,
+            remote_pcp_rank=0,
+            remote_pp_rank=0,
+            remote_pp_local_rank=0,
+        )
+
+
+def test_local_split_dlist_setup_is_atomic_and_retryable():
+    worker = object.__new__(NixlConnectorWorker)
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_memory_type = "VRAM"
+    worker.src_xfer_handles_by_tp_ratio = {}
+    split_data = [
+        [(1000, 4, 0)],
+        [(2000, 4, 0)],
+    ]
+    worker._build_local_splits_from_plan = MagicMock(
+        side_effect=lambda *_args: iter(split_data)
+    )
+    worker.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _memory: data
+    worker.nixl_wrapper.prep_xfer_dlist.side_effect = [10, None]
+    plan = SimpleNamespace(all_source_ranks=(0, 1))
+    key = (-2, 4)
+
+    with pytest.raises(RuntimeError, match="local split descriptors"):
+        worker.src_xfer_handles_by_tp_ratio[key] = (
+            worker._prepare_local_split_xfer_handlers(
+                cast(Any, plan), np.empty((0, 3), dtype=np.uint64), 0, 1
+            )
+        )
+
+    assert key not in worker.src_xfer_handles_by_tp_ratio
+    worker.nixl_wrapper.release_dlist_handle.assert_called_once_with(10)
+
+    worker.nixl_wrapper.prep_xfer_dlist.side_effect = [20, 21]
+    worker.src_xfer_handles_by_tp_ratio[key] = (
+        worker._prepare_local_split_xfer_handlers(
+            cast(Any, plan), np.empty((0, 3), dtype=np.uint64), 0, 1
+        )
+    )
+    assert worker.src_xfer_handles_by_tp_ratio[key] == [20, 21]
+
+
+def test_local_split_dlist_rejects_incomplete_cohort_and_releases_handles():
+    worker = object.__new__(NixlConnectorWorker)
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_memory_type = "VRAM"
+    worker._build_local_splits_from_plan = MagicMock(
+        return_value=iter([[(1000, 4, 0)]])
+    )
+    worker.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _memory: data
+    worker.nixl_wrapper.prep_xfer_dlist.return_value = 10
+    plan = SimpleNamespace(all_source_ranks=(0, 1))
+
+    with pytest.raises(RuntimeError, match="descriptor count does not match"):
+        worker._prepare_local_split_xfer_handlers(
+            cast(Any, plan), np.empty((0, 3), dtype=np.uint64), 0, 1
+        )
+
+    worker.nixl_wrapper.release_dlist_handle.assert_called_once_with(10)
+
+
+def test_local_split_dlist_cache_key_includes_complete_tp_mapping():
+    common = {
+        "source_ranks_per_group": ((0, 1),),
+        "all_source_ranks": (0, 1),
+        "rank_offset_factor": 0,
+        "local_consumers": 1,
+    }
+    first = SimpleNamespace(rank_to_attention_slot={0: 0, 1: 1}, **common)
+    second = SimpleNamespace(rank_to_attention_slot={0: 1, 1: 0}, **common)
+
+    assert NixlConnectorWorker._split_local_xfer_handle_key(
+        -2, 4, cast(Any, first)
+    ) != NixlConnectorWorker._split_local_xfer_handle_key(-2, 4, cast(Any, second))
+
+
+def test_register_local_xfer_handler_rejects_missing_dlist_handle():
+    worker = object.__new__(NixlConnectorWorker)
+    worker.transfer_topo = cast(Any, object())
+    worker.block_size = 4
+    worker.kv_caches_base_addr = {"decode": {0: [1000]}}
+    worker.engine_id = "decode"
+    worker.tp_rank = 0
+    worker.device_id = 0
+    worker._build_fa_local = MagicMock(
+        return_value=np.array([(1000, 4, 0)], dtype=np.uint64)
+    )
+    worker._has_mamba = False
+    worker.nixl_memory_type = "VRAM"
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.prep_xfer_dlist.return_value = None
+
+    with pytest.raises(RuntimeError, match="local descriptors"):
+        worker.register_local_xfer_handler(4)
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_explicit_generic_activation_fails_when_placement_is_unavailable(
+    default_vllm_config, dist_init
+):
+    vllm_config = create_vllm_config(
+        block_size=32, kv_connector_extra_config={"enable_generic_placement": True}
+    )
+    kv_cache_config = make_kv_cache_config(block_size=32, num_blocks=2)
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    kv_cache_spec = cast(
+        AttentionSpec, kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    )
+    shape = compute_layer_kv_cache_shape_bytes(
+        kv_cache_spec, kv_cache_config.num_blocks
+    )
+    tensor = torch.zeros(*shape, dtype=torch.int8).view(kv_cache_spec.dtype)
+    kv_caches = {
+        layer_name: tensor
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+
+    try:
+        with (
+            patch.object(
+                nixl.base_worker,
+                "build_runtime_nixl_placement",
+                side_effect=nixl.base_worker.NixlRuntimePlacementUnsupported(
+                    "unsupported test layout"
+                ),
+            ),
+            pytest.raises(
+                RuntimeError,
+                match="generic NIXL placement is unavailable on every PP/PCP/TP rank",
+            ),
+        ):
+            connector.register_kv_caches(kv_caches)
+    finally:
+        connector.shutdown()
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_generic_placement_survives_eager_legacy_dlist_failure(dist_init):
+    vllm_config = create_vllm_config(
+        block_size=32, kv_connector_extra_config={"enable_generic_placement": True}
+    )
+    layer_name = "model.layers.0.self_attn"
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.uint8,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=(KVCacheGroupSpec([layer_name], kv_cache_spec),),
+        kv_cache_layout="LBNHC",
+    )
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    worker = connector.connector_worker
+    assert worker is not None
+    worker.nixl_wrapper.register_memory = MagicMock()
+    worker.register_local_xfer_handler = MagicMock(
+        side_effect=RuntimeError("legacy dlist preparation failed")
+    )
+    kv_caches = {
+        layer_name: torch.empty((3, 1, 32, 2), dtype=torch.uint8),
+    }
+
+    try:
+        connector.register_kv_caches(kv_caches)
+
+        worker.nixl_wrapper.register_memory.assert_called_once()
+        worker.register_local_xfer_handler.assert_called_once_with(worker.block_size)
+        assert worker._legacy_fast_path_available is False
+        assert worker._local_placement_metadata is not None
+        assert worker._local_placement_workers == (worker._local_placement_metadata,)
+    finally:
+        connector.shutdown()
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_generic_completion_config_requires_generic_activation(default_vllm_config):
+    default_vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="NixlConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config={"generic_completion_participant_count": 2},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="generic completion configuration requires.*enable_generic_placement",
+    ):
+        NixlConnectorWorker(
+            default_vllm_config,
+            default_vllm_config.kv_transfer_config.engine_id,
+            make_kv_cache_config(block_size=16),
+        )
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_push_worker_rejects_explicit_generic_activation(default_vllm_config):
+    default_vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="NixlConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"enable_generic_placement": True},
+    )
+
+    with (
+        patch.object(nixl.NixlPushConnectorWorker, "shutdown"),
+        pytest.raises(ValueError, match="supported only by NIXL pull"),
+    ):
+        nixl.NixlPushConnectorWorker(
+            default_vllm_config,
+            default_vllm_config.kv_transfer_config.engine_id,
+            make_kv_cache_config(block_size=16),
+        )
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_generic_activation_propagates_memory_registration_failure(dist_init):
+    vllm_config = create_vllm_config(
+        block_size=32, kv_connector_extra_config={"enable_generic_placement": True}
+    )
+    kv_cache_config = make_kv_cache_config(block_size=32, num_blocks=2)
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    worker = connector.connector_worker
+    assert worker is not None
+    worker.nixl_wrapper.register_memory = MagicMock(
+        side_effect=RuntimeError("registration failed")
+    )
+    worker.nixl_wrapper.deregister_memory = MagicMock()
+    kv_cache_spec = cast(
+        AttentionSpec, kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    )
+    shape = compute_layer_kv_cache_shape_bytes(
+        kv_cache_spec, kv_cache_config.num_blocks
+    )
+    tensor = torch.zeros(*shape, dtype=torch.int8).view(kv_cache_spec.dtype)
+    kv_caches = {
+        layer_name: tensor
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="generic NIXL placement is unavailable on every PP/PCP/TP rank",
+        ):
+            connector.register_kv_caches(kv_caches)
+        worker.nixl_wrapper.deregister_memory.assert_called_once()
+    finally:
+        connector.shutdown()
 
 
 def _setup_worker_with_remote_engine(
@@ -3129,7 +4064,11 @@ def test_compatibility_hash_validation(
         num_blocks=1,
         block_lens=prefill_block_lens,
         block_strides=prefill_block_lens,
-        kv_cache_layout="LBHNC",
+        kv_cache_layout=(
+            decode_worker.host_buffer_kv_cache_layout
+            if decode_worker.use_host_buffer
+            else decode_worker.kv_cache_layout
+        ),
         block_size=prefill_block_size,
         ssm_sizes=(0, 0),
         attn_backend_name=decode_worker.backend_name,
@@ -3137,15 +4076,21 @@ def test_compatibility_hash_validation(
     )
     handshake_payload = NixlHandshakePayload(
         compatibility_hash=remote_hash,
+        placement_compatibility_hash=remote_hash,
         agent_metadata_bytes=msgspec.msgpack.encode(prefill_metadata),
     )
 
     # Mock ZMQ socket to return our handshake payload
     mock_socket = MagicMock()
-    mock_socket.recv_multipart.return_value = [
-        msgspec.msgpack.encode(handshake_payload),
-        msgspec.msgpack.encode(time.perf_counter()),
-    ]
+    set_mock_multipart_replies(
+        mock_socket,
+        [
+            [
+                msgspec.msgpack.encode(handshake_payload),
+                msgspec.msgpack.encode(time.perf_counter()),
+            ]
+        ],
+    )
 
     # Mock add_remote_agent to avoid actual NIXL operations
     # Patch zmq_ctx to return our mock socket
@@ -3232,6 +4177,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     elif error_scenario == "metadata_decode_error":
         valid_handshake = NixlHandshakePayload(
             compatibility_hash=decode_worker.compat_hash,
+            placement_compatibility_hash=decode_worker.compat_hash,
             agent_metadata_bytes=b"invalid msgpack for metadata",
         )
         msg_bytes = msgspec.msgpack.encode(valid_handshake)
@@ -3239,6 +4185,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     elif error_scenario == "metadata_validation_error":
         valid_handshake = NixlHandshakePayload(
             compatibility_hash=decode_worker.compat_hash,
+            placement_compatibility_hash=decode_worker.compat_hash,
             agent_metadata_bytes=msgspec.msgpack.encode({"missing": "fields"}),
         )
         msg_bytes = msgspec.msgpack.encode(valid_handshake)
@@ -3246,10 +4193,10 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
         raise AssertionError(f"{error_scenario} not a valid scenario")
 
     mock_socket = MagicMock()
-    mock_socket.recv_multipart.return_value = [
-        msg_bytes,
-        msgspec.msgpack.encode(time.perf_counter()),
-    ]
+    set_mock_multipart_replies(
+        mock_socket,
+        [[msg_bytes, msgspec.msgpack.encode(time.perf_counter())]],
+    )
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
         patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,

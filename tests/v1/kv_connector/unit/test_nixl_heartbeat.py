@@ -3,6 +3,7 @@
 """Unit tests for the scheduler-driven heartbeat / lease-renewal system."""
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,7 +16,12 @@ _ENGINE_A = "my-engine-id"
 
 
 def _sched(kv_lease_duration: int = 30):
-    return make_nixl_scheduler(heartbeat=True, kv_lease_duration=kv_lease_duration)
+    scheduler = make_nixl_scheduler(
+        heartbeat=True,
+        kv_lease_duration=kv_lease_duration,
+    )
+    scheduler._reqs_need_send_expected_participants = {}
+    return scheduler
 
 
 def _req(request_id: int = 1):
@@ -41,12 +47,15 @@ def _worker_stub():
 def test_on_new_request_tracks_and_groups():
     """Add two reqs to same engine, one to another; verify grouping."""
     s = _sched()
-    s.on_new_request(_req(1))
-    s.on_new_request(_req(2))
+    requests = (_req(1), _req(2))
+    for request in requests:
+        request.kv_transfer_params["pcp_size"] = 2
+        s.on_new_request(request)
 
     assert s._heartbeat_by_engine[_ENGINE_A].req_ids == {"prefill-1", "prefill-2"}
     info = s._heartbeat_by_engine[_ENGINE_A]
     assert (info.host, info.port, info.tp_size) == ("my-host", 1234, 1)
+    assert info.pcp_size == 2
     assert s._heartbeat_req_engine["id-1"] == (_ENGINE_A, "prefill-1")
 
     # Different engine.
@@ -54,6 +63,31 @@ def test_on_new_request_tracks_and_groups():
     r3.kv_transfer_params["remote_engine_id"] = "engine-b"
     s.on_new_request(r3)
     assert len(s._heartbeat_by_engine) == 2
+    assert s._heartbeat_by_engine["engine-b"].pcp_size == 1
+
+
+def test_request_finished_exports_local_pcp_size():
+    from vllm.v1.request import RequestStatus
+
+    scheduler = _sched()
+    scheduler.generic_completion_participant_count = None
+    scheduler.generic_completion_participants = ()
+    scheduler.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=3,
+            pipeline_parallel_size=1,
+        )
+    )
+    request = create_request(request_id=4, do_remote_decode=True)
+    request.status = RequestStatus.FINISHED_STOPPED
+
+    delay_free, params = scheduler.request_finished(request, ([7],))
+
+    assert delay_free
+    assert params is not None
+    assert params["pcp_size"] == 3
 
 
 @pytest.mark.parametrize(

@@ -3,11 +3,19 @@
 """Pull-specific scheduler-side logic for the NIXL connector."""
 
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.transfer_completion import (
+    MAX_TRANSFER_PARTICIPANTS,
+    WorkerIdentity,
+    participant_set_digest,
+    worker_identities_from_wire,
+    worker_identities_to_wire,
 )
 from vllm.logger import init_logger
 
@@ -38,6 +46,52 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        configured_participant_count = kv_transfer_config.get_from_extra_config(
+            "generic_completion_participant_count", None
+        )
+        if configured_participant_count is not None and (
+            not isinstance(configured_participant_count, int)
+            or isinstance(configured_participant_count, bool)
+            or not 1 <= configured_participant_count <= MAX_TRANSFER_PARTICIPANTS
+        ):
+            raise ValueError(
+                "generic_completion_participant_count must be None or an integer "
+                f"between 1 and {MAX_TRANSFER_PARTICIPANTS}"
+            )
+        self.generic_completion_participant_count: int | None = (
+            configured_participant_count
+        )
+        configured_participants = kv_transfer_config.get_from_extra_config(
+            "generic_completion_participants", None
+        )
+        generic_placement_enabled = kv_transfer_config.get_from_extra_config(
+            "enable_generic_placement", False
+        )
+        if (
+            configured_participant_count is not None
+            or configured_participants is not None
+        ) and generic_placement_enabled is not True:
+            raise ValueError(
+                "generic completion configuration requires "
+                "enable_generic_placement=true"
+            )
+        self.generic_completion_participants: tuple[WorkerIdentity, ...] = ()
+        if configured_participants is not None:
+            self.generic_completion_participants = worker_identities_from_wire(
+                configured_participants,
+                name="generic_completion_participants",
+            )
+            if (
+                configured_participant_count is not None
+                and configured_participant_count
+                != len(self.generic_completion_participants)
+            ):
+                raise ValueError(
+                    "generic_completion_participant_count must match the exact "
+                    "generic_completion_participants roster"
+                )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -268,6 +322,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         blocks_expiry_time = None
+        transfer_id = None
+        expected_completion_participant_count = None
+        expected_roster: tuple[WorkerIdentity, ...] = ()
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_kv_blocks_ttl = self._kv_lease_duration
@@ -284,6 +341,91 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = (
                 time.perf_counter() + request_kv_blocks_ttl
             )
+            # A request ID can be reused by a retry. Keep the lease bound to a
+            # fresh attempt so a delayed completion cannot release new pages.
+            transfer_id = str(uuid.uuid4())
+            self._reqs_need_send_transfer_ids[request.request_id] = transfer_id
+            self._reqs_need_send_expected_participant_counts.pop(
+                request.request_id, None
+            )
+            expected_rosters = getattr(
+                self, "_reqs_need_send_expected_participants", None
+            )
+            if expected_rosters is None:
+                expected_rosters = self._reqs_need_send_expected_participants = {}
+            expected_rosters.pop(request.request_id, None)
+            request_participant_count = params.get(
+                "expected_kv_completion_participant_count"
+            )
+            request_participants: tuple[WorkerIdentity, ...] = ()
+            raw_request_participants = params.get("expected_kv_completion_participants")
+            if raw_request_participants is not None:
+                try:
+                    request_participants = worker_identities_from_wire(
+                        raw_request_participants,
+                        name="expected_kv_completion_participants",
+                    )
+                except ValueError as error:
+                    logger.error(
+                        "Ignoring invalid generic completion participant roster "
+                        "for request %s: %s",
+                        request.request_id,
+                        error,
+                    )
+            expected_roster = getattr(self, "generic_completion_participants", ())
+            if not expected_roster:
+                expected_roster = request_participants
+            elif request_participants and (
+                participant_set_digest(request_participants)
+                != participant_set_digest(expected_roster)
+            ):
+                logger.warning(
+                    "Configured generic_completion_participants overrides the "
+                    "request roster for request %s.",
+                    request.request_id,
+                )
+
+            expected_participants = self.generic_completion_participant_count
+            if expected_participants is None and expected_roster:
+                expected_participants = len(expected_roster)
+            elif expected_participants is None:
+                expected_participants = request_participant_count
+            elif (
+                "expected_kv_completion_participant_count" in params
+                and request_participant_count != expected_participants
+            ):
+                logger.warning(
+                    "Configured generic_completion_participant_count=%d overrides "
+                    "request expected_kv_completion_participant_count=%r for "
+                    "request %s.",
+                    expected_participants,
+                    request_participant_count,
+                    request.request_id,
+                )
+            if expected_roster and (
+                isinstance(expected_participants, int)
+                and not isinstance(expected_participants, bool)
+                and 0 < expected_participants <= MAX_TRANSFER_PARTICIPANTS
+                and expected_participants == len(expected_roster)
+            ):
+                self._reqs_need_send_expected_participant_counts[request.request_id] = (
+                    expected_participants
+                )
+                self._reqs_need_send_expected_participants[request.request_id] = (
+                    expected_roster
+                )
+                expected_completion_participant_count = expected_participants
+            elif expected_participants is not None or expected_roster:
+                # A count is not an authorization boundary. Generic completion
+                # stays disabled unless the producer-side request supplies the
+                # exact worker-incarnation roster that may release this lease.
+                logger.error(
+                    "Ignoring incomplete generic completion contract for request "
+                    "%s: count=%r, roster_size=%d; generic completion is disabled.",
+                    request.request_id,
+                    expected_participants,
+                    len(expected_roster),
+                )
             if is_d_node:
                 # D blocks expiry time exported for the turn-2 readback.
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
@@ -301,12 +443,27 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_block_ids=block_ids,
             remote_engine_id=self.engine_id,
             remote_request_id=request.request_id,
+            remote_endpoint_incarnation=self._endpoint_incarnation,
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
+            pcp_size=getattr(
+                self.vllm_config.parallel_config,
+                "prefill_context_parallel_size",
+                1,
+            ),
             pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
             remote_num_tokens=remote_num_tokens,
             remote_blocks_expiry_time=blocks_expiry_time,
+            transfer_id=transfer_id,
+            expected_kv_completion_participant_count=(
+                expected_completion_participant_count
+            ),
+            expected_kv_completion_participants=(
+                worker_identities_to_wire(expected_roster)
+                if expected_completion_participant_count is not None
+                else None
+            ),
             transfer_mode=self._TRANSFER_MODE,
         )

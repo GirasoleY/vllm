@@ -48,6 +48,28 @@ from vllm.v1.structured_output import StructuredOutputManager
 EOS_TOKEN_ID = 50256
 
 
+def set_mock_multipart_replies(
+    socket: Any,
+    replies: list[list[bytes]],
+) -> None:
+    """Configure a mock for incremental bounded multipart receives."""
+    queued = [list(reply) for reply in replies]
+    current: list[bytes] = []
+
+    def recv() -> bytes:
+        if not current:
+            if not queued:
+                raise AssertionError("mock multipart reply queue is empty")
+            current.extend(queued.pop(0))
+        return current.pop(0)
+
+    def getsockopt(_option: int) -> bool:
+        return bool(current)
+
+    socket.recv.side_effect = recv
+    socket.getsockopt.side_effect = getsockopt
+
+
 def assert_scheduler_empty(scheduler: Scheduler):
     """Confirm the scheduler is "empty" - i.e. no leaks."""
     # Scheduler Metadata.
@@ -540,11 +562,14 @@ def make_nixl_scheduler(
         # Fields touched by build_connector_meta / request_finished:
         sched._reqs_need_recv = {}
         sched._reqs_need_send = {}
+        sched._reqs_need_send_transfer_ids = {}
+        sched._reqs_need_send_expected_participant_counts = {}
         sched._reqs_in_batch = set()
         sched._reqs_not_processed = set()
         sched._reqs_need_save = {}
         sched.use_host_buffer = False
         sched.engine_id = "test-engine"
+        sched._endpoint_incarnation = "test-endpoint-incarnation"
         sched.side_channel_host = "localhost"
         sched.side_channel_port = 5555
         sched.blocks_per_sw = []
@@ -577,6 +602,8 @@ def make_nixl_push_scheduler(
     # Base scheduler fields (shared with pull / heartbeat path).
     sched._reqs_need_recv = {}
     sched._reqs_need_send = {}
+    sched._reqs_need_send_transfer_ids = {}
+    sched._reqs_need_send_expected_participant_counts = {}
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._reqs_need_save = {}
@@ -584,6 +611,7 @@ def make_nixl_push_scheduler(
     sched.decoder_kv_blocks_ttl = decoder_kv_blocks_ttl
     sched.use_host_buffer = False
     sched.engine_id = "decode-engine"
+    sched._endpoint_incarnation = "test-endpoint-incarnation"
     sched.side_channel_host = "127.0.0.1"
     sched.side_channel_port = 5600
     sched.is_bidirectional_kv_xfer_enabled = is_bidirectional_kv_xfer_enabled

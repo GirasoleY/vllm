@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     checkpoint_prepare_distributed_state,
     checkpoint_restore_distributed_state,
+    get_pcp_group,
     get_pp_group,
     get_tp_group,
     resume_device_comms,
@@ -684,7 +685,9 @@ class Worker(WorkerBase):
     ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
         """Get KV connector metadata from this worker if available.
 
-        Returned dict is keyed by `(pp_rank, tp_rank)`.
+        Returned dict is keyed by ``(pp_rank, pp_local_placement_rank)``, where
+        ``pp_local_placement_rank = pcp_rank * tp_size + tp_rank``. Flattening
+        PCP into the second coordinate preserves the established two-tuple API.
         """
 
         if not has_kv_transfer_group():
@@ -698,7 +701,12 @@ class Worker(WorkerBase):
 
         pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
-        return {(pp_rank, tp_rank): metadata}
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+        pp_local_placement_rank = (
+            pcp_rank * self.parallel_config.tensor_parallel_size + tp_rank
+        )
+        return {(pp_rank, pp_local_placement_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

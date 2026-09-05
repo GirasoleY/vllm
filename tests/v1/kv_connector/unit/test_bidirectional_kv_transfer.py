@@ -1075,3 +1075,113 @@ def test_handshake_listener_appends_perf_counter_frame():
     finally:
         stop_event.set()
         listener.join(timeout=5)
+
+
+def test_handshake_listener_rejects_bad_queries_and_keeps_serving():
+    """Malformed requests receive an error without terminating the listener."""
+    import threading
+    from contextlib import contextmanager
+
+    import msgspec
+    import zmq
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_scheduler
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import GET_META_MSG
+
+    valid_query = msgspec.msgpack.encode((GET_META_MSG, 0, 0))
+    oversized_query = b"x" * (base_scheduler._MAX_NIXL_HANDSHAKE_QUERY_BYTES + 1)
+    received = [
+        [b"extra-frame", b"", valid_query, b"unexpected"],
+        [b"bad-msgpack", b"", b"\xc1"],
+        [
+            b"bad-types",
+            b"",
+            msgspec.msgpack.encode((GET_META_MSG, True, 0)),
+        ],
+        [
+            b"unknown-coordinate",
+            b"",
+            msgspec.msgpack.encode((GET_META_MSG, 9, 9)),
+        ],
+        [b"oversized", b"", oversized_query],
+        [b"valid", b"", valid_query],
+    ]
+    stop_event = threading.Event()
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+            self.current = []
+
+        def setsockopt(self, option, value):
+            assert option == zmq.RCVTIMEO
+
+        def recv(self):
+            if not self.current:
+                if received:
+                    self.current.extend(received.pop(0))
+                else:
+                    stop_event.set()
+                    raise zmq.Again()
+            return self.current.pop(0)
+
+        def getsockopt(self, option):
+            assert option == zmq.RCVMORE
+            return bool(self.current)
+
+        def send_multipart(self, parts):
+            self.sent.append(parts)
+
+    sock = FakeSocket()
+
+    @contextmanager
+    def fake_zmq_ctx(socket_type, path, *, max_message_size=None):
+        assert max_message_size == base_scheduler._MAX_NIXL_HANDSHAKE_QUERY_BYTES
+        try:
+            yield sock
+        finally:
+            # Recreating a real socket discards any unread over-frame tail.
+            sock.current.clear()
+
+    ready_event = threading.Event()
+    with patch.object(base_scheduler, "zmq_ctx", fake_zmq_ctx):
+        base_scheduler.NixlBaseConnectorScheduler._nixl_handshake_listener(
+            {(0, 0): b"payload-rank-0"},
+            ready_event,
+            stop_event,
+            "127.0.0.1",
+            1234,
+        )
+
+    assert ready_event.is_set()
+    assert len(sock.sent) == 5
+    for response in sock.sent[:-1]:
+        assert response[1] == b""
+        assert msgspec.msgpack.decode(response[2]) == {
+            "error": "invalid NIXL handshake query"
+        }
+        assert isinstance(msgspec.msgpack.decode(response[3]), float)
+    assert sock.sent[-1][0] == b"valid"
+    assert sock.sent[-1][2] == b"payload-rank-0"
+
+
+def test_scheduler_rejects_oversized_encoded_handshake():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+        NixlBaseConnectorScheduler,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        MAX_NIXL_HANDSHAKE_BYTES,
+        NixlHandshakePayload,
+    )
+
+    scheduler = object.__new__(NixlBaseConnectorScheduler)
+    scheduler._nixl_handshake_listener_t = None
+    scheduler._endpoint_incarnation = "scheduler-test-incarnation"
+    payload = NixlHandshakePayload(
+        compatibility_hash="strict",
+        placement_compatibility_hash="placement",
+        agent_metadata_bytes=b"x" * MAX_NIXL_HANDSHAKE_BYTES,
+    )
+
+    with pytest.raises(ValueError, match="encoded NixlHandshakePayload.*exceeds"):
+        scheduler.set_xfer_handshake_metadata({(0, 0): payload})

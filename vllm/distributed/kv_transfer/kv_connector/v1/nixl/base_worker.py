@@ -4,6 +4,7 @@
 
 import itertools
 import logging
+import math
 import os
 import queue
 import threading
@@ -12,6 +13,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -20,6 +22,7 @@ import numpy as np
 import torch
 import zmq
 
+from vllm.distributed.kv_transfer.canonical_mapping import native_vllm_dcp_rank
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -34,16 +37,38 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    MAX_NIXL_ENDPOINT_HANDSHAKE_BYTES,
+    MAX_NIXL_HANDSHAKE_BYTES,
+    MAX_NIXL_HANDSHAKE_RANKS,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+    NixlPlacementMetadata,
     ReqId,
     ReqMeta,
     TransferHandle,
     compute_nixl_compatibility_hash,
+    compute_nixl_placement_compatibility_hash,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.request_bridge import (
+    NixlRemotePlacementIndex,
+    index_remote_nixl_placements,
+    validate_complete_nixl_placement_endpoint,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.runtime_placement import (
+    NixlRuntimePlacementUnsupported,
+    build_runtime_nixl_placement,
+    finalize_nixl_placement_cohort,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.segmented import (
+    NixlEphemeralDlistTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.terminal import (
+    NixlRequestTerminalPoller,
+    NixlTransferFailure,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     TPMapping,
@@ -54,6 +79,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
+    recv_multipart_bounded,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -62,9 +88,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
+    get_ep_group,
     get_pcp_group,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -91,6 +120,20 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _HandshakeSpec:
+    """Identity of one reusable remote endpoint registration."""
+
+    host: str
+    port: int
+    tp_size: int
+    dcp_size: int
+    pcp_size: int
+    pp_size: int
+    notif_agents_only: bool
+    endpoint_incarnation: str | None
 
 
 def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
@@ -310,6 +353,23 @@ class NixlBaseConnectorWorker:
         """
         return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
 
+    @staticmethod
+    def _split_local_xfer_handle_key(
+        tp_ratio: int,
+        remote_block_size: int,
+        plan: TPMapping,
+    ) -> tuple[object, ...]:
+        """Return the complete descriptor-slicing identity for a TP plan."""
+        return (
+            tp_ratio,
+            remote_block_size,
+            plan.source_ranks_per_group,
+            plan.all_source_ranks,
+            tuple(sorted(plan.rank_to_attention_slot.items())),
+            plan.rank_offset_factor,
+            plan.local_consumers,
+        )
+
     def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
         """Per-FA-descriptor replicate flag, in _build_fa_local emission order
         (region-major; one desc per block, with K/V packed). Length ``num_fa_descs``.
@@ -359,6 +419,28 @@ class NixlBaseConnectorWorker:
         if vllm_config.kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set for NixlConnector")
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        self._enable_generic_placement = self.kv_transfer_config.get_from_extra_config(
+            "enable_generic_placement", False
+        )
+        if not isinstance(self._enable_generic_placement, bool):
+            raise ValueError("enable_generic_placement must be a boolean")
+        if self._enable_generic_placement and self._TRANSFER_MODE != "pull":
+            raise ValueError(
+                "enable_generic_placement is currently supported only by "
+                "NIXL pull transfers"
+            )
+        generic_completion_configured = any(
+            self.kv_transfer_config.get_from_extra_config(key, None) is not None
+            for key in (
+                "generic_completion_participant_count",
+                "generic_completion_participants",
+            )
+        )
+        if generic_completion_configured and not self._enable_generic_placement:
+            raise ValueError(
+                "generic completion configuration requires "
+                "enable_generic_placement=True"
+            )
 
         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
             "backends", ["UCX"]
@@ -466,12 +548,26 @@ class NixlBaseConnectorWorker:
                 else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
             )
 
-        self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
-        # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
-        # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
+        self._placement_worker_incarnation = str(uuid.uuid4())
+        self.nixl_wrapper = nixl_wrapper_cls(self._placement_worker_incarnation, config)
+        # Request-scoped segmented-direct descriptor lists. Static descriptor
+        # handles remain in the existing maps below and are never registered
+        # here, so their handshake/shutdown lifetime is unchanged.
+        self._ephemeral_direct_dlists = NixlEphemeralDlistTracker(self.nixl_wrapper)
+        # Map of engine_id -> {(pp_rank, pp_local_rank): agent_name, ...}.
+        # ``pp_local_rank = pcp_rank * tp_size + tp_rank``. With PCP disabled
+        # this remains the legacy ``(pp_rank, tp_rank)`` key.
         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
             dict
         )
+        self._remote_handshake_specs: dict[EngineId, _HandshakeSpec] = {}
+        self._stale_remote_engines: set[EngineId] = set()
+        self._legacy_fast_path_available = True
+        self._local_placement_metadata: NixlPlacementMetadata | None = None
+        self._local_placement_workers: tuple[NixlPlacementMetadata, ...] = ()
+        self._remote_placement_indexes: dict[EngineId, NixlRemotePlacementIndex] = {}
+        # A strict-hash mismatch admits only generic segmented-direct requests.
+        self._generic_only_remote_engines: set[EngineId] = set()
         # Map of engine_id -> clock offset.
         self._engine_clock_offset: dict[EngineId, float] = {}
 
@@ -482,6 +578,17 @@ class NixlBaseConnectorWorker:
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        if (
+            getattr(vllm_config.parallel_config, "enable_expert_parallel", False)
+            is True
+            and getattr(vllm_config.model_config, "is_moe", False) is True
+        ):
+            ep_group = get_ep_group()
+            self.ep_size = ep_group.world_size
+            self.ep_rank = ep_group.rank_in_group
+        else:
+            self.ep_size = 1
+            self.ep_rank = 0
 
         # DCP support is scoped to MLA, with dcp_size in (1, tp_size): either fully
         # replicated or fully sharded. A DCP rank is always derivable this way.
@@ -579,6 +686,7 @@ class NixlBaseConnectorWorker:
         # PP>1 (push mode): this worker holds a contiguous layer slice and
         # transfers into the matching sub-range of a PP=1 remote's regions.
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self.pp_rank = get_pp_group().rank_in_group if self.pp_size > 1 else 0
         self._remote_region_offset = 0
         # PP push slices regions per layer (uniform count); HMA breaks that.
         if self.pp_size > 1 and self._is_hma_required:
@@ -586,8 +694,15 @@ class NixlBaseConnectorWorker:
                 "NixlPushConnector does not support pipeline_parallel_size > 1 "
                 "with hybrid KV cache layouts (HMA) yet."
             )
-        # Decode-side PP is unsupported (completions counted per consumer rank).
-        if vllm_config.kv_transfer_config.kv_role == "kv_consumer" and self.pp_size > 1:
+        # The legacy decode-side PP path cannot disambiguate per-stage static
+        # descriptor maps or completion participants. Generic READ placement
+        # does both by flattened endpoint rank; keep the legacy guard intact
+        # unless that path was explicitly selected.
+        if (
+            vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+            and self.pp_size > 1
+            and not (self._TRANSFER_MODE == "pull" and self._enable_generic_placement)
+        ):
             raise NotImplementedError(
                 "NixlPushConnector consumer (decode) does not support "
                 "pipeline_parallel_size > 1."
@@ -601,8 +716,8 @@ class NixlBaseConnectorWorker:
         # kept for building per-tp-ratio splits at the same granularity.
         self.src_blocks_data_by_block_size: dict[int, np.ndarray] = {}
         # Populated dynamically during handshake based on remote configuration.
-        # Per-source split handles, keyed by (tp_ratio, remote_block_size).
-        self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
+        # Per-source split handles, keyed by their complete mapping and geometry.
+        self.src_xfer_handles_by_tp_ratio: dict[tuple[object, ...], list[int]] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
 
@@ -615,6 +730,8 @@ class NixlBaseConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        self._generic_direct_receive_requests: set[ReqId] = set()
+        self._request_terminal_poller = NixlRequestTerminalPoller()
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -630,6 +747,10 @@ class NixlBaseConnectorWorker:
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
         # Background thread for initializing new NIXL handshakes.
+        self._handshake_lock = threading.RLock()
+        self._handshake_shutdown_event = threading.Event()
+        self._shutting_down = False
+        self._shutdown_complete = False
         self._handshake_initiation_executor = ThreadPoolExecutor(
             # NIXL is not guaranteed to be thread-safe, limit 1 worker.
             max_workers=1,
@@ -639,8 +760,8 @@ class NixlBaseConnectorWorker:
         self._handshake_futures: dict[
             EngineId, Future[tuple[dict[tuple[int, int], str], float]]
         ] = {}
+        self._handshake_future_specs: dict[EngineId, _HandshakeSpec] = {}
         # Protects _handshake_futures and _remote_agents.
-        self._handshake_lock = threading.RLock()
 
         # TTL-based eviction of stale remote engine state.
         self._engine_last_active: dict[EngineId, float] = {}
@@ -670,6 +791,7 @@ class NixlBaseConnectorWorker:
 
         # lazy initialized in register_kv_caches
         self.compat_hash: str | None = None
+        self.placement_compat_hash: str | None = None
         self.transfer_topo: TransferTopology | None = None
 
         # With heterogeneous TP (or DCP), P must wait for all assigned D
@@ -714,20 +836,133 @@ class NixlBaseConnectorWorker:
         )
 
     def _validate_remote_parallel_config(
-        self, agent_metadata: NixlAgentMetadata
+        self,
+        agent_metadata: NixlAgentMetadata,
+        *,
+        generic_placement_available: bool = False,
     ) -> None:
-        local_pcp_size = self.pcp_size
+        local_pcp_size = getattr(self, "pcp_size", 1)
         local_dcp_size = self.dcp_size
         remote_pcp_size = agent_metadata.pcp_size
         remote_dcp_size = agent_metadata.dcp_size
-        if (local_pcp_size > 1 and remote_dcp_size > 1) or (
-            remote_pcp_size > 1 and local_dcp_size > 1
-        ):
+        if remote_pcp_size > 1 and remote_dcp_size > 1:
             raise NotImplementedError(
-                "NixlConnector PCP requires decode_context_parallel_size=1 "
-                "on both instances. "
+                "NixlConnector does not yet support PCP and DCP on the same "
+                "endpoint. Cross-endpoint PCP-to-DCP placement is supported by "
+                "generic segmented-direct transfer. "
+                f"Remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+        cross_endpoint_pcp_dcp = (local_pcp_size > 1 and remote_dcp_size > 1) or (
+            remote_pcp_size > 1 and local_dcp_size > 1
+        )
+        if cross_endpoint_pcp_dcp and not generic_placement_available:
+            raise NotImplementedError(
+                "Cross-endpoint PCP/DCP requires generic segmented-direct "
+                "NIXL READ placement. "
                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+
+    @staticmethod
+    def _validate_requested_remote_topology(
+        remote_tp_size: int,
+        remote_dcp_size: int,
+        remote_pcp_size: int,
+        remote_pp_size: int,
+    ) -> None:
+        for name, size in (
+            ("TP", remote_tp_size),
+            ("DCP", remote_dcp_size),
+            ("PCP", remote_pcp_size),
+            ("PP", remote_pp_size),
+        ):
+            if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                raise RuntimeError(f"Remote {name} size must be a positive integer")
+            if size > MAX_NIXL_HANDSHAKE_RANKS:
+                raise RuntimeError(
+                    f"Remote {name} size exceeds the "
+                    f"{MAX_NIXL_HANDSHAKE_RANKS}-rank handshake limit"
+                )
+        endpoint_ranks = remote_tp_size * remote_pcp_size * remote_pp_size
+        if endpoint_ranks > MAX_NIXL_HANDSHAKE_RANKS:
+            raise RuntimeError(
+                f"Remote endpoint has {endpoint_ranks} placement ranks, exceeding "
+                f"the {MAX_NIXL_HANDSHAKE_RANKS}-rank handshake limit"
+            )
+        if remote_pcp_size == 1 and remote_tp_size % remote_dcp_size:
+            raise RuntimeError(
+                "Remote TP size must be divisible by remote DCP size: "
+                f"TP={remote_tp_size}, DCP={remote_dcp_size}."
+            )
+        if remote_pcp_size > 1 and remote_dcp_size > 1:
+            raise RuntimeError(
+                "Remote NIXL endpoint cannot combine PCP and DCP yet: "
+                f"PCP={remote_pcp_size}, DCP={remote_dcp_size}."
+            )
+
+    @staticmethod
+    def _validate_remote_metadata_topology(
+        metadata: NixlAgentMetadata,
+        *,
+        remote_tp_size: int,
+        remote_dcp_size: int,
+        remote_pcp_size: int,
+        remote_pp_size: int,
+        remote_tp_rank: int,
+        remote_pcp_rank: int,
+        remote_pp_rank: int,
+        remote_pp_local_rank: int,
+    ) -> None:
+        if metadata.dcp_size != remote_dcp_size:
+            raise RuntimeError(
+                "Remote NIXL metadata DCP size does not match the requested "
+                f"topology: requested={remote_dcp_size}, "
+                f"advertised={metadata.dcp_size}."
+            )
+        if metadata.pcp_size != remote_pcp_size:
+            raise RuntimeError(
+                "Remote NIXL metadata PCP size does not match the requested "
+                f"topology: requested={remote_pcp_size}, "
+                f"advertised={metadata.pcp_size}."
+            )
+
+        placement = metadata.placement_metadata
+        if placement is None:
+            return
+        rank_placement = placement.rank_placement
+        expected = {
+            "TP size": (rank_placement.tp_size, remote_tp_size),
+            "TP rank": (rank_placement.tp_rank, remote_tp_rank),
+            "DCP size": (rank_placement.dcp_size, remote_dcp_size),
+            "DCP rank": (
+                rank_placement.dcp_rank,
+                native_vllm_dcp_rank(
+                    tp_size=remote_tp_size,
+                    tp_rank=remote_tp_rank,
+                    dcp_size=remote_dcp_size,
+                    pcp_size=remote_pcp_size,
+                    pcp_rank=remote_pcp_rank,
+                ),
+            ),
+            "PCP size": (rank_placement.pcp_size, metadata.pcp_size),
+            "PCP rank": (rank_placement.pcp_rank, remote_pcp_rank),
+            "PP size": (rank_placement.pp_size, remote_pp_size),
+            "PP rank": (rank_placement.pp_rank, remote_pp_rank),
+            "CP interleave": (
+                rank_placement.cp_interleave,
+                metadata.cp_kv_cache_interleave_size,
+            ),
+        }
+        mismatches = [
+            f"{name}: advertised={advertised}, expected={wanted}"
+            for name, (advertised, wanted) in expected.items()
+            if advertised != wanted
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "Remote NIXL placement topology does not match its handshake "
+                f"coordinate ({remote_pp_rank}, {remote_pp_local_rank}) or requested "
+                f"topology: {'; '.join(mismatches)}"
             )
 
     def _sync_block_size_with_kernel(self) -> None:
@@ -776,8 +1011,56 @@ class NixlBaseConnectorWorker:
         remote_dcp_size: int = 1,
         remote_pp_size: int = 1,
         notif_agents_only: bool = False,
+        remote_pcp_size: int = 1,
+        expected_endpoint_incarnation: str | None = None,
+    ) -> tuple[dict[tuple[int, int], str], float]:
+        """Atomically import every remote rank needed by one endpoint.
+
+        NIXL agent imports happen rank by rank, while the endpoint is usable
+        only after its complete placement metadata has been validated.  Keep
+        the partially imported names local and roll all per-engine state back
+        if any later rank or endpoint-level validation fails.
+        """
+        imported_agents: list[str] = []
+        try:
+            return self._nixl_handshake_impl(
+                host,
+                port,
+                remote_tp_size,
+                expected_engine_id,
+                remote_dcp_size,
+                remote_pp_size,
+                notif_agents_only,
+                imported_agents,
+                remote_pcp_size,
+                expected_endpoint_incarnation,
+            )
+        except BaseException:
+            self._rollback_incomplete_handshake(expected_engine_id, imported_agents)
+            raise
+
+    def _nixl_handshake_impl(
+        self,
+        host: str,
+        port: int,
+        remote_tp_size: int,
+        expected_engine_id: str,
+        remote_dcp_size: int = 1,
+        remote_pp_size: int = 1,
+        notif_agents_only: bool = False,
+        imported_agents: list[str] | None = None,
+        remote_pcp_size: int = 1,
+        expected_endpoint_incarnation: str | None = None,
     ) -> tuple[dict[tuple[int, int], str], float]:
         """Do a NIXL handshake with a remote instance."""
+        if imported_agents is None:
+            imported_agents = []
+        self._validate_requested_remote_topology(
+            remote_tp_size,
+            remote_dcp_size,
+            remote_pcp_size,
+            remote_pp_size,
+        )
         if self._is_csa_linear:
             self._validate_csa_linear_tp_layout(remote_tp_size)
 
@@ -799,56 +1082,138 @@ class NixlBaseConnectorWorker:
         # local rank will read from. Note that With homogeneous TP,
         # this happens to be the same single rank_i.
         assert self.transfer_topo is not None
-        p_remote_ranks = self.transfer_topo.handshake_target_ranks(
-            remote_tp_size, remote_dcp_size
-        )
+        legacy_topology_error: RuntimeError | None = None
+        try:
+            p_remote_ranks = self.transfer_topo.handshake_target_ranks(
+                remote_tp_size, remote_dcp_size
+            )
+        except AssertionError as error:
+            if self._local_placement_metadata is None or notif_agents_only:
+                raise RuntimeError(
+                    "Legacy NIXL cannot represent the requested remote topology"
+                ) from error
+            # Canonical placement can compose TP sizes that do not divide one
+            # another. Query the complete endpoint and force generic admission.
+            legacy_topology_error = RuntimeError(
+                "Legacy NIXL cannot represent the requested remote topology"
+            )
+            p_remote_ranks = list(range(remote_tp_size))
+        legacy_target_ranks = frozenset(p_remote_ranks)
+        if self._local_placement_metadata is not None and not notif_agents_only:
+            # The generic request planner elects writers per canonical page and
+            # sends one aggregate completion to every producer participant. Keep
+            # the topology-selected ranks distinct: only those ranks may build
+            # legacy static descriptor lists. The remaining ranks are imported
+            # metadata-only through generic registration when both endpoints
+            # advertise a compatible placement protocol.
+            p_remote_ranks = list(range(remote_pcp_size * remote_tp_size))
         remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
+        remote_metadata_by_rank: dict[tuple[int, int], NixlAgentMetadata] = {}
         path = make_zmq_path("tcp", host, port)
         # Clock offset to the peer, estimated from the handshake round-trip.
         # Keep the lowest-RTT sample: hop cost is ~uniform across ranks, so a
         # higher RTT is just noise that skews the midpoint estimate.
         best_rtt = float("inf")
         best_offset: float | None = None
+        # True means the strict legacy hashes differed and the whole endpoint
+        # must be admitted through generic placement only. Legitimate ranks in
+        # one remote endpoint always publish the same compatibility hashes;
+        # reject a mixed endpoint before it can partially commit.
+        endpoint_generic_only: bool | None = None
+        all_placement_hashes_match = True
+        advertised_endpoint_incarnation: str | None = None
 
-        with zmq_ctx(zmq.REQ, path) as sock:
-            for remote_pp_rank, remote_rank in itertools.product(
+        endpoint_handshake_bytes = 0
+        with zmq_ctx(
+            zmq.REQ,
+            path,
+            max_message_size=MAX_NIXL_HANDSHAKE_BYTES,
+        ) as sock:
+            for remote_pp_rank, remote_pp_local_rank in itertools.product(
                 range(remote_pp_size), p_remote_ranks
             ):
+                shutdown_event = getattr(self, "_handshake_shutdown_event", None)
+                if shutdown_event is not None and shutdown_event.is_set():
+                    raise RuntimeError("NIXL worker is shutting down")
+                remote_pcp_rank, remote_tp_rank = divmod(
+                    remote_pp_local_rank, remote_tp_size
+                )
                 logger.debug(
-                    "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
+                    "Querying metadata on path: %s at remote pp rank %s, "
+                    "pcp rank %s, tp rank %s",
                     path,
                     remote_pp_rank,
-                    remote_rank,
+                    remote_pcp_rank,
+                    remote_tp_rank,
                 )
 
                 # Send query for the request.
                 msg = msgspec.msgpack.encode(
-                    (GET_META_MSG, remote_pp_rank, remote_rank)
+                    (GET_META_MSG, remote_pp_rank, remote_pp_local_rank)
                 )
                 # Set receive timeout to 5 seconds to avoid hanging on dead server
                 sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
                 start_time = time.perf_counter()
                 sock.send(msg)
-                reply_parts = sock.recv_multipart()
+                reply_parts = recv_multipart_bounded(sock, 2)
                 recv_time = time.perf_counter()
-                assert len(reply_parts) == 2
+                if len(reply_parts) != 2 or any(
+                    not isinstance(part, bytes) for part in reply_parts
+                ):
+                    raise RuntimeError(
+                        "Invalid NIXL handshake response framing: expected two "
+                        "byte frames"
+                    )
+                endpoint_handshake_bytes += sum(map(len, reply_parts))
+                if endpoint_handshake_bytes > MAX_NIXL_ENDPOINT_HANDSHAKE_BYTES:
+                    raise RuntimeError(
+                        "Remote endpoint handshake metadata exceeds the "
+                        f"{MAX_NIXL_ENDPOINT_HANDSHAKE_BYTES}-byte aggregate limit"
+                    )
                 handshake_bytes = reply_parts[0]
 
-                remote_perf = msgspec.msgpack.decode(reply_parts[1])
+                try:
+                    remote_perf = msgspec.msgpack.decode(
+                        reply_parts[1], type=float, strict=True
+                    )
+                except (msgspec.DecodeError, msgspec.ValidationError) as error:
+                    raise RuntimeError(
+                        "Invalid NIXL handshake timestamp frame"
+                    ) from error
+                if not math.isfinite(remote_perf):
+                    raise RuntimeError(
+                        "Invalid NIXL handshake timestamp frame: expected a "
+                        "finite value"
+                    )
                 rtt = recv_time - start_time
                 if rtt < best_rtt:
                     best_rtt = rtt
                     best_offset = remote_perf - (start_time + recv_time) / 2
 
                 # Decode handshake payload to get compatibility hash
-                handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
                 try:
-                    handshake_payload = handshake_decoder.decode(handshake_bytes)
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
+                    handshake_payload = NixlHandshakePayload.decode(handshake_bytes)
+                except ValueError as e:
                     raise RuntimeError(
                         f"Failed to decode NixlHandshakePayload. This likely indicates "
                         f"an incompatibility between connector version. Error: {e}"
                     ) from e
+
+                rank_endpoint_incarnation = handshake_payload.endpoint_incarnation
+                if advertised_endpoint_incarnation is None:
+                    advertised_endpoint_incarnation = rank_endpoint_incarnation
+                elif rank_endpoint_incarnation != advertised_endpoint_incarnation:
+                    raise RuntimeError(
+                        "Remote NIXL ranks advertise inconsistent endpoint incarnations"
+                    )
+                if (
+                    expected_endpoint_incarnation is not None
+                    and rank_endpoint_incarnation != expected_endpoint_incarnation
+                ):
+                    raise RuntimeError(
+                        "Remote NIXL endpoint incarnation does not match request "
+                        "metadata"
+                    )
 
                 got_metadata_time = time.perf_counter()
                 logger.debug(
@@ -856,43 +1221,171 @@ class NixlBaseConnectorWorker:
                     got_metadata_time - start_time,
                 )
 
-                # Check compatibility hash BEFORE decoding agent metadata
+                # Check compatibility hashes BEFORE decoding agent metadata.
+                # A matching placement hash includes the connector protocol
+                # version, making strict nested placement decoding safe even
+                # when backend/layout-only factors changed the legacy hash.
                 assert self.compat_hash is not None
-                if (
-                    self.enforce_compat_hash
-                    and handshake_payload.compatibility_hash != self.compat_hash
-                ):
-                    raise RuntimeError(
-                        f"NIXL compatibility hash mismatch. "
-                        f"Local: {self.compat_hash}, "
-                        f"Remote: {handshake_payload.compatibility_hash}. "
-                        f"Prefill and decode instances have incompatible "
-                        f"configurations. This may be due to: different vLLM versions,"
-                        f" models, dtypes, KV cache layouts, attention backends, etc. "
-                        f"Both instances must use identical configurations."
-                        f"Disable this check using "
-                        f'--kv-transfer-config \'{{"kv_connector_extra_config": '
-                        f'{{"enforce_handshake_compat": false}}}}\''
-                    )
-
-                logger.info(
-                    "NIXL compatibility check passed (hash: %s)",
-                    handshake_payload.compatibility_hash,
+                strict_hash_matches = (
+                    handshake_payload.compatibility_hash == self.compat_hash
                 )
+                assert self.placement_compat_hash is not None
+                placement_hash_matches = (
+                    handshake_payload.placement_compatibility_hash
+                    == self.placement_compat_hash
+                )
+                all_placement_hashes_match &= placement_hash_matches
+                rank_generic_only = False
+                if self.enforce_compat_hash and not strict_hash_matches:
+                    generic_fallback_available = (
+                        self._TRANSFER_MODE == "pull"
+                        and not notif_agents_only
+                        and self._local_placement_metadata is not None
+                    )
+                    if not generic_fallback_available:
+                        raise RuntimeError(
+                            "NIXL compatibility hash mismatch and generic placement "
+                            "is unavailable. "
+                            f"Local: {self.compat_hash}, "
+                            f"Remote: {handshake_payload.compatibility_hash}."
+                        )
+                    if not placement_hash_matches:
+                        raise RuntimeError(
+                            "NIXL compatibility hash mismatch and placement "
+                            "compatibility hash mismatch. "
+                            f"Local placement: {self.placement_compat_hash}, "
+                            "Remote placement: "
+                            f"{handshake_payload.placement_compatibility_hash}."
+                        )
+                    rank_generic_only = True
 
                 # Decode agent metadata
-                metadata_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
                 try:
-                    metadata = metadata_decoder.decode(
+                    metadata = NixlAgentMetadata.decode(
                         handshake_payload.agent_metadata_bytes
                     )
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    # This should not happen if hash matched
+                except ValueError as e:
+                    # The strict or placement hash includes the connector
+                    # protocol version, so a decode failure is incompatible.
                     raise RuntimeError(
                         f"Failed to decode NixlAgentMetadata. Error: {e}"
                     ) from e
 
-                self._validate_remote_parallel_config(metadata)
+                self._validate_remote_metadata_topology(
+                    metadata,
+                    remote_tp_size=remote_tp_size,
+                    remote_dcp_size=remote_dcp_size,
+                    remote_pcp_size=remote_pcp_size,
+                    remote_pp_size=remote_pp_size,
+                    remote_tp_rank=remote_tp_rank,
+                    remote_pcp_rank=remote_pcp_rank,
+                    remote_pp_rank=remote_pp_rank,
+                    remote_pp_local_rank=remote_pp_local_rank,
+                )
+                generic_registration_available = (
+                    self._TRANSFER_MODE == "pull"
+                    and not notif_agents_only
+                    and self._generic_registration_available(metadata)
+                )
+                if not getattr(self, "_legacy_fast_path_available", True):
+                    if not generic_registration_available:
+                        raise RuntimeError(
+                            "Local legacy NIXL descriptor preparation failed and "
+                            "generic placement is unavailable"
+                        )
+                    if not placement_hash_matches:
+                        raise RuntimeError(
+                            "Local legacy NIXL descriptor preparation failed and "
+                            "placement compatibility hash mismatch prevents the "
+                            "generic path"
+                        )
+                    rank_generic_only = True
+                self._validate_remote_parallel_config(
+                    metadata,
+                    generic_placement_available=generic_registration_available,
+                )
+                placement_axis_requires_generic = (
+                    self._TRANSFER_MODE == "pull"
+                    and not notif_agents_only
+                    and (
+                        getattr(self, "pp_size", 1) > 1
+                        or remote_pp_size > 1
+                        or getattr(self, "pcp_size", 1) > 1
+                        or remote_pcp_size > 1
+                    )
+                )
+                if placement_axis_requires_generic:
+                    # Legacy descriptor maps are keyed only by remote TP rank,
+                    # so two PP stages would alias the same entry. The generic
+                    # path addresses the flattened PP x TP placement rank and
+                    # must be selected for the entire endpoint before any
+                    # legacy descriptor registration mutates shared state.
+                    if not generic_registration_available:
+                        raise RuntimeError(
+                            "PCP/PP generic NIXL requires placement metadata "
+                            "on both endpoints"
+                        )
+                    if not placement_hash_matches:
+                        raise RuntimeError(
+                            "PCP/PP generic NIXL placement "
+                            "compatibility hash mismatch. "
+                            f"Local: {self.placement_compat_hash}, remote: "
+                            f"{handshake_payload.placement_compatibility_hash}."
+                        )
+                    rank_generic_only = True
+                if not rank_generic_only:
+                    # Topology and interleave are intentionally absent from the
+                    # strict hash because legacy supports several heterogeneous
+                    # combinations. Some combinations cannot use raw legacy page
+                    # copies, however. Select the canonical path before legacy
+                    # registration mutates any per-engine state, even when strict
+                    # hash enforcement was explicitly disabled.
+                    try:
+                        if legacy_topology_error is not None:
+                            raise legacy_topology_error
+                        self._validate_legacy_registration_compatibility(
+                            metadata, remote_tp_size
+                        )
+                    except RuntimeError as legacy_error:
+                        if not generic_registration_available:
+                            raise
+                        if not placement_hash_matches:
+                            raise RuntimeError(
+                                "Legacy NIXL registration cannot represent this "
+                                "KV placement and placement compatibility hash "
+                                "mismatch prevents the generic path. "
+                                f"Local placement: {self.placement_compat_hash}, "
+                                "Remote placement: "
+                                f"{handshake_payload.placement_compatibility_hash}."
+                            ) from legacy_error
+                        rank_generic_only = True
+
+                if rank_generic_only and not self._generic_registration_available(
+                    metadata
+                ):
+                    raise RuntimeError(
+                        "Generic-only NIXL compatibility requires placement metadata "
+                        "on both endpoints"
+                    )
+
+                if endpoint_generic_only is None:
+                    endpoint_generic_only = rank_generic_only
+                elif endpoint_generic_only != rank_generic_only:
+                    raise RuntimeError(
+                        "Remote NIXL workers advertised mixed legacy and generic-only "
+                        "compatibility modes"
+                    )
+
+                if rank_generic_only:
+                    logger.info(
+                        "NIXL generic-placement compatibility check passed (hash: %s)",
+                        handshake_payload.placement_compatibility_hash,
+                    )
+                else:
+                    logger.info(
+                        "NIXL legacy compatibility check passed (hash: %s)",
+                        handshake_payload.compatibility_hash,
+                    )
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -902,6 +1395,25 @@ class NixlBaseConnectorWorker:
                         f"received {metadata.engine_id}."
                     )
 
+                remote_ranks = (remote_pp_rank, remote_pp_local_rank)
+                remote_metadata_by_rank[remote_ranks] = metadata
+
+                # Generic placement needs metadata and agent handles for every
+                # endpoint rank. Legacy only needs the topology-selected ranks.
+                # Do not accidentally materialize a full static descriptor list
+                # on every local/remote TP pair merely because the local worker
+                # advertises optional generic placement.
+                is_legacy_target = (
+                    remote_pcp_rank == 0 and remote_tp_rank in legacy_target_ranks
+                )
+                generic_extra_rank = (
+                    not is_legacy_target
+                    and generic_registration_available
+                    and placement_hash_matches
+                )
+                if not is_legacy_target and not generic_extra_rank:
+                    continue
+
                 # Register Remote agent.
                 if notif_agents_only:
                     remote_agent_name = self._add_notif_only_remote_agent(
@@ -909,7 +1421,11 @@ class NixlBaseConnectorWorker:
                     )
                 else:
                     remote_agent_name = self.add_remote_agent(
-                        metadata, remote_rank, remote_tp_size, metadata.dcp_size
+                        metadata,
+                        remote_tp_rank,
+                        remote_tp_size,
+                        metadata.dcp_size,
+                        generic_registration=(rank_generic_only or generic_extra_rank),
                     )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
@@ -917,11 +1433,90 @@ class NixlBaseConnectorWorker:
                     setup_agent_time - got_metadata_time,
                     notif_agents_only,
                 )
-                remote_ranks = (remote_pp_rank, remote_rank)
                 remote_rank_to_agent_name[remote_ranks] = remote_agent_name
+                imported_agents.append(remote_agent_name)
 
         assert best_offset is not None
+        advertised_placements = [
+            metadata.placement_metadata is not None
+            for metadata in remote_metadata_by_rank.values()
+        ]
+        if any(advertised_placements) and not all(advertised_placements):
+            raise RuntimeError(
+                "Remote NIXL workers inconsistently advertised generic placement"
+            )
+        if (
+            self._local_placement_metadata is not None
+            and advertised_placements
+            and all(advertised_placements)
+            and all_placement_hashes_match
+            and not notif_agents_only
+        ):
+            remote_index = index_remote_nixl_placements(
+                remote_metadata_by_rank, remote_rank_to_agent_name
+            )
+            validate_complete_nixl_placement_endpoint(remote_index.workers)
+            self._remote_placement_indexes[expected_engine_id] = remote_index
+        elif advertised_placements and not all_placement_hashes_match:
+            logger.warning(
+                "Remote NIXL placement hash differs; retaining only the strict "
+                "legacy path for engine %s",
+                expected_engine_id,
+            )
+        if endpoint_generic_only:
+            if expected_engine_id not in self._remote_placement_indexes:
+                raise RuntimeError(
+                    "Generic-only NIXL handshake did not produce a validated "
+                    "placement endpoint"
+                )
+            self._generic_only_remote_engines.add(expected_engine_id)
+        else:
+            self._generic_only_remote_engines.discard(expected_engine_id)
         return remote_rank_to_agent_name, best_offset
+
+    def _rollback_incomplete_handshake(
+        self, engine_id: EngineId, imported_agents: list[str]
+    ) -> None:
+        """Release state created before a multi-rank handshake committed."""
+        for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
+            try:
+                self.nixl_wrapper.release_dlist_handle(handle)
+            except Exception:
+                logger.warning(
+                    "Failed to release a descriptor list while rolling back "
+                    "NIXL handshake for engine %s",
+                    engine_id,
+                    exc_info=True,
+                )
+
+        # _remote_agents is normally committed only by the Future callback,
+        # but include it to make direct/re-entrant calls equally safe.
+        committed_agents = self._remote_agents.pop(engine_id, {})
+        agent_names = set(imported_agents)
+        agent_names.update(committed_agents.values())
+        for agent_name in agent_names:
+            try:
+                self.nixl_wrapper.remove_remote_agent(agent_name)
+            except Exception:
+                logger.warning(
+                    "Failed to remove remote agent %s while rolling back NIXL "
+                    "handshake for engine %s",
+                    agent_name,
+                    engine_id,
+                    exc_info=True,
+                )
+
+        self.kv_caches_base_addr.pop(engine_id, None)
+        self.dst_num_blocks.pop(engine_id, None)
+        self.tp_mappings.pop(engine_id, None)
+        self._remote_placement_indexes.pop(engine_id, None)
+        self._generic_only_remote_engines.discard(engine_id)
+        self._remote_handshake_specs.pop(engine_id, None)
+        self._stale_remote_engines.discard(engine_id)
+        self._engine_clock_offset.pop(engine_id, None)
+        self._engine_last_active.pop(engine_id, None)
+        if self.transfer_topo is not None:
+            self.transfer_topo.unregister_remote_engine(engine_id)
 
     def _add_notif_only_remote_agent(
         self, metadata: NixlAgentMetadata, remote_tp_size: int, remote_dcp_size: int = 1
@@ -1063,6 +1658,9 @@ class NixlBaseConnectorWorker:
         dcp_size: int = 1,
         pp_size: int = 1,
         notif_agents_only: bool = False,
+        pcp_size: int = 1,
+        endpoint_incarnation: str | None = None,
+        request_id: str | None = None,
     ) -> Future[tuple[dict[tuple[int, int], str], float]] | None:
         """
         Ensure a handshake is in-flight (or already done) for *engine_id*.
@@ -1073,12 +1671,41 @@ class NixlBaseConnectorWorker:
         returned future.
         Failures to handshake are logged and the request is marked as failed.
         """
-        self._evict_stale_engines()
+        if not isinstance(endpoint_incarnation, str) or not endpoint_incarnation:
+            raise RuntimeError("Remote endpoint incarnation must be a non-empty string")
+        spec = _HandshakeSpec(
+            host=host,
+            port=port,
+            tp_size=tp_size,
+            dcp_size=dcp_size,
+            pcp_size=pcp_size,
+            pp_size=pp_size,
+            notif_agents_only=notif_agents_only,
+            endpoint_incarnation=endpoint_incarnation,
+        )
         with self._handshake_lock:
+            if getattr(self, "_shutting_down", False):
+                raise RuntimeError("NIXL worker is shutting down")
+            self._evict_stale_engines(exclude_request_id=request_id)
             if engine_id in self._remote_agents:
-                return None
+                if self._remote_handshake_specs.get(engine_id) == spec:
+                    return None
+                self._stale_remote_engines.add(engine_id)
+                if self._engine_has_active_references(
+                    engine_id, exclude_request_id=request_id
+                ):
+                    raise RuntimeError(
+                        "Remote NIXL endpoint changed while its previous "
+                        "registration is still in use"
+                    )
+                self._cleanup_remote_engine(engine_id, log_eviction=False)
             fut = self._handshake_futures.get(engine_id)
             if fut is not None:
+                if self._handshake_future_specs.get(engine_id) != spec:
+                    raise RuntimeError(
+                        "Remote NIXL endpoint changed while a handshake for its "
+                        "previous incarnation is still pending"
+                    )
                 return fut
             fut = self._handshake_initiation_executor.submit(
                 self._nixl_handshake,
@@ -1089,27 +1716,35 @@ class NixlBaseConnectorWorker:
                 dcp_size,
                 pp_size,
                 notif_agents_only,
+                pcp_size,
+                endpoint_incarnation,
             )
             self._handshake_futures[engine_id] = fut
+            self._handshake_future_specs[engine_id] = spec
 
             def done_callback(
                 f: Future[tuple[dict[tuple[int, int], str], float]],
                 eid=engine_id,
+                handshake_spec=spec,
             ):
                 with self._handshake_lock:
-                    del self._handshake_futures[eid]
+                    self._handshake_futures.pop(eid, None)
+                    self._handshake_future_specs.pop(eid, None)
                     try:
                         remote_agents, clock_offset = f.result()
                         self._remote_agents[eid] = remote_agents
+                        self._remote_handshake_specs[eid] = handshake_spec
+                        self._stale_remote_engines.discard(eid)
                         self._engine_clock_offset[eid] = clock_offset
                         self._engine_last_active[eid] = time.perf_counter()
                     except Exception as e:
-                        self._log_failure(
-                            failure_type="handshake_setup_failed",
-                            req_id=None,
-                            error=e,
-                            remote_engine_id=eid,
-                        )
+                        if not getattr(self, "_shutting_down", False):
+                            self._log_failure(
+                                failure_type="handshake_setup_failed",
+                                req_id=None,
+                                error=e,
+                                remote_engine_id=eid,
+                            )
 
             fut.add_done_callback(done_callback)
             return fut
@@ -1119,32 +1754,55 @@ class NixlBaseConnectorWorker:
     ):
         # Do NIXL handshake in background and add to _ready_requests when done.
         assert meta.remote is not None
-        fut = self._ensure_handshake(
-            remote_engine_id,
-            meta.remote.host,
-            meta.remote.port,
-            meta.tp_size,
-            meta.dcp_size,
-            meta.pp_size,
-        )
+        try:
+            fut = self._ensure_handshake(
+                remote_engine_id,
+                meta.remote.host,
+                meta.remote.port,
+                meta.tp_size,
+                meta.dcp_size,
+                meta.pp_size,
+                pcp_size=meta.pcp_size,
+                endpoint_incarnation=meta.remote.endpoint_incarnation,
+                request_id=req_id,
+            )
+        except Exception as error:
+            self._log_failure(
+                failure_type="handshake_spec_rejected",
+                req_id=req_id,
+                error=error,
+                meta=meta,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
         if fut is None:
             # Already handshaked — only happens if caller does not pre-check.
-            self._ready_requests.put((req_id, meta))
+            if self._recving_metadata.get(req_id) is meta:
+                self._ready_requests.put((req_id, meta))
             return
 
         # Check handshake success before proceeding with request.
         def request_ready(f: Future[Any], entry=(req_id, meta)):
-            try:
-                f.result()
-                self._ready_requests.put(entry)
-            except Exception as e:
-                self._log_failure(
-                    failure_type="handshake_failed",
-                    req_id=req_id,
-                    error=e,
-                    meta=meta,
-                )
-                self._handle_failed_transfer(req_id, None)
+            if getattr(self, "_shutting_down", False):
+                return
+            with self._handshake_lock:
+                # Request IDs may be reused by retries. A late callback belongs
+                # to the exact metadata object that initiated it and must never
+                # start or fail a newer attempt with the same ID. Keep the check
+                # and its side effect atomic with start_load_kv replacement.
+                if self._recving_metadata.get(req_id) is not meta:
+                    return
+                try:
+                    f.result()
+                    self._ready_requests.put(entry)
+                except Exception as e:
+                    self._log_failure(
+                        failure_type="handshake_failed",
+                        req_id=req_id,
+                        error=e,
+                        meta=meta,
+                    )
+                    self._handle_failed_transfer(req_id, None)
 
         fut.add_done_callback(request_ready)
 
@@ -1172,6 +1830,10 @@ class NixlBaseConnectorWorker:
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config,
             self.backend_name,
+            transfer_mode=self._TRANSFER_MODE,
+        )
+        self.placement_compat_hash = compute_nixl_placement_compatibility_hash(
+            self.vllm_config,
             transfer_mode=self._TRANSFER_MODE,
         )
 
@@ -1456,14 +2118,243 @@ class NixlBaseConnectorWorker:
         # Total local FA descriptors (boundary between FA and mamba descs).
         self.num_descs = self.num_regions * self.num_blocks
 
-        descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
-        logger.debug("Registering descs: %s", caches_data)
-        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-        logger.debug("Done registering descs")
-        self._registered_descs.append(descs)
+        generic_activation_requested = (
+            self._TRANSFER_MODE == "pull" and self._enable_generic_placement
+        )
+        registration_error: Exception | None = None
+        descs = None
+        try:
+            descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
+            logger.debug("Registering descs: %s", caches_data)
+            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+            logger.debug("Done registering descs")
+            self._registered_descs.append(descs)
+        except Exception as error:
+            if not generic_activation_requested:
+                raise
+            registration_error = error
+            if descs is not None:
+                try:
+                    self.nixl_wrapper.deregister_memory(descs)
+                except Exception:
+                    logger.warning(
+                        "Failed to roll back NIXL memory registration",
+                        exc_info=True,
+                    )
+            # A failed rank must still join the generic placement collectives so
+            # its peers fail uniformly instead of hanging during startup.
+            logger.warning(
+                "Failed to register NIXL memory for generic placement",
+                exc_info=True,
+            )
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
+
+        local_dlist_error: Exception | None = None
+        if registration_error is None:
+            try:
+                # Prepare the legacy fast-path descriptor eagerly when
+                # possible. Generic segmented descriptors only require the
+                # registered memory and canonical placement below, so failure
+                # here disables legacy admission on this worker rather than
+                # disabling the generic path as well.
+                (
+                    self.src_xfer_handles_by_block_size[self.block_size],
+                    self.src_blocks_data,
+                ) = self.register_local_xfer_handler(self.block_size)
+            except Exception as error:
+                if not generic_activation_requested:
+                    raise
+                local_dlist_error = error
+                logger.warning(
+                    "Failed to prepare the legacy local NIXL descriptor list; "
+                    "generic segmented-direct placement remains eligible",
+                    exc_info=True,
+                )
+        self._legacy_fast_path_available = (
+            registration_error is None and local_dlist_error is None
+        )
+
+        self._local_placement_metadata = None
+        self._local_placement_workers = ()
+        if generic_activation_requested:
+            parallel = self.vllm_config.parallel_config
+            candidate: NixlPlacementMetadata | None = None
+            if registration_error is None and not self.use_host_buffer:
+                try:
+                    candidate = build_runtime_nixl_placement(
+                        vllm_config=self.vllm_config,
+                        kv_cache_config=self.kv_cache_config,
+                        caches=kv_caches,
+                        deployment_id=self.engine_id,
+                        topology_generation=0,
+                        worker_id=(
+                            f"{self.engine_id}:dp{parallel.data_parallel_rank}:"
+                            f"pp{self.pp_rank}:pcp{self.pcp_rank}:"
+                            f"tp{self.tp_rank}:ep{self.ep_rank}"
+                        ),
+                        worker_incarnation=self._placement_worker_incarnation,
+                        tp_rank=self.tp_rank,
+                        pcp_rank=self.pcp_rank,
+                        pp_rank=self.pp_rank,
+                        dp_rank=parallel.data_parallel_rank,
+                        ep_size=self.ep_size,
+                        ep_rank=self.ep_rank,
+                        physical_pages_per_logical=(
+                            self._physical_blocks_per_logical_kv_block
+                        ),
+                        max_segments_per_batch=(
+                            self.kv_transfer_config.get_from_extra_config(
+                                "max_segments_per_batch", 4096
+                            )
+                        ),
+                    )
+                except NixlRuntimePlacementUnsupported as error:
+                    logger.info(
+                        "Generic segmented-direct NIXL placement is unavailable: %s",
+                        error,
+                    )
+                except Exception:
+                    # Every TP rank must still enter the metadata collective;
+                    # otherwise one unexpected derivation error deadlocks its
+                    # peers during startup. Disable the optional path uniformly.
+                    logger.warning(
+                        "Failed to derive generic segmented-direct placement",
+                        exc_info=True,
+                    )
+
+            stage_candidates: list[NixlPlacementMetadata | None]
+            if self.world_size == 1:
+                stage_candidates = [candidate]
+            else:
+                stage_candidates = [None] * self.world_size
+                torch.distributed.all_gather_object(
+                    stage_candidates,
+                    candidate,
+                    group=get_tp_group().cpu_group,
+                )
+
+            # TP groups hold one fixed PP/PCP coordinate. PCP groups then span
+            # those complete TP tuples at a fixed PP/TP coordinate. This gives
+            # every stage worker the same PCP-major, TP-minor cohort without a
+            # world-level collective or any KV-data all-gather.
+            if self.pcp_size == 1:
+                pcp_stage_candidates = stage_candidates
+            else:
+                gathered_pcp_candidates: list[
+                    tuple[NixlPlacementMetadata | None, ...] | None
+                ] = [None] * self.pcp_size
+                torch.distributed.all_gather_object(
+                    gathered_pcp_candidates,
+                    tuple(stage_candidates),
+                    group=get_pcp_group().cpu_group,
+                )
+                malformed_pcp = next(
+                    (
+                        pcp_rank
+                        for pcp_rank, cohort in enumerate(gathered_pcp_candidates)
+                        if not isinstance(cohort, tuple)
+                        or len(cohort) != self.world_size
+                    ),
+                    None,
+                )
+                if malformed_pcp is not None:
+                    raise RuntimeError(
+                        "prefill-context-parallel generic NIXL gathered a "
+                        f"malformed TP cohort for PCP rank {malformed_pcp}"
+                    )
+                pcp_stage_candidates = [
+                    worker
+                    for cohort in gathered_pcp_candidates
+                    for worker in cast(tuple[NixlPlacementMetadata | None, ...], cohort)
+                ]
+
+            # PP groups hold one fixed PCP/TP coordinate. Gathering the complete
+            # stage cohort across PP gives every endpoint worker deterministic
+            # PP-major, PCP-major, TP-minor metadata.
+            stage_size = self.pcp_size * self.world_size
+            if self.pp_size == 1:
+                gathered_candidates = pcp_stage_candidates
+            else:
+                gathered_stage_candidates: list[
+                    tuple[NixlPlacementMetadata | None, ...] | None
+                ] = [None] * self.pp_size
+                torch.distributed.all_gather_object(
+                    gathered_stage_candidates,
+                    tuple(pcp_stage_candidates),
+                    group=get_pp_group().cpu_group,
+                )
+                malformed_stage = next(
+                    (
+                        pp_rank
+                        for pp_rank, stage in enumerate(gathered_stage_candidates)
+                        if not isinstance(stage, tuple) or len(stage) != stage_size
+                    ),
+                    None,
+                )
+                if malformed_stage is not None:
+                    raise RuntimeError(
+                        "pipeline-parallel generic NIXL gathered a malformed "
+                        f"PCP/TP cohort for PP rank {malformed_stage}"
+                    )
+                gathered_candidates = [
+                    worker
+                    for stage in gathered_stage_candidates
+                    for worker in cast(tuple[NixlPlacementMetadata | None, ...], stage)
+                ]
+
+            if all(item is not None for item in gathered_candidates):
+                try:
+                    finalized_candidates = finalize_nixl_placement_cohort(
+                        cast(list[NixlPlacementMetadata], gathered_candidates)
+                    )
+                    placement_workers = validate_complete_nixl_placement_endpoint(
+                        finalized_candidates,
+                        dp_rank=parallel.data_parallel_rank,
+                    )
+                    local_candidates = tuple(
+                        worker
+                        for worker in placement_workers
+                        if (
+                            worker.rank_placement.pp_rank == self.pp_rank
+                            and worker.rank_placement.pcp_rank == self.pcp_rank
+                            and worker.rank_placement.tp_rank == self.tp_rank
+                        )
+                    )
+                    if len(local_candidates) != 1:
+                        raise ValueError(
+                            "local PP/PCP/TP coordinates do not identify exactly "
+                            "one gathered placement worker"
+                        )
+                    self._local_placement_metadata = local_candidates[0]
+                    self._local_placement_workers = placement_workers
+                    logger.info(
+                        "Enabled generic segmented-direct NIXL placement on "
+                        "PP rank %s, PCP rank %s, TP rank %s",
+                        self.pp_rank,
+                        self.pcp_rank,
+                        self.tp_rank,
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "Gathered generic NIXL placements failed endpoint validation",
+                        exc_info=True,
+                    )
+                    raise RuntimeError(
+                        "generic NIXL placement failed endpoint validation"
+                    ) from error
+            elif any(item is not None for item in gathered_candidates):
+                logger.warning(
+                    "Generic NIXL placement was not derivable on every PP/PCP/TP rank"
+                )
+                raise RuntimeError(
+                    "generic NIXL placement must be derivable on every PP/PCP/TP rank"
+                )
+            else:
+                raise RuntimeError(
+                    "generic NIXL placement is unavailable on every PP/PCP/TP rank"
+                )
 
         if self._has_mamba:
             logger.info(
@@ -1478,11 +2369,6 @@ class NixlBaseConnectorWorker:
                 self._mamba_ssm_size,
                 set(self.block_len_per_layer),
             )
-
-        # Register local/src descr for NIXL xfer.
-        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
-            self.register_local_xfer_handler(self.block_size)
-        )
 
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
@@ -1505,12 +2391,15 @@ class NixlBaseConnectorWorker:
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            placement_metadata=self._local_placement_metadata,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
+        assert self.placement_compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
+            placement_compatibility_hash=self.placement_compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
@@ -1761,7 +2650,90 @@ class NixlBaseConnectorWorker:
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         # NIXL_INIT_AGENT to be used for preparations of local descs.
-        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
+        handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+        if handle is None:
+            raise RuntimeError("NIXL failed to prepare local descriptors")
+        return handle, blocks_data
+
+    def _prepare_local_split_xfer_handlers(
+        self,
+        plan: TPMapping,
+        src_blocks_data: np.ndarray,
+        num_fa_descs: int,
+        block_size_ratio: int,
+    ) -> list[int]:
+        """Prepare one split-handle cohort without publishing partial state."""
+        prepared_handles: list[int] = []
+        expected_handles = len(plan.all_source_ranks)
+        if expected_handles <= 0:
+            raise RuntimeError("NIXL local split plan has no source ranks")
+        try:
+            for handle_data in self._build_local_splits_from_plan(
+                plan,
+                src_blocks_data,
+                num_fa_descs,
+                block_size_ratio,
+            ):
+                descs = self.nixl_wrapper.get_xfer_descs(
+                    handle_data, self.nixl_memory_type
+                )
+                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+                if handle is None:
+                    raise RuntimeError("NIXL failed to prepare local split descriptors")
+                prepared_handles.append(handle)
+            if len(prepared_handles) != expected_handles:
+                raise RuntimeError(
+                    "NIXL local split descriptor count does not match its TP plan: "
+                    f"prepared={len(prepared_handles)}, expected={expected_handles}"
+                )
+        except BaseException:
+            for handle in prepared_handles:
+                try:
+                    self.nixl_wrapper.release_dlist_handle(handle)
+                except Exception:
+                    logger.warning(
+                        "Failed to release a partial local split descriptor list",
+                        exc_info=True,
+                    )
+            raise
+        return prepared_handles
+
+    def _add_generic_remote_agent(
+        self,
+        metadata: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int,
+    ) -> str:
+        """Register an agent without legacy page-copy descriptor setup."""
+        assert self.transfer_topo is not None
+        self.transfer_topo.register_remote_engine(
+            metadata.engine_id,
+            EngineTransferInfo(
+                remote_tp_size=remote_tp_size,
+                remote_block_size=metadata.block_size,
+                remote_block_len=metadata.block_lens[0],
+                remote_physical_blocks_per_logical=(
+                    metadata.physical_blocks_per_logical_kv_block
+                ),
+                remote_dcp_size=remote_dcp_size,
+                remote_cp_kv_cache_interleave_size=(
+                    metadata.cp_kv_cache_interleave_size
+                ),
+            ),
+        )
+        self.dst_num_blocks.setdefault(metadata.engine_id, metadata.num_blocks)
+        return self.nixl_wrapper.add_remote_agent(metadata.agent_metadata)
+
+    def _generic_registration_available(self, metadata: NixlAgentMetadata) -> bool:
+        """Whether the current runtime bridge can address both page spaces.
+
+        Each side advertises physical-page geometry independently, so different
+        scheduler-to-kernel page ratios remain directly composable.
+        """
+        return (
+            self._local_placement_metadata is not None
+            and metadata.placement_metadata is not None
+        )
 
     def add_remote_agent(
         self,
@@ -1769,6 +2741,8 @@ class NixlBaseConnectorWorker:
         remote_tp_rank: int = 0,
         remote_tp_size: int = 1,
         remote_dcp_size: int = 1,
+        *,
+        generic_registration: bool | None = None,
     ) -> str:
         """
         Add the remote NIXL agent and prepare the descriptors for reading cache
@@ -1824,6 +2798,21 @@ class NixlBaseConnectorWorker:
             )
             return self._remote_agents[engine_id][(0, remote_tp_rank)]
 
+        generic_registration_available = self._generic_registration_available(
+            nixl_agent_meta
+        )
+        if generic_registration is True and not generic_registration_available:
+            raise RuntimeError(
+                "generic NIXL registration requires placement metadata on both "
+                "endpoints"
+            )
+        if generic_registration is True or (
+            generic_registration is None and generic_registration_available
+        ):
+            return self._add_generic_remote_agent(
+                nixl_agent_meta, remote_tp_size, remote_dcp_size
+            )
+
         # Number of physical regions registered locally (one per layer/tensor).
         num_local_regions = len(self.block_len_per_layer)
         if (
@@ -1866,10 +2855,6 @@ class NixlBaseConnectorWorker:
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
             remote_dcp_size=remote_dcp_size,
-        )
-
-        remote_agent_name = self.nixl_wrapper.add_remote_agent(
-            nixl_agent_meta.agent_metadata
         )
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
@@ -1919,7 +2904,7 @@ class NixlBaseConnectorWorker:
             src_blocks_data = self.src_blocks_data_by_block_size[remote_block_size]
 
         ### (Optional) Register local agent memory regions. MLA is not split.
-        split_key = (tp_ratio, remote_block_size)
+        split_key = self._split_local_xfer_handle_key(tp_ratio, remote_block_size, plan)
         if self._needs_split_local_xfer_handles(tp_ratio, plan) and (
             split_key not in self.src_xfer_handles_by_tp_ratio
         ):
@@ -1928,19 +2913,13 @@ class NixlBaseConnectorWorker:
             # MLA+SSM also needs this path: MLA is replicated and read once,
             # while the SSM state is sharded across every remote TP rank.
             # We only do this once per remote (tp_size, block_size).
-            self.src_xfer_handles_by_tp_ratio[split_key] = []
-
-            for handle_data in self._build_local_splits_from_plan(
+            split_handles = self._prepare_local_split_xfer_handlers(
                 plan,
                 src_blocks_data,
                 self.num_descs * block_size_ratio,
                 block_size_ratio,
-            ):
-                descs = self.nixl_wrapper.get_xfer_descs(
-                    handle_data, self.nixl_memory_type
-                )
-                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-                self.src_xfer_handles_by_tp_ratio[split_key].append(handle)
+            )
+            self.src_xfer_handles_by_tp_ratio[split_key] = split_handles
 
         ### Register remote agent memory regions
         # With homogeneous TP, D pulls the whole kv cache from corresponding rank. With
@@ -1970,11 +2949,32 @@ class NixlBaseConnectorWorker:
             mamba = self._build_mamba_remote(nixl_agent_meta, tp_ratio, transfer_info)
             blocks_data = np.concatenate([blocks_data, mamba])
 
-        # Register with NIXL.
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
-            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+        # Import the remote agent only after every local validation and
+        # descriptor calculation has succeeded. If descriptor-list creation
+        # then fails, remove that import here because the outer multi-rank
+        # transaction has not yet received its name to roll it back.
+        remote_agent_name = self.nixl_wrapper.add_remote_agent(
+            nixl_agent_meta.agent_metadata
         )
+        try:
+            descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+            remote_handle = self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+            if remote_handle is None:
+                raise RuntimeError("NIXL failed to prepare remote descriptors")
+            self.dst_xfer_side_handles[engine_id][remote_tp_rank] = remote_handle
+        except BaseException:
+            try:
+                self.nixl_wrapper.remove_remote_agent(remote_agent_name)
+            except Exception:
+                logger.warning(
+                    "Failed to remove remote agent %s after descriptor setup "
+                    "failed for engine %s rank %s",
+                    remote_agent_name,
+                    engine_id,
+                    remote_tp_rank,
+                    exc_info=True,
+                )
+            raise
 
         return remote_agent_name
 
@@ -2021,6 +3021,78 @@ class NixlBaseConnectorWorker:
                     f"{remote_interleave}/{remote_logical_block_size} "
                     f"(engine {remote_engine_id})."
                 )
+
+    def _validate_legacy_registration_compatibility(
+        self, metadata: NixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """Validate constraints intrinsic to legacy static page descriptors.
+
+        This intentionally excludes compatibility-hash policy. A disabled strict
+        hash check must not route a byte layout that legacy descriptors cannot
+        represent; callers can instead select canonical segmented-direct when
+        placement metadata is available.
+        """
+        remote_dcp_size = metadata.dcp_size
+        if not (
+            self.dcp_size % remote_dcp_size == 0 or remote_dcp_size % self.dcp_size == 0
+        ):
+            raise RuntimeError(
+                "Legacy NIXL requires DCP sizes to divide one another: "
+                f"local={self.dcp_size}, remote={remote_dcp_size} "
+                f"(engine {metadata.engine_id})."
+            )
+
+        self._validate_dcp_interleave_compatibility(
+            remote_dcp_size=remote_dcp_size,
+            remote_interleave=metadata.cp_kv_cache_interleave_size,
+            remote_block_size=metadata.block_size,
+            remote_physical_per_logical=(metadata.physical_blocks_per_logical_kv_block),
+            remote_engine_id=metadata.engine_id,
+        )
+
+        if getattr(self, "use_mla", True):
+            return
+        local_layout = (
+            self.kv_cache_layout
+            if not self.use_host_buffer
+            else self.host_buffer_kv_cache_layout
+        )
+        transfer_config = getattr(self, "kv_transfer_config", None)
+        legacy_permute_available = (
+            getattr(transfer_config, "enable_permute_local_kv", False)
+            and metadata.kv_cache_layout == "LBHNC"
+            and not getattr(self, "_is_hma_required", False)
+        )
+        if metadata.kv_cache_layout != local_layout and not legacy_permute_available:
+            raise RuntimeError(
+                "Legacy NIXL cannot represent different MHA KV cache layouts: "
+                f"local={local_layout}, remote={metadata.kv_cache_layout} "
+                f"(engine {metadata.engine_id})."
+            )
+
+        assert self.transfer_topo is not None
+        local_tp_size = self.transfer_topo.tp_size
+        tp_sizes_divide = (
+            local_tp_size % remote_tp_size == 0 or remote_tp_size % local_tp_size == 0
+        )
+        remote_kv_replicated = remote_tp_size > self.transfer_topo.total_num_kv_heads
+        if not tp_sizes_divide:
+            raise RuntimeError(
+                "Legacy NIXL requires TP sizes to divide one another: "
+                f"local={local_tp_size}, remote={remote_tp_size} "
+                f"(engine {metadata.engine_id})."
+            )
+        if (
+            local_tp_size != remote_tp_size
+            and not remote_kv_replicated
+            and not KVCacheLayout[local_layout].is_block_contiguous
+            and not legacy_permute_available
+        ):
+            raise RuntimeError(
+                "Legacy NIXL heterogeneous TP head splitting requires a "
+                f"block-contiguous local layout, got {local_layout} "
+                f"(engine {metadata.engine_id})."
+            )
 
     def _validate_remote_agent_handshake(
         self,
@@ -2414,10 +3486,15 @@ class NixlBaseConnectorWorker:
         """
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
-        done_recving = self._pop_done_transfers(self._recving_transfers)
+        terminal_failed_recv_reqs: set[ReqId] = set()
+        done_recving = self._pop_done_transfers(
+            self._recving_transfers,
+            stream="recv",
+            failed_req_ids=terminal_failed_recv_reqs,
+        )
 
         # Drain queue of requests where handshake or transfer setup failed.
-        failed_recv_reqs = set[ReqId]()
+        failed_recv_reqs = set(terminal_failed_recv_reqs)
         while not self._failed_recv_reqs.empty():
             try:
                 failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())
@@ -2427,6 +3504,9 @@ class NixlBaseConnectorWorker:
         # Add failed requests to done_recving for scheduler tracking
         # (blocks are already marked invalid, scheduler will handle recompute)
         done_recving.update(failed_recv_reqs)
+        self._on_receive_requests_terminal(
+            done_recving - failed_recv_reqs, failed_recv_reqs
+        )
 
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
@@ -2442,15 +3522,28 @@ class NixlBaseConnectorWorker:
         block_ids_for_heterogeneous_attn_post_process = list[list[int]]()
         for req_id in done_recving:
             # clean up metadata for completed requests
-            meta = self._recving_metadata.pop(req_id, None)
+            # Handshake/WRITE threads inspect this mapping while holding the
+            # same lock to pin endpoint registrations. Keep mutation atomic
+            # with those scans so rollover cannot race terminal cleanup.
+            with self._handshake_lock:
+                meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
+                self._generic_direct_receive_requests.discard(req_id)
                 logger.warning(
                     "Skipping KV post-processing for failed request %s",
                     req_id,
                 )
+                continue
+
+            if req_id in self._generic_direct_receive_requests:
+                # The generic planner wrote destination-native page offsets;
+                # applying the legacy block-size/layout conversion would
+                # corrupt heterogeneous TP/DCP copies. Its exact KVRange also
+                # replaces the legacy clipped-block coverage bookkeeping.
+                self._generic_direct_receive_requests.discard(req_id)
                 continue
 
             assert meta.remote is not None
@@ -2514,11 +3607,10 @@ class NixlBaseConnectorWorker:
 
         # Handle timeout to avoid stranding blocks on remote.
         now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
-            if now < expires:
-                break
+        expired_requests = [
+            req_id for req_id, expires in self._reqs_to_send.items() if now >= expires
+        ]
+        for req_id in expired_requests:
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.expected_consumer_notifications_by_req.pop(req_id, None)
             self.xfer_stats.record_kv_expired_req()
@@ -2530,6 +3622,7 @@ class NixlBaseConnectorWorker:
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
+            self._on_send_request_terminal(req_id)
             done_sending.add(req_id)
 
         return done_sending, done_recving
@@ -2557,6 +3650,14 @@ class NixlBaseConnectorWorker:
         """
         raise NotImplementedError
 
+    def _on_receive_requests_terminal(
+        self, successful: set[str], failed: set[str]
+    ) -> None:
+        """Allow a transfer mode to emit one request-level completion."""
+
+    def _on_send_request_terminal(self, req_id: str) -> None:
+        """Allow a transfer mode to discard source-side request state."""
+
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
 
@@ -2578,52 +3679,144 @@ class NixlBaseConnectorWorker:
                     new_expiry,
                 )
 
-    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+    def _release_xfer_handle(self, handle: int) -> None:
+        """Release a transfer and any request-scoped direct descriptors.
+
+        The segmented-direct tracker returns ``False`` for legacy transfers,
+        preserving the existing static descriptor-list lifetime.
         """
-        Pop completed xfers by checking for DONE state.
+        tracker = getattr(self, "_ephemeral_direct_dlists", None)
+        if tracker is None or not tracker.release(handle):
+            self.nixl_wrapper.release_xfer_handle(handle)
+
+    def _pop_done_transfers(
+        self,
+        transfers: dict[str, list[int]],
+        *,
+        stream: str = "recv",
+        failed_req_ids: set[str] | None = None,
+    ) -> set[str]:
+        """
+        Pop requests only after every sibling xfer reaches terminal state.
+
+        A failed handle latches request failure, but a PROC sibling keeps the
+        request in ``transfers``. ``failed_req_ids`` receives only fully
+        terminal failed requests, allowing aggregate notifications to use
+        ``done - failed``. When omitted, receive failures retain the legacy
+        queue-based reporting behavior.
+
         Args:
             transfers: dict of req_id -> list[running_xfer]
         Returns:
-            set of req_ids that have all done xfers
+            set of req_ids whose complete handle set is terminal
         """
-        done_req_ids: set[str] = set()
-        for req_id, handles in list(transfers.items()):
-            in_progress = []
-            for handle in handles:
-                try:
-                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                    if xfer_state == "DONE":
-                        # Get telemetry from NIXL
-                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
-                        self.nixl_wrapper.release_xfer_handle(handle)
-                    elif xfer_state == "PROC":
-                        in_progress.append(handle)
-                        continue
-                    else:
-                        self._log_failure(
-                            failure_type="transfer_failed",
-                            msg="Marking blocks as invalid",
-                            req_id=req_id,
-                            xfer_state=xfer_state,
-                        )
-                        self._handle_failed_transfer(req_id, handle)
-                except Exception as e:
-                    self._log_failure(
-                        failure_type="transfer_exception",
-                        msg="Marking blocks as invalid",
-                        req_id=req_id,
-                        error=e,
-                    )
-                    self._handle_failed_transfer(req_id, handle)
+        poller = getattr(self, "_request_terminal_poller", None)
+        if poller is None:
+            # A few focused tests construct workers with object.__new__.
+            poller = self._request_terminal_poller = NixlRequestTerminalPoller()
 
-            if not in_progress:
-                # Only report request as completed when all transfers are done.
-                done_req_ids.add(req_id)
-                del transfers[req_id]
+        def on_done(handle: int) -> None:
+            res = self.nixl_wrapper.get_xfer_telemetry(handle)
+            self.xfer_stats.record_transfer(res)
+            self._release_xfer_handle(handle)
+
+        def on_failed(
+            req_id: str,
+            handle: int,
+            failure: NixlTransferFailure,
+            first_failure: bool,
+        ) -> None:
+            if failure.error is not None:
+                self._log_failure(
+                    failure_type="transfer_exception",
+                    msg="Marking blocks as invalid",
+                    req_id=req_id,
+                    error=failure.error,
+                )
             else:
-                transfers[req_id] = in_progress
-        return done_req_ids
+                self._log_failure(
+                    failure_type="transfer_failed",
+                    msg="Marking blocks as invalid",
+                    req_id=req_id,
+                    xfer_state=failure.state,
+                )
+            if stream == "recv":
+                self._mark_remote_engine_stale_for_request(req_id)
+            self._record_failed_transfer(
+                req_id,
+                handle,
+                mark_request_invalid=first_failure and stream == "recv",
+            )
+
+        result = poller.poll(
+            transfers,
+            stream=stream,
+            check_state=self.nixl_wrapper.check_xfer_state,
+            on_done=on_done,
+            on_failed=on_failed,
+        )
+        terminal = set(result.terminal_requests)
+        failed = set(result.failed_requests)
+        if failed_req_ids is not None:
+            failed_req_ids.update(failed)
+        elif stream == "recv":
+            for req_id in failed:
+                self._failed_recv_reqs.put(req_id)
+        return terminal
+
+    def _record_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        *,
+        mark_request_invalid: bool,
+    ) -> None:
+        """Record/release one failed handle without reporting request completion."""
+        if (
+            mark_request_invalid
+            and (meta := self._recving_metadata.get(req_id))
+            and not self._is_hma_required
+            and meta.local_block_ids
+        ):
+            self._invalid_block_ids.put(set(meta.local_block_ids[0]))
+        if handle is not None:
+            self._release_xfer_handle(handle)
+        self.xfer_stats.record_failed_transfer()
+
+    def _mark_remote_engine_stale_for_request(self, req_id: str) -> None:
+        """Force endpoint revalidation after a failed receive operation."""
+        meta = self._recving_metadata.get(req_id)
+        if meta is None or meta.remote is None:
+            return
+        with self._handshake_lock:
+            if meta.remote.engine_id in self._remote_agents:
+                self._stale_remote_engines.add(meta.remote.engine_id)
+
+    def _latch_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        *,
+        stream: str,
+    ) -> None:
+        """Record a failed batch while deferring request completion.
+
+        Submission can fail after sibling batches have already started.  The
+        request-level poller owns the failure latch so completion is reported
+        only after those siblings reach terminal state.  Send-side failures
+        deliberately never invalidate receive-side KV blocks.
+        """
+        poller = getattr(self, "_request_terminal_poller", None)
+        if poller is None:
+            poller = self._request_terminal_poller = NixlRequestTerminalPoller()
+        first_failure = poller.mark_failed(stream, req_id)
+        if stream == "recv":
+            self._mark_remote_engine_stale_for_request(req_id)
+        self._record_failed_transfer(
+            req_id,
+            handle,
+            mark_request_invalid=first_failure and stream == "recv",
+        )
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """
@@ -2634,14 +3827,15 @@ class NixlBaseConnectorWorker:
             req_id: The request ID.
             handle: The transfer handle.
         """
-        # Use .get() here as the metadata cleanup is handled by get_finished()
-        # TODO (NickLucche) handle failed transfer for HMA.
-        if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
-            self._invalid_block_ids.put(set(meta.local_block_ids[0]))
+        # Setup/handshake failures have no sibling handle set to drain, so they
+        # retain immediate queue reporting. Polled handle failures instead use
+        # _record_failed_transfer and report only when all siblings terminate.
+        self._record_failed_transfer(
+            req_id,
+            handle,
+            mark_request_invalid=True,
+        )
         self._failed_recv_reqs.put(req_id)
-        if handle is not None:
-            self.nixl_wrapper.release_xfer_handle(handle)
-        self.xfer_stats.record_failed_transfer()
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
         """
@@ -2650,18 +3844,29 @@ class NixlBaseConnectorWorker:
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
             # Proactive handshake (this request may still be in waiting queue) so
             # the **next** heartbeat for this remote can go through.
-            if (
-                self._ensure_handshake(
+            try:
+                handshake = self._ensure_handshake(
                     engine_id,
                     hb_info.host,
                     hb_info.port,
                     hb_info.tp_size,
                     hb_info.dcp_size,
                     hb_info.pp_size,
-                    self._hb_handshake_notif_only and hb_info.pp_size > 1,
+                    self._hb_handshake_notif_only,
+                    hb_info.pcp_size,
+                    hb_info.endpoint_incarnation,
                 )
-                is not None
-            ):
+            except Exception:
+                # Heartbeats only extend an existing lease. A concurrent endpoint
+                # rollover, shutdown, or failed setup must not fail the model step;
+                # the normal transfer/lease paths own request terminalization.
+                logger.debug(
+                    "Failed to prepare heartbeat for engine %s",
+                    engine_id,
+                    exc_info=True,
+                )
+                continue
+            if handshake is not None:
                 continue  # handshake is still pending
 
             # Build the heartbeat message: "HB:req1,req2,..."
@@ -2968,7 +4173,43 @@ class NixlBaseConnectorWorker:
                 break
         return result
 
-    def _evict_stale_engines(self) -> None:
+    def _engine_has_active_references(
+        self,
+        engine_id: EngineId,
+        *,
+        exclude_request_id: str | None = None,
+    ) -> bool:
+        # ``start_load_kv`` installs the current request metadata before it
+        # validates the remote endpoint specification. Exclude that metadata
+        # from pinning its own stale registration, but never let the exclusion
+        # hide live handles or a lazy direct-read window owned by the request.
+        if exclude_request_id is not None:
+            if self._recving_transfers.get(exclude_request_id):
+                return True
+            direct_windows = getattr(self, "_direct_read_batch_windows", {})
+            if exclude_request_id in direct_windows:
+                return True
+        for req_id, meta in self._recving_metadata.items():
+            if req_id == exclude_request_id or meta.remote is None:
+                continue
+            if meta.remote.engine_id == engine_id:
+                return True
+        # Push WRITE state does not retain an engine-id index. Conservatively
+        # defer replacement of every push registration while any WRITE is live.
+        sending_transfers = getattr(self, "_sending_transfers", None)
+        sending_lock = getattr(self, "_sending_transfers_lock", None)
+        if sending_transfers is None:
+            return False
+        if sending_lock is None:
+            return any(sending_transfers.values())
+        with sending_lock:
+            return any(sending_transfers.values())
+
+    def _evict_stale_engines(
+        self,
+        *,
+        exclude_request_id: str | None = None,
+    ) -> None:
         """Scan for and evict remote engines that have exceeded their TTL.
 
         Called from the main thread in when a new remote engine appears.
@@ -2977,20 +4218,34 @@ class NixlBaseConnectorWorker:
         prevents us from using background threads, though memory usage is not guaranteed
         to be "optimal" until a new handshake is performed.
 
-        Engines with active transfers or pending handshakes cannot be stale:
-        - Active transfers touch _engine_last_active in start_load_kv.
-        - Pending handshakes don't have an _engine_last_active entry yet
+        Pending handshakes do not have an ``_engine_last_active`` entry yet.
+        Requests already admitted for receive pin their remote endpoint until
+        request terminalization; this closes the interval between scheduler
+        admission and the first transfer-activity refresh.
         """
         # NOTE (NickLucche): This does NOT currently prevent OOMing if a huge number
         # of remote engines is registered all at once (adding a background cleanup
         # thread wouldnt help either).
         # If that scenario is plausible, we can follow up with an LRU eviction policy.
+        for eid in tuple(self._stale_remote_engines):
+            if eid in self._remote_agents and not self._engine_has_active_references(
+                eid,
+                exclude_request_id=exclude_request_id,
+            ):
+                self._cleanup_remote_engine(eid, log_eviction=False)
+
         if self._engine_ttl <= 0:
             return
 
         now = time.perf_counter()
         for eid, last_active in list(self._engine_last_active.items()):
-            if now - last_active > self._engine_ttl:
+            if (
+                now - last_active > self._engine_ttl
+                and not self._engine_has_active_references(
+                    eid,
+                    exclude_request_id=exclude_request_id,
+                )
+            ):
                 self._cleanup_remote_engine(eid)
 
     def _cleanup_remote_engine(
@@ -3013,6 +4268,10 @@ class NixlBaseConnectorWorker:
         self.kv_caches_base_addr.pop(engine_id, None)
         self.dst_num_blocks.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
+        self._remote_placement_indexes.pop(engine_id, None)
+        self._generic_only_remote_engines.discard(engine_id)
+        self._remote_handshake_specs.pop(engine_id, None)
+        self._stale_remote_engines.discard(engine_id)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 
@@ -3036,11 +4295,28 @@ class NixlBaseConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
-        self._handshake_initiation_executor.shutdown(wait=False)
+        with self._handshake_lock:
+            if self._shutting_down or self._shutdown_complete:
+                return
+            self._shutting_down = True
+            self._handshake_shutdown_event.set()
+        # A running handshake owns/imports NIXL resources. Wait without holding
+        # _handshake_lock so its done callback can commit those resources; the
+        # cleanup pass below will then release them before memory deregistration.
+        self._handshake_initiation_executor.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
         for handles in self._recving_transfers.values():
             for handle in handles:
-                self.nixl_wrapper.release_xfer_handle(handle)
+                self._release_xfer_handle(handle)
         self._recving_transfers.clear()
+        self._recving_metadata.clear()
+        self._generic_direct_receive_requests.clear()
+        self._request_terminal_poller.clear()
+        # Also release a prepared direct transfer that failed before it could
+        # be published in a request's in-flight handle list.
+        self._ephemeral_direct_dlists.release_all()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
@@ -3053,3 +4329,16 @@ class NixlBaseConnectorWorker:
         for desc in self._registered_descs:
             self.nixl_wrapper.deregister_memory(desc)
         self._registered_descs.clear()
+        while not self._ready_requests.empty():
+            try:
+                self._ready_requests.get_nowait()
+            except queue.Empty:
+                break
+        while not self._failed_recv_reqs.empty():
+            try:
+                self._failed_recv_reqs.get_nowait()
+            except queue.Empty:
+                break
+        with self._handshake_lock:
+            self._handshake_futures.clear()
+            self._shutdown_complete = True

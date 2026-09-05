@@ -7,10 +7,12 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.kv_offload.base import (
-    CanonicalKVCacheRef,
+from vllm.distributed.kv_transfer.kv_placement import (
     CanonicalPageMapping,
     CopyRun,
+)
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
@@ -149,7 +151,7 @@ def test_gpu_roundtrip_assembles_canonical_page_across_ranks():
         for run in _tp2_rank_mapping(rank).runs:
             for i in range(run.num_fragments):
                 lo = run.local_offset + i * run.local_stride
-                co = run.canonical_offset + i * run.canonical_stride
+                co = run.storage_offset + i * run.storage_stride
                 expected[:, co : co + run.fragment_size] = local[
                     :, lo : lo + run.fragment_size
                 ]

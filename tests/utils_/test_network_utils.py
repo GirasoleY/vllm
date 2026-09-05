@@ -205,6 +205,20 @@ def test_make_zmq_socket_ipv6():
     ctx.term()
 
 
+def test_make_zmq_socket_sets_max_message_size_before_transport_setup():
+    ctx = zmq.Context()
+    try:
+        zsock: zmq.Socket = make_zmq_socket(
+            ctx,
+            "inproc://bounded-message-test",
+            zmq.ROUTER,
+            max_message_size=1024,
+        )
+        assert zsock.getsockopt(zmq.MAXMSGSIZE) == 1024
+    finally:
+        ctx.destroy(linger=0)
+
+
 def test_make_zmq_path():
     assert make_zmq_path("tcp", "127.0.0.1", "5555") == "tcp://127.0.0.1:5555"
     assert make_zmq_path("tcp", "::1", "5555") == "tcp://[::1]:5555"

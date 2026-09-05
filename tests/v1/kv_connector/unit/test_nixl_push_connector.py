@@ -32,6 +32,9 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    _HandshakeSpec,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
@@ -77,6 +80,7 @@ def _make_request(
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_engine_id": remote_engine_id,
+            "remote_endpoint_incarnation": "prefill-endpoint-incarnation",
             "remote_request_id": remote_request_id or f"prefill-{request_id}",
             "remote_host": remote_host,
             "remote_port": remote_port,
@@ -356,6 +360,14 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.world_size = 1
         w.engine_id = "test-decode-engine"
         w._remote_agents = {}
+        w._remote_handshake_specs = {}
+        w._stale_remote_engines = set()
+        w._remote_placement_indexes = {}
+        w._generic_only_remote_engines = set()
+        w._handshake_futures = {}
+        w._handshake_future_specs = {}
+        w._handshake_lock = threading.RLock()
+        w._shutting_down = False
         w._physical_blocks_per_logical_kv_block = 1
         # Single non-hybrid attention group, matching the stub block id lists.
         w._has_mamba = False
@@ -363,6 +375,12 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._group_spec_types = (FullAttentionSpec,)
         w._engine_ttl = 0.0
         w._engine_last_active = {}
+        w._engine_clock_offset = {}
+        w._local_placement_metadata = None
+        w.nixl_wrapper = MagicMock()
+        w.xfer_stats = MagicMock()
+        w._release_xfer_handle = MagicMock()
+        w._log_failure = MagicMock()
 
         # Track _do_start_push_kv invocations.
         calls: list[tuple[str, Any, dict[str, Any]]] = []
@@ -395,6 +413,7 @@ def _registration_data(
     return {
         "request_id": request_id,
         "decode_engine_id": decode_engine_id,
+        "decode_endpoint_incarnation": "decode-endpoint-incarnation",
         "decode_host": decode_host,
         "decode_port": decode_port,
         "decode_tp_size": decode_tp_size,
@@ -667,6 +686,16 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     w._engine_last_active = {}
     w._engine_clock_offset = {}
     w._handshake_lock = threading.RLock()
+    w._remote_handshake_specs["decode-engine"] = _HandshakeSpec(
+        host="10.0.0.2",
+        port=5602,
+        tp_size=1,
+        dcp_size=1,
+        pcp_size=1,
+        pp_size=1,
+        notif_agents_only=False,
+        endpoint_incarnation="decode-endpoint-incarnation",
+    )
     # _cleanup_remote_engine touches these when reaping an engine.
     w.nixl_wrapper = MagicMock()
     w.dst_xfer_side_handles = {}
@@ -1235,7 +1264,8 @@ class TestPushWriterMlaReplication:
         }
         w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
         w.dst_xfer_side_handles = {engine_id: {0: 1000, 1: 1001}}
-        w.src_xfer_handles_by_tp_ratio = {(-2, 16): [2000, 2001]}
+        split_key = w._split_local_xfer_handle_key(-2, 16, w.tp_mappings[engine_id])
+        w.src_xfer_handles_by_tp_ratio = {split_key: [2000, 2001]}
 
         writes = []
 

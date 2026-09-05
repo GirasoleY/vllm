@@ -315,6 +315,7 @@ def make_zmq_socket(
     identity: bytes | None = None,
     linger: int | None = None,
     router_handover: bool = False,
+    max_message_size: int | None = None,
 ) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
 
@@ -350,6 +351,12 @@ def make_zmq_socket(
 
     if linger is not None:
         socket.setsockopt(zmq.LINGER, linger)
+
+    if max_message_size is not None:
+        if max_message_size < 0:
+            raise ValueError("max_message_size must be non-negative")
+        # MAXMSGSIZE only takes effect for subsequent bind/connect calls.
+        socket.setsockopt(zmq.MAXMSGSIZE, max_message_size)
 
     if socket_type == zmq.XPUB:
         socket.setsockopt(zmq.XPUB_VERBOSE, True)
