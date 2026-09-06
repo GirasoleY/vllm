@@ -193,10 +193,11 @@ vllm serve <target-model> \
   unspecified TP/PCP/DCP values from the target, so `{}` requests the target
   PCP layout rather than the omitted-field default.
 - Independent draft topology requires Model Runner V2. Integrated draft TP and
-  DCP must match the target; DSpark and supported single-module MTP
-  implementations support PCP-replicated drafting by setting draft PCP to 1.
-  Speculative decoding with target PCP and DCP enabled together is not
-  supported yet.
+  DCP must match the target; DSpark and the single-module MTP speculator support
+  PCP-replicated drafting by setting draft PCP to 1. The single-module MTP
+  speculator also supports PCP-sharded drafting by matching the target PCP,
+  currently in eager mode only. Speculative decoding with target PCP and DCP
+  enabled together is not supported yet.
 - Keys such as `temperature` and `top_p` are sampling parameters, not
   `--speculative-config` fields.
 - Internal fields such as `target_model_config`, `draft_model_config`,
