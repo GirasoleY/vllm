@@ -285,6 +285,7 @@ steps:
     - pytest -v -s tests/distributed/test_nccl_symm_mem.py
     - pytest -v -s tests/v1/distributed/test_dbo.py
     - pytest -v -s tests/distributed/test_mnnvl_alltoall.py
+    - pytest -v -s tests/models/test_dspark_mla.py
 
 - label: ":nvidia: (B200) Kimi-K3 GEMM-RS/AR"
   key: kimi-k3-gemm-rs-ar-2xb200

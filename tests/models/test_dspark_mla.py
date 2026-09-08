@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn as nn
 
+from tests.utils import multi_gpu_test
+from vllm import SamplingParams
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
+from vllm.platforms import current_platform
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
@@ -102,64 +105,136 @@ def test_dspark_markov_head_is_replicated(
     assert bias.shape == (2, 128)
 
 
-@pytest.mark.cpu_test
-def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
-    markov_head_calls = []
-    context_kv_proj_calls = []
+@pytest.fixture
+def mla_dspark_models(tmp_path):
+    """Small models exercise the real loader without checkpoint downloads."""
+    common = {
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 16,
+        "q_lora_rank": 64,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "vocab_size": 128,
+        "rms_norm_eps": 1e-5,
+        "max_position_embeddings": 256,
+        "torch_dtype": "bfloat16",
+        "hidden_act": "silu",
+        "n_routed_experts": 0,
+        "n_shared_experts": 0,
+        "num_experts_per_tok": 0,
+        "first_k_dense_replace": 2,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+    }
+    target = {
+        **common,
+        "architectures": ["DeepseekV3ForCausalLM"],
+        "model_type": "deepseek_v3",
+    }
+    draft = {
+        **common,
+        "architectures": ["K3DSparkModel"],
+        "model_type": "k3_dspark",
+        "num_target_layers": 2,
+        "target_hidden_size": 128,
+        "target_num_hidden_layers": 2,
+        "target_layer_ids": [0, 1],
+        "mask_token_id": 127,
+        "markov_rank": 8,
+        "draft_vocab_size": 128,
+    }
+    for name, config in (("target", target), ("draft", draft)):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps(config))
+    return str(tmp_path / "target"), str(tmp_path / "draft")
 
-    class DummyModule(nn.Module):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
 
-    def make_markov_head(*args, **kwargs):
-        markov_head_calls.append((args, kwargs))
-        return DummyModule()
-
-    def make_context_kv_proj(*args, **kwargs):
-        context_kv_proj_calls.append((args, kwargs))
-        return DummyModule()
-
-    monkeypatch.setattr(dspark_mla, "get_draft_quant_config", lambda _: None)
-    monkeypatch.setattr(dspark_mla, "ReplicatedLinear", DummyModule)
-    monkeypatch.setattr(dspark_mla, "MergedColumnParallelLinear", make_context_kv_proj)
-    monkeypatch.setattr(dspark_mla, "RMSNorm", DummyModule)
-    monkeypatch.setattr(dspark_mla, "K3DSparkDecoderLayer", DummyModule)
-    monkeypatch.setattr(dspark_mla, "DSparkMarkovHead", make_markov_head)
-
-    config = SimpleNamespace(
-        target_hidden_size=16,
-        num_target_layers=2,
-        hidden_size=8,
-        kv_lora_rank=3,
-        qk_rope_head_dim=1,
-        rms_norm_eps=1e-6,
-        num_hidden_layers=1,
-        vocab_size=128,
-        draft_vocab_size=128,
-        markov_rank=4,
-    )
-    vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            draft_model_config=SimpleNamespace(hf_config=config)
-        ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
-    )
-
-    K3DSparkModel(vllm_config=vllm_config, start_layer_id=0, prefix="model")
-
-    assert len(markov_head_calls) == 1
-    assert context_kv_proj_calls == [
-        (
-            (8, [4]),
-            {
-                "bias": False,
-                "return_bias": False,
-                "quant_config": None,
-                "prefix": "model.layers.0.self_attn.fused_qkv_a_proj",
-                "disable_tp": True,
-            },
-        )
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not current_platform.is_device_capability_family(100),
+    reason="FlashInfer MLA requires SM100-family NVIDIA GPUs",
+)
+@pytest.mark.parametrize(
+    ("tp_size", "dcp_size", "draft_tp_size", "enforce_eager"),
+    [
+        (1, 1, None, True),
+        (2, 1, None, False),
+        (2, 2, None, False),
+        (2, 1, 1, False),
+        (2, 2, 1, False),
+    ],
+    ids=["eager", "tp", "tp-dcp", "tp-draft-tp1", "tp-dcp-draft-tp1"],
+)
+@multi_gpu_test(num_gpus=2)
+def test_dspark_mla_parallel_generation(
+    monkeypatch,
+    mla_dspark_models,
+    vllm_runner,
+    tp_size,
+    dcp_size,
+    draft_tp_size,
+    enforce_eager,
+):
+    """Load, profile, and decode with DSpark without changing target outputs."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    target, draft = mla_dspark_models
+    runner_args = {
+        "load_format": "dummy",
+        "skip_tokenizer_init": True,
+        "dtype": "bfloat16",
+        "tensor_parallel_size": tp_size,
+        "decode_context_parallel_size": dcp_size,
+        "attention_config": {"backend": "FLASHINFER_MLA"},
+        "max_model_len": 256,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 128,
+        "block_size": 32,
+        "num_gpu_blocks_override": 256,
+        "gpu_memory_utilization": 0.2,
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": True,
+        "enforce_eager": enforce_eager,
+        "compilation_config": {"cudagraph_capture_sizes": [4, 8, 16]},
+        "disable_log_stats": False,
+    }
+    # Unequal lengths cross cache-block boundaries and require padded decode batches.
+    prompts = [
+        {"prompt_token_ids": [i % 120 + 3 for i in range(length)]}
+        for length in (7, 33, 65)
     ]
+    sampling = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+    with vllm_runner(target, **runner_args) as runner:
+        reference = runner.llm.generate(prompts, sampling)
+
+    with vllm_runner(
+        target,
+        **runner_args,
+        speculative_config={
+            "method": "dspark",
+            "model": draft,
+            "num_speculative_tokens": 3,
+            "draft_tensor_parallel_size": draft_tp_size,
+            "draft_sample_method": "probabilistic",
+            "attention_backend": "FLASHINFER_MLA",
+        },
+    ) as runner:
+        outputs = runner.llm.generate(prompts, sampling)
+        metrics = runner.llm.get_metrics()
+        assert any(
+            m.name == "vllm:spec_decode_num_drafts" and m.value > 0 for m in metrics
+        )
+
+    assert len(outputs) == len(reference) == len(prompts)
+    for output, expected in zip(outputs, reference):
+        assert output.finished
+        assert len(output.outputs[0].token_ids) == sampling.max_tokens
+        assert output.outputs[0].token_ids == expected.outputs[0].token_ids
 
 
 def test_context_kv_weights_are_loaded_as_merged_linear_shards():
