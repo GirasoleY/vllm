@@ -84,7 +84,9 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
 | `method` | `string` | `None` | Speculation method. Common values include `draft_model`, `ngram`, `suffix`, `mtp`, `eagle3`, and `dflash`. If omitted, vLLM infers the method from the provided configuration when possible. |
 | `model` | `string` | `None` | Draft model, EAGLE head, or auxiliary model identifier. For `ngram`, `ngram_gpu`, `suffix`, and `mtp`, this can often be omitted. |
 | `num_speculative_tokens` | `integer > 0` | `None` | Number of speculative tokens to propose per step. Required for methods that do not infer it from model metadata. |
-| `draft_tensor_parallel_size` | `integer >= 1` | `None` | Tensor parallel size for the draft model. |
+| `draft_tensor_parallel_size` | `integer >= 1` | `None` | Draft tensor parallel size. `None` inherits the target tensor parallel size when applicable, except that MLP Speculator retains its legacy default of `1`. |
+| `draft_prefill_context_parallel_size` | `integer >= 1` | `None` | Draft prefill context parallel size. `None` inherits the target prefill context parallel size when applicable. |
+| `draft_decode_context_parallel_size` | `integer >= 1` | `None` | Draft decode context parallel size. `None` inherits the target decode context parallel size when applicable. |
 | `max_model_len` | `integer >= 1` | `None` | Maximum context length for the draft model. |
 | `parallel_drafting` | `boolean` | `false` | Enable parallel draft token generation. Only compatible with EAGLE and draft-model methods. |
 | `rejection_sample_method` | `string` | `standard` | `standard`, `synthetic`, or `block`. |
@@ -180,6 +182,15 @@ vllm serve <target-model> \
   files, use a nested mapping instead of an escaped JSON string.
 - `tensor_parallel_size` is not a valid key in `speculative_config`. Use
   `draft_tensor_parallel_size` instead.
+- Each draft parallel size is resolved independently. An explicit value is used
+  exactly; currently it must be `1` or match the corresponding target size.
+  Leaving a field as `None` requests the target size for methods that expose
+  that axis, except that MLP Speculator defaults draft TP to `1`.
+- Medusa does not expose draft parallelism policy, and MLP Speculator exposes
+  only draft TP; fields for non-applicable axes must remain `None`.
+- The policy describes the requested topology; each execution path separately
+  validates whether it can run that topology.
+
 - Keys such as `temperature` and `top_p` are sampling parameters, not
   `--speculative-config` fields.
 - Internal fields such as `target_model_config`, `draft_model_config`,

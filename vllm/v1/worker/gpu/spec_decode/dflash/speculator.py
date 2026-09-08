@@ -391,7 +391,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Under PCP the runner gathered block tables for the rank-local
         # sharded batch; the replicated drafter needs them gathered for the
         # global batch (its context-KV slot mappings are derived from them).
-        if self.replicated_pcp:
+        if self._uses_replicated_pcp():
             self.block_tables.gather_block_tables(
                 input_batch.idx_mapping, num_reqs_padded=num_reqs
             )

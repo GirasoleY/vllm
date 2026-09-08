@@ -29,7 +29,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=False,
             runner=runner,
         )
-        self._raise_if_draft_tp_mismatch()
+        self._raise_if_draft_parallelism_unsupported()
 
         self.use_heterogeneous_vocab = self.speculative_config.use_heterogeneous_vocab
 
@@ -60,7 +60,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
     def _raise_if_vocab_size_mismatch(self):
         self.speculative_config.verify_equal_vocab_size_if_draft_model()
 
-    def _raise_if_draft_tp_mismatch(self):
+    def _raise_if_draft_parallelism_unsupported(self):
         # Note(Tomas Ruiz) If we run the target model with TP > 1 and
         # the draft model with TP = 1, then the different TP ranks collide.
         # Specifically when all ranks compile the draft model on rank 0
@@ -69,24 +69,39 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # To prevent this error, we assert that both TP sizes must be the same.
         spec_cfg = self.speculative_config
         tgt_tp = spec_cfg.target_parallel_config.tensor_parallel_size
-        draft_tp = spec_cfg.draft_parallel_config.tensor_parallel_size
+        draft_parallel_config = spec_cfg.draft_parallel_config
+        assert draft_parallel_config is not None
+        draft_tp = draft_parallel_config.tensor_parallel_size
         if draft_tp != tgt_tp:
             raise ValueError(
-                f"Currently, 'draft_tensor_parallel_size' and 'tensor_parallel_size' "
-                f"must be the same. Got {draft_tp} and {tgt_tp}. "
-                "Please pass 'draft_tensor_parallel_size' in the speculative_config."
+                f"Currently, 'draft_tensor_parallel_size' and "
+                f"'tensor_parallel_size' must be the same. Got {draft_tp} and "
+                f"{tgt_tp}. Please pass 'draft_tensor_parallel_size' in the "
+                "speculative_config."
+            )
+
+        if (
+            draft_parallel_config.prefill_context_parallel_size != 1
+            or draft_parallel_config.decode_context_parallel_size != 1
+        ):
+            raise NotImplementedError(
+                "Standalone draft models currently require "
+                "draft_prefill_context_parallel_size=1 and "
+                "draft_decode_context_parallel_size=1."
             )
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
         spec = self.speculative_config
+        draft_parallel_config = spec.draft_parallel_config
+        assert draft_parallel_config is not None
 
         return replace(
             base,
             quant_config=None,
             parallel_config=replace(
-                spec.draft_parallel_config,
+                draft_parallel_config,
                 rank=self.vllm_config.parallel_config.rank,
             ),
             model_config=spec.draft_model_config,

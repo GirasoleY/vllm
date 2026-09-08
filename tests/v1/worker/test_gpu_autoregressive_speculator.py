@@ -104,22 +104,36 @@ def _make_speculator(
     return speculator
 
 
-@pytest.mark.parametrize(("hc_mult", "expected"), [(None, 64), (4, 256)])
-def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected):
-    # Qwen4Exp targets expose multi-stream HC residuals to the drafter.
-    monkeypatch.setattr(base_spec_module, "_target_feeds_hc_residual", lambda _: True)
-    hf_config = SimpleNamespace()
-    if hc_mult is not None:
-        hf_config.hc_mult = hc_mult
-    draft_model_config = SimpleNamespace(
-        hf_config=hf_config,
-        get_hidden_size=lambda: 64,
-        get_vocab_size=lambda: 32,
+def _parallel_config(
+    *,
+    tp: int = 2,
+    pcp: int = 4,
+    dcp: int = 1,
+    enable_eplb: bool = False,
+):
+    return SimpleNamespace(
+        tensor_parallel_size=tp,
+        prefill_context_parallel_size=pcp,
+        decode_context_parallel_size=dcp,
+        enable_eplb=enable_eplb,
+        data_parallel_size=1,
+        data_parallel_rank=0,
     )
+
+
+def _speculator_vllm_config(
+    draft_model_config,
+    target_parallel_config,
+    draft_parallel_config,
+):
+    resolve_draft_parallel_config = Mock(return_value=draft_parallel_config)
     speculative_config = SimpleNamespace(
         method="mtp",
         num_speculative_tokens=3,
         draft_model_config=draft_model_config,
+        draft_parallel_config=draft_parallel_config,
+        target_parallel_config=target_parallel_config,
+        _resolve_draft_parallel_config=resolve_draft_parallel_config,
         use_local_argmax_reduction=False,
         draft_sample_method="greedy",
     )
@@ -134,15 +148,66 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
             dtype=torch.float32,
             use_fp64_gumbel=False,
         ),
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank=0,
+        parallel_config=target_parallel_config,
+    )
+    return vllm_config, resolve_draft_parallel_config
+
+
+@pytest.mark.parametrize(
+    ("target_overrides", "draft_overrides", "message"),
+    [
+        ({}, {"tp": 1}, "tensor parallelism"),
+        ({"pcp": 1, "dcp": 2}, {}, "decode context parallelism"),
+        ({"dcp": 4}, {"dcp": 4}, "does not support DCP"),
+        ({}, {"pcp": 4}, "PCP-sharded drafting"),
+        (
+            {"enable_eplb": True},
+            {"enable_eplb": True},
+            "does not support EPLB",
         ),
+    ],
+)
+def test_mrv2_draft_parallel_config_rejects_unsupported_layout(
+    target_overrides,
+    draft_overrides,
+    message,
+):
+    target = _parallel_config(**target_overrides)
+    draft = _parallel_config(**({"pcp": 1} | draft_overrides))
+
+    with pytest.raises(NotImplementedError, match=message):
+        DraftModelSpeculator._validate_mrv2_draft_parallel_config(target, draft)
+
+
+@pytest.mark.parametrize(("hc_mult", "expected"), [(None, 64), (4, 256)])
+def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected):
+    # Qwen4Exp targets expose multi-stream HC residuals to the drafter.
+    monkeypatch.setattr(base_spec_module, "_target_feeds_hc_residual", lambda _: True)
+
+    hf_config = SimpleNamespace()
+    if hc_mult is not None:
+        hf_config.hc_mult = hc_mult
+    draft_model_config = SimpleNamespace(
+        hf_config=hf_config,
+        get_hidden_size=lambda: 64,
+        get_vocab_size=lambda: 32,
+    )
+    target_parallel_config = _parallel_config(pcp=4)
+    draft_parallel_config = _parallel_config(pcp=1)
+    vllm_config, resolve_draft_parallel_config = _speculator_vllm_config(
+        draft_model_config,
+        target_parallel_config,
+        draft_parallel_config,
     )
 
     speculator = _TestSpeculator(vllm_config, torch.device("cpu"))
 
     assert speculator.hidden_size == expected
+    resolve_draft_parallel_config.assert_called_once_with(target_parallel_config)
+    assert vllm_config.parallel_config is target_parallel_config
+    assert speculator.vllm_config is not vllm_config
+    assert speculator.vllm_config.parallel_config is draft_parallel_config
+    assert speculator._uses_replicated_pcp()
 
 
 def test_mm_support_configured_after_model_load(monkeypatch):

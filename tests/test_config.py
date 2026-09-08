@@ -2376,10 +2376,10 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     """Regression test: MTP + runai_streamer should use model_weights (original
     S3 URL) for the draft model, not model (local cache dir set by
     pull_runai_model_from_obj_storage)."""
-    from unittest.mock import MagicMock
-
     s3_url = "s3://my-bucket/Qwen3-35B-A3B-FP8"
     local_cache = "/root/.cache/vllm/assets/model_streamer/abcd1234"
+
+    from unittest.mock import MagicMock
 
     mock_draft = MagicMock()
     mock_draft.model = local_cache
@@ -2404,6 +2404,159 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
 
     actual_model = mock_model_config_cls.call_args.kwargs["model"]
     assert actual_model == s3_url
+
+
+_PARALLEL_SIZE_FIELDS = (
+    "tensor_parallel_size",
+    "prefill_context_parallel_size",
+    "decode_context_parallel_size",
+)
+
+
+def _parallel_sizes(config, prefix=""):
+    return tuple(getattr(config, f"{prefix}{field}") for field in _PARALLEL_SIZE_FIELDS)
+
+
+def _resolve_draft_parallel_config(
+    target_parallel_config=None,
+    method="mtp",
+    **draft_policy,
+):
+    speculative_config = SpeculativeConfig(method="ngram", num_speculative_tokens=1)
+    speculative_config.method = method
+    for field_name, value in draft_policy.items():
+        setattr(speculative_config, field_name, value)
+    if target_parallel_config is None:
+        target_parallel_config = ParallelConfig(
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=4,
+        )
+    return speculative_config, speculative_config._resolve_draft_parallel_config(
+        target_parallel_config
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "requested", "resolved"),
+    [
+        ("mtp", (None, None, None), (8, 4, 4)),
+        ("mtp", (None, 1, None), (8, 1, 4)),
+        ("mtp", (1, 1, 1), (1, 1, 1)),
+        ("draft_model", (None, None, None), (8, 4, 4)),
+        ("medusa", (None, None, None), (8, 1, 1)),
+        ("mlp_speculator", (None, None, None), (1, 1, 1)),
+        ("mlp_speculator", (8, None, None), (8, 1, 1)),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_policy_is_preserved_and_resolved(method, requested, resolved):
+    draft_policy = dict(
+        zip(
+            (f"draft_{field}" for field in _PARALLEL_SIZE_FIELDS),
+            requested,
+            strict=True,
+        )
+    )
+    target_parallel_config = None
+    if method == "draft_model":
+        target_parallel_config = ParallelConfig(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=4,
+        )
+    speculative_config, draft_parallel_config = _resolve_draft_parallel_config(
+        target_parallel_config=target_parallel_config,
+        method=method,
+        **draft_policy,
+    )
+
+    assert _parallel_sizes(speculative_config, "draft_") == requested
+    assert _parallel_sizes(draft_parallel_config) == resolved
+    if method == "draft_model":
+        assert draft_parallel_config.pipeline_parallel_size == 1
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [f"draft_{field}" for field in _PARALLEL_SIZE_FIELDS],
+)
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_policy_rejects_intermediate_size(field_name):
+    with pytest.raises(ValueError, match=field_name):
+        _resolve_draft_parallel_config(**{field_name: 2})
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_policy_rejects_incompatible_resolved_topology():
+    target_parallel_config = ParallelConfig(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=8,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"draft_tensor_parallel_size=1.*draft_decode_context_parallel_size=8",
+    ):
+        _resolve_draft_parallel_config(
+            target_parallel_config=target_parallel_config,
+            draft_tensor_parallel_size=1,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_integrated_draft_parallel_policy_preserves_runtime_envelope():
+    target_parallel_config = ParallelConfig(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=8,
+        prefill_context_parallel_size=4,
+        decode_context_parallel_size=1,
+        distributed_executor_backend="mp",
+    )
+    _, draft_parallel_config = _resolve_draft_parallel_config(
+        target_parallel_config=target_parallel_config,
+        draft_prefill_context_parallel_size=1,
+    )
+
+    assert _parallel_sizes(draft_parallel_config) == (8, 1, 1)
+    assert draft_parallel_config.pipeline_parallel_size == 1
+    assert draft_parallel_config.world_size == 8
+    assert draft_parallel_config.distributed_executor_backend == "mp"
+    assert _parallel_sizes(target_parallel_config) == (8, 4, 1)
+    assert target_parallel_config.world_size == 64
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_topology_affects_hash():
+    speculative_config = SpeculativeConfig(method="ngram", num_speculative_tokens=1)
+    initial_hash = speculative_config.compute_hash()
+
+    speculative_config.draft_prefill_context_parallel_size = 1
+
+    assert speculative_config.compute_hash() != initial_hash
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_policy_rejects_non_model_method():
+    with pytest.raises(
+        ValueError,
+        match="draft_prefill_context_parallel_size.*not supported.*ngram",
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_prefill_context_parallel_size=1,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_parallel_config_is_internal():
+    with pytest.raises(ValidationError, match="draft_parallel_config"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_parallel_config=ParallelConfig(),  # type: ignore[call-arg]
+        )
 
 
 def _make_qwen3_omni_dspark_configs():

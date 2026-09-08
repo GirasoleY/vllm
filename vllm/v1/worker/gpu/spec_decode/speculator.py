@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import replace
@@ -9,7 +10,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.config import (
+    ParallelConfig,
+    VllmConfig,
+    get_layers_from_vllm_config,
+)
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
@@ -87,24 +92,24 @@ class BaseSpeculator(ABC):
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Under PCP the drafter runs replicated over the global batch on
-        # every rank, so its attention groups, forward context, and
-        # cudagraphs must not see PCP.
+        assert vllm_config.speculative_config is not None
+        self.speculative_config = vllm_config.speculative_config
         target_parallel_config = vllm_config.parallel_config
-        self.replicated_pcp = target_parallel_config.prefill_context_parallel_size > 1
-        if self.replicated_pcp:
-            vllm_config = replace(
-                vllm_config,
-                parallel_config=replace(
-                    target_parallel_config,
-                    prefill_context_parallel_size=1,
-                ),
-            )
+        draft_parallel_config = self.speculative_config._resolve_draft_parallel_config(
+            target_parallel_config
+        )
+        self.speculative_config.draft_parallel_config = draft_parallel_config
+        self._validate_mrv2_draft_parallel_config(
+            target_parallel_config, draft_parallel_config
+        )
+
+        # Keep the target runner's config intact while giving the speculator a
+        # worker-local view of the resolved draft topology.
+        vllm_config = copy.copy(vllm_config)
+        vllm_config.parallel_config = draft_parallel_config
         self.vllm_config = vllm_config
         self.device = device
 
-        assert vllm_config.speculative_config is not None
-        self.speculative_config = vllm_config.speculative_config
         self.method = self.speculative_config.method
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
@@ -179,6 +184,47 @@ class DraftModelSpeculator(BaseSpeculator):
             )
 
         self.supports_mm_inputs = False
+
+    def _uses_replicated_pcp(self) -> bool:
+        draft_parallel_config = self.speculative_config.draft_parallel_config
+        assert draft_parallel_config is not None
+        return (
+            self.speculative_config.target_parallel_config.prefill_context_parallel_size
+            > 1
+            and draft_parallel_config.prefill_context_parallel_size == 1
+        )
+
+    @staticmethod
+    def _validate_mrv2_draft_parallel_config(
+        target_parallel_config: ParallelConfig,
+        draft_parallel_config: ParallelConfig,
+    ) -> None:
+        for field, label in (
+            ("tensor_parallel_size", "tensor parallelism"),
+            ("decode_context_parallel_size", "decode context parallelism"),
+        ):
+            if getattr(draft_parallel_config, field) != getattr(
+                target_parallel_config, field
+            ):
+                raise NotImplementedError(
+                    f"Integrated draft {label} must currently match the target model."
+                )
+
+        target_pcp = target_parallel_config.prefill_context_parallel_size
+        draft_pcp = draft_parallel_config.prefill_context_parallel_size
+        if target_pcp > 1 and target_parallel_config.decode_context_parallel_size > 1:
+            raise NotImplementedError(
+                "MRV2 PCP speculative decoding does not support DCP yet."
+            )
+        if target_pcp > 1 and draft_pcp == target_pcp:
+            raise NotImplementedError(
+                "PCP-sharded drafting is not supported yet; set "
+                "draft_prefill_context_parallel_size to 1."
+            )
+        if draft_parallel_config.enable_eplb and draft_pcp != target_pcp:
+            raise NotImplementedError(
+                "Independent draft parallelism does not support EPLB yet."
+            )
 
     @abstractmethod
     def load_draft_model(

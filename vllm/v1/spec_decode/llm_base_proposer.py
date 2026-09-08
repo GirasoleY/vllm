@@ -11,6 +11,7 @@ import torch.nn as nn
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
+    ParallelConfig,
     VllmConfig,
     get_layers_from_vllm_config,
     replace,
@@ -69,6 +70,25 @@ logger = init_logger(__name__)
 
 
 class SpecDecodeBaseProposer:
+    @staticmethod
+    def _validate_integrated_draft_parallel_config(
+        target_parallel_config: ParallelConfig,
+        draft_parallel_config: ParallelConfig,
+    ) -> None:
+        fields = (
+            "tensor_parallel_size",
+            "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+        )
+        target_sizes = tuple(getattr(target_parallel_config, field) for field in fields)
+        draft_sizes = tuple(getattr(draft_parallel_config, field) for field in fields)
+        if draft_sizes != target_sizes:
+            raise NotImplementedError(
+                "Model Runner V1 integrated draft models currently require "
+                "draft parallelism to match target parallelism. Got "
+                f"draft={draft_sizes} and target={target_sizes} for (TP, PCP, DCP)."
+            )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -81,6 +101,13 @@ class SpecDecodeBaseProposer:
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
+        if self.speculative_config.use_eagle():
+            draft_parallel_config = self.speculative_config.draft_parallel_config
+            assert draft_parallel_config is not None
+            self._validate_integrated_draft_parallel_config(
+                vllm_config.parallel_config,
+                draft_parallel_config,
+            )
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self._share_mtp_indices = False
 

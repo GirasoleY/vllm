@@ -340,7 +340,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # sharded batch while the replicated drafter runs the global batch.
         prefill_attn_metadata: dict[str, Any] | None = attn_metadata
         prefill_slot_mappings: dict[str, torch.Tensor] | None = slot_mappings
-        if self.replicated_pcp:
+        if self._uses_replicated_pcp():
             if dummy_run and skip_attn_for_dummy_run:
                 prefill_attn_metadata, prefill_slot_mappings = None, None
             else:
