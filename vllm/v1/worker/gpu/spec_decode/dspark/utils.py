@@ -53,12 +53,10 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     draft_vllm_config = replace(
         vllm_config,
+        # DSpark shares the target's execution groups on the last PP stage.
         parallel_config=replace(
             vllm_config.parallel_config,
             pipeline_parallel_size=1,
-            tensor_parallel_size=(
-                speculative_config.draft_parallel_config.tensor_parallel_size
-            ),
         ),
         attention_config=replace(
             vllm_config.attention_config,
