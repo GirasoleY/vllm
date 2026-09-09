@@ -382,8 +382,10 @@ class ParallelConfig:
     in the group.
     """
 
-    cp_kv_cache_interleave_size: int = 1
+    cp_kv_cache_interleave_size: int | None = Field(default=None, gt=0)
     """Interleave size of kv_cache storage while using DCP.
+    None selects the local KV block size with NIXL and DCP, otherwise 1.
+    Explicit values are preserved and must be compatible with the block size.
     Store interleave_size tokens on dcp_rank i, then store next
     interleave_size tokens on dcp_rank i+1.
     Interleave_size=1: token-level alignment, where token `i` is stored on
@@ -394,9 +396,6 @@ class ParallelConfig:
     Block_size should be greater than or equal to cp_kv_cache_interleave_size.
     Block_size should be divisible by cp_kv_cache_interleave_size.
     """
-
-    _cp_kv_cache_interleave_size_auto: bool = True
-    """Whether NIXL may select the interleave size automatically."""
 
     data_parallel_index: int = Field(init=False)
     """Equal to the data parallel rank but not used for torch process groups
@@ -476,6 +475,18 @@ class ParallelConfig:
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
+        if (
+            self.decode_context_parallel_size > 1
+            and self.dcp_kv_cache_interleave_size > 1
+            and self.cp_kv_cache_interleave_size != self.dcp_kv_cache_interleave_size
+        ):
+            self.cp_kv_cache_interleave_size = self.dcp_kv_cache_interleave_size
+            logger.warning_once(
+                "cp_kv_cache_interleave_size is overridden by dcp_kv_cache"
+                "_interleave_size. And dcp-kv-cache-interleave-size will be "
+                "deprecated when PCP is fully supported."
+            )
+
         if self._api_process_rank >= self._api_process_count:
             raise ValueError(
                 "Invalid value of `_api_process_rank`. "

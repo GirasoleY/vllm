@@ -44,6 +44,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_capacity,
     get_kv_cache_configs,
     get_kv_cache_groups,
+    get_kv_cache_groups_per_worker,
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     hash_block_tokens,
@@ -1232,7 +1233,10 @@ def test_get_kv_cache_configs_multiple_workers():
     [False, True],
     ids=["symmetric", "asymmetric"],
 )
-def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
+@pytest.mark.parametrize("prepare_groups", [False, True])
+def test_get_kv_cache_configs_pp_sharding(
+    asymmetric_memory, prepare_groups, monkeypatch
+):
     model_config = ModelConfig(max_model_len=512)
     vllm_config = VllmConfig(model_config=model_config)
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
@@ -1253,10 +1257,20 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
         [avail_memory, avail_memory * 2] if asymmetric_memory else [avail_memory] * 2
     )
 
+    prepared_groups = None
+    if prepare_groups:
+        prepared_groups = get_kv_cache_groups_per_worker(vllm_config, pp_kv_cache_specs)
+        monkeypatch.setattr(
+            kv_cache_utils,
+            "get_kv_cache_groups_per_worker",
+            lambda *_: pytest.fail("Allocation must reuse the pre-profile groups"),
+        )
+
     kv_cache_configs = get_kv_cache_configs(
         vllm_config,
         pp_kv_cache_specs,
         available_memory,
+        prepared_groups=prepared_groups,
     )
 
     assert kv_cache_configs == [
@@ -1287,6 +1301,47 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
             kv_cache_groups=[KVCacheGroupSpec(["layer2"], ref_kv_cache_spec)],
         ),
     ]
+
+
+def test_prepared_kv_cache_groups_preserve_empty_pp_group_geometry(monkeypatch):
+    """PP stages must retain globally aligned groups before and after profiling."""
+    vllm_config = VllmConfig()
+    vllm_config.model_config = cast(
+        ModelConfig, SimpleNamespace(max_model_len=16, original_max_model_len=16)
+    )
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    worker_specs = [
+        {"full": new_kv_cache_spec()},
+        {"sliding": new_sliding_window_spec()},
+    ]
+    available_memory = [16 * new_kv_cache_spec().page_size_bytes] * 2
+    expected = get_kv_cache_configs(vllm_config, worker_specs, available_memory)
+    prepared_groups = get_kv_cache_groups_per_worker(vllm_config, worker_specs)
+
+    assert all(len(groups) == 2 for groups in prepared_groups)
+    assert all(
+        any(not group.layer_names for group in groups) for groups in prepared_groups
+    )
+    assert [group.kv_cache_spec for group in prepared_groups[0]] == [
+        group.kv_cache_spec for group in prepared_groups[1]
+    ]
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "get_kv_cache_groups_per_worker",
+        lambda *_: pytest.fail("Allocation must reuse the pre-profile groups"),
+    )
+
+    assert (
+        get_kv_cache_configs(
+            vllm_config,
+            worker_specs,
+            available_memory,
+            prepared_groups=prepared_groups,
+        )
+        == expected
+    )
 
 
 def test_project_kv_cache_groups_to_worker():

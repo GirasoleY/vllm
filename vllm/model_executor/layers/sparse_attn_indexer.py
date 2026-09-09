@@ -808,10 +808,11 @@ class SparseAttnIndexer(CustomOp):
         """With PD+DCP, the real value isn't known until block_size is finalized,
         which happens after this layer is built. Safe to cache after the first access,
         as long as the adjustment always runs before any forward pass
-        (it's set up in Worker.initialize_from_config, ahead of warmup/serving).
+        (it's resolved before memory profiling, warmup, and serving).
         """
         if self._cp_kv_cache_interleave_size is None:
             value = self._parallel_config.cp_kv_cache_interleave_size
+            assert value is not None, "CP interleave must be resolved before forward"
             if isinstance(get_forward_context().attn_metadata, dict):
                 self._cp_kv_cache_interleave_size = value
             return value

@@ -49,6 +49,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
+    get_kv_cache_groups_per_worker,
     get_request_block_hasher,
     init_none_hash,
     resolve_kv_cache_block_sizes,
@@ -293,6 +294,20 @@ class EngineCore:
         )
         self.model_executor.set_kv_cache_layout(layout.name)
 
+        prepared_groups = None
+        if vllm_config.parallel_config.cp_kv_cache_interleave_size is None:
+            # Only NIXL+DCP auto needs final group geometry before profiling.
+            prepared_groups = get_kv_cache_groups_per_worker(
+                vllm_config, kv_cache_specs
+            )
+            # PP projection preserves all group geometries, even for empty groups.
+            vllm_config.resolve_cp_kv_cache_interleave_size(
+                prepared_groups[0] if prepared_groups else []
+            )
+            self.model_executor.collective_rpc(
+                "prepare_kv_cache_groups", args=(prepared_groups,)
+            )
+
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
@@ -317,8 +332,15 @@ class EngineCore:
         max_model_len_before = vllm_config.model_config.max_model_len
 
         kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs, available_gpu_memory
+            vllm_config,
+            kv_cache_specs,
+            available_gpu_memory,
+            prepared_groups=prepared_groups,
         )
+        if prepared_groups is None:
+            vllm_config.resolve_cp_kv_cache_interleave_size(
+                kv_cache_configs[0].kv_cache_groups
+            )
         for kv_cache_config in kv_cache_configs:
             kv_cache_config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
 

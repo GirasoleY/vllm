@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+from vllm.config import ParallelConfig
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
@@ -13,6 +16,26 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
+
+
+def test_sparse_indexer_requires_interleave_resolved_before_forward(monkeypatch):
+    indexer = object.__new__(sparse_indexer.SparseAttnIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer._parallel_config = ParallelConfig()
+    indexer._cp_kv_cache_interleave_size = None
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={}),
+    )
+
+    with pytest.raises(AssertionError):
+        _ = indexer.cp_kv_cache_interleave_size
+    assert indexer._cp_kv_cache_interleave_size is None
+
+    indexer._parallel_config.cp_kv_cache_interleave_size = 16
+    assert indexer.cp_kv_cache_interleave_size == 16
+    assert indexer._cp_kv_cache_interleave_size == 16
 
 
 def _local_count(length: int, rank: int, world: int, interleave: int) -> int:

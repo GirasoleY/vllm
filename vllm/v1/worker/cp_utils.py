@@ -22,6 +22,7 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+    assert interleave_size is not None
     if pcp_size * dcp_size > 1:
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)

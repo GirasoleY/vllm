@@ -471,6 +471,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # fused path disabled until DCP gets a full replay-safe refresh model.
         self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
 
+        assert self.parallel_config.cp_kv_cache_interleave_size is not None
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
         )

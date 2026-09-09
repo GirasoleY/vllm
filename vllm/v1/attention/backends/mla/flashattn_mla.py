@@ -117,6 +117,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         device: torch.device,
     ):
         interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        assert interleave_size is not None
         super().__init__(
             kv_cache_spec,
             layer_names,

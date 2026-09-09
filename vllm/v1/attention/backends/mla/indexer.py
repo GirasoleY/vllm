@@ -438,6 +438,7 @@ class BuildPrefillChunkMetadataKernel(
         parallel_config = vllm_config.parallel_config
         dcp_world = parallel_config.decode_context_parallel_size
         dcp_interleave = parallel_config.cp_kv_cache_interleave_size
+        assert dcp_interleave is not None
         dcp_rank = get_dcp_group().rank_in_group if dcp_world > 1 else 0
         compress_ratios = tuple(
             dict.fromkeys(
@@ -716,6 +717,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
+        assert parallel_config.cp_kv_cache_interleave_size is not None
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),

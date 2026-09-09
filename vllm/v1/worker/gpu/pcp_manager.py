@@ -714,6 +714,7 @@ def maybe_build_pcp_manager(
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
+    assert parallel_config.cp_kv_cache_interleave_size is not None
     return cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,

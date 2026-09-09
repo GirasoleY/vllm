@@ -426,6 +426,10 @@ class DeepseekV32Attention(MLAAttention):
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
+            assert (
+                self._vllm_config.parallel_config.cp_kv_cache_interleave_size
+                is not None
+            )
             if self.use_pcp:
                 assert index_k is not None
             sparse_attn_indexer(

@@ -418,6 +418,7 @@ def derive_canonical_mappings(
         return {}
 
     def ctx(rank: int) -> _RankContext:
+        assert parallel_config.cp_kv_cache_interleave_size is not None
         return _RankContext(
             tp_size=tp_size,
             dcp_size=parallel_config.decode_context_parallel_size,

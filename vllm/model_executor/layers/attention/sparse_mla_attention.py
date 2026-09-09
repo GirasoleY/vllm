@@ -141,6 +141,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
+        assert parallel_config.cp_kv_cache_interleave_size is not None
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_local_block_size = self.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size

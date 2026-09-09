@@ -20,7 +20,7 @@ from vllm.v1.attention.backends.utils import (
     get_supported_kv_cache_layouts,
     record_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -112,6 +112,10 @@ class WorkerBase:
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         """Adopt the KV cache layout resolved by the engine core."""
         record_kv_cache_layout(self.vllm_config.cache_config, kv_cache_layout)
+
+    def prepare_kv_cache_groups(self, kv_cache_groups: list[KVCacheGroupSpec]) -> None:
+        """Resolve configuration from final cache geometry before profiling."""
+        self.vllm_config.resolve_cp_kv_cache_interleave_size(kv_cache_groups)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Prepare model for execution through compilation/warmup.
@@ -347,6 +351,13 @@ class WorkerWrapperBase:
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
+
+    def prepare_kv_cache_groups(
+        self, kv_cache_groups: list[list[KVCacheGroupSpec]]
+    ) -> None:
+        groups = kv_cache_groups[self.global_rank]
+        with set_current_vllm_config(self.vllm_config):
+            self.worker.prepare_kv_cache_groups(groups)
 
     def init_device(self):
         assert self.vllm_config is not None

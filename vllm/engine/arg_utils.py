@@ -2358,9 +2358,6 @@ class EngineArgs:
                 if self.cp_kv_cache_interleave_size is not None
                 else ParallelConfig.cp_kv_cache_interleave_size
             ),
-            _cp_kv_cache_interleave_size_auto=(
-                self.cp_kv_cache_interleave_size is None
-            ),
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
             assigned_physical_gpu_ids=self._resolve_device_ids(),

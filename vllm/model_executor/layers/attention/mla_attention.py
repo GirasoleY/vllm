@@ -1917,6 +1917,7 @@ def align_mla_chunked_context_workspace_size(
     parallel_config = vllm_config.parallel_config
     alignment = vllm_config.cache_config.block_size
     if parallel_config.decode_context_parallel_size > 1:
+        assert parallel_config.cp_kv_cache_interleave_size is not None
         alignment = lcm(
             alignment,
             parallel_config.decode_context_parallel_size
@@ -2324,6 +2325,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
+        assert parallel_config.cp_kv_cache_interleave_size is not None
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size

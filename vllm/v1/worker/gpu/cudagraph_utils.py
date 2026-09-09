@@ -881,8 +881,10 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
         get_kv_cache_groups,
     )
 
-    kv_cache_spec = runner.get_kv_cache_spec()
-    kv_cache_groups = get_kv_cache_groups(runner.vllm_config, kv_cache_spec)
+    kv_cache_groups = getattr(runner, "kv_cache_groups_for_profiling", None)
+    if kv_cache_groups is None:
+        kv_cache_spec = runner.get_kv_cache_spec()
+        kv_cache_groups = get_kv_cache_groups(runner.vllm_config, kv_cache_spec)
     # At least one block per sequence is required to capture the graphs.
     min_blocks = (
         min(runner.max_num_reqs, runner.compilation_config.max_cudagraph_capture_size)

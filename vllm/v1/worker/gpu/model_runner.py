@@ -69,6 +69,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -188,6 +189,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
+        self.kv_cache_groups_for_profiling: list[KVCacheGroupSpec] | None = None
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self._draft_workspace_lane = int(
@@ -250,7 +252,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.dcp_size = self.parallel_config.decode_context_parallel_size
         self.use_dcp = self.dcp_size > 1
         self.dcp_rank = get_dcp_group().rank_in_group if self.use_dcp else 0
-        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        self.cp_interleave = cp_interleave if cp_interleave is not None else 1
 
         # Multimodal
         self.mm_registry = MULTIMODAL_REGISTRY
@@ -554,8 +557,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
-        # GPUWorker finalizes the PD interleave before KV cache initialization.
-        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        # GPUWorker resolves the interleave before profiling or KV initialization.
+        cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        assert cp_interleave is not None
+        self.cp_interleave = cp_interleave
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 

@@ -132,6 +132,7 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         parallel_config = vllm_config.parallel_config
         dcp_size = parallel_config.decode_context_parallel_size
         interleave_size = parallel_config.cp_kv_cache_interleave_size
+        assert interleave_size is not None
         if dcp_size > 1 and interleave_size != 1:
             raise ValueError(
                 "FlashInfer MLA native DCP requires "

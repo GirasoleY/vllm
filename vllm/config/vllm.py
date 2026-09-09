@@ -57,13 +57,13 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 else:
     PretrainedConfig = Any
 
     QuantizationConfig = Any
 
-    KVCacheConfig = Any
+    KVCacheGroupSpec = Any
 
 logger = init_logger(__name__)
 
@@ -1799,6 +1799,13 @@ class VllmConfig:
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
 
+        if self.parallel_config.cp_kv_cache_interleave_size is None and not (
+            self.parallel_config.decode_context_parallel_size > 1
+            and self.kv_transfer_config is not None
+            and self.kv_transfer_config.has_connector("NixlConnector")
+        ):
+            self.parallel_config.cp_kv_cache_interleave_size = 1
+
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
             # Such an instance publishes encoder embeddings and runs no language
             # model, so it holds no KV cache for prefix caching to reuse and its
@@ -2818,54 +2825,38 @@ class VllmConfig:
                 f"Model Runner V1 does not support: {', '.join(unsupported)}"
             )
 
-    def adjust_dcp_kv_cache_interleave_size(
-        self, kv_cache_config: "KVCacheConfig"
+    def resolve_cp_kv_cache_interleave_size(
+        self, kv_cache_groups: list["KVCacheGroupSpec"]
     ) -> None:
-        """Normalize DCP interleave size against block_size for NIXL P/D.
-
-        Called by each worker (via ensure_kv_transfer_initialized), once it knows its
-        own final block_size via kv_cache_config.
-        """
-        dcp_size = self.parallel_config.decode_context_parallel_size
-        if dcp_size <= 1:
-            return
-        if self.parallel_config.dcp_kv_cache_interleave_size > 1 and (
-            self.parallel_config.cp_kv_cache_interleave_size
-            != self.parallel_config.dcp_kv_cache_interleave_size
-        ):
-            self.parallel_config.cp_kv_cache_interleave_size = (
-                self.parallel_config.dcp_kv_cache_interleave_size
-            )
-            logger.warning_once(
-                "cp_kv_cache_interleave_size is overridden by dcp_kv_cache"
-                "_interleave_size. And dcp-kv-cache-interleave-size will be "
-                "deprecated when PCP is fully supported."
-            )
-
-        if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
-            "NixlConnector"
-        ):
-            return
-        if not self.parallel_config._cp_kv_cache_interleave_size_auto:
-            return
-
-        # Get the kernel block_size, but don't use resolve_kv_cache_block_size to avoid
-        # scaling by dcp_size (we need the local block_size here).
+        """Resolve auto interleave from prepared KV groups before profiling."""
+        parallel_config = self.parallel_config
         local_block_size = min(
-            g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+            (g.kv_cache_spec.block_size for g in kv_cache_groups), default=1
         )
-        if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
-            interleave = self.parallel_config.cp_kv_cache_interleave_size
-            self.parallel_config.cp_kv_cache_interleave_size = local_block_size
-            logger.info_once(
-                "When using PD disaggregation with DCP "
-                "(decode_context_parallel_size=%d), "
-                "cp_kv_cache_interleave_size is automatically adjusted "
-                "from %d to block_size %d for block-level alignment.",
-                dcp_size,
-                interleave,
-                local_block_size,
+        if parallel_config.cp_kv_cache_interleave_size is None:
+            nixl_dcp = (
+                parallel_config.decode_context_parallel_size > 1
+                and self.kv_transfer_config is not None
+                and self.kv_transfer_config.has_connector("NixlConnector")
             )
+            parallel_config.cp_kv_cache_interleave_size = (
+                local_block_size if nixl_dcp else 1
+            )
+            logger.info_once(
+                "cp_kv_cache_interleave_size is automatically resolved to %d.",
+                parallel_config.cp_kv_cache_interleave_size,
+            )
+
+        if parallel_config.decode_context_parallel_size <= 1 or not kv_cache_groups:
+            return
+        interleave = parallel_config.cp_kv_cache_interleave_size
+        assert (
+            0 < interleave <= local_block_size and local_block_size % interleave == 0
+        ), (
+            f"Block_size({local_block_size}) should be greater "
+            "than or equal to and divisible by cp_kv_cache_interleave_size "
+            f"({interleave})."
+        )
 
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.
@@ -2875,20 +2866,15 @@ class VllmConfig:
         """
         block_size = self.cache_config.block_size
 
-        # Skip DCP interleave-size compatibility for NIXL P/D: the interleave
-        # size is pinned to block_size by each worker.
-        nixl_pd_active = (
-            self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
-        )
-        if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
-            assert (
-                self.parallel_config.cp_kv_cache_interleave_size <= block_size
-                and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
-            ), (
+        if self.parallel_config.decode_context_parallel_size > 1:
+            interleave = self.parallel_config.cp_kv_cache_interleave_size
+            assert interleave is not None, (
+                "CP interleave must be resolved before profiling"
+            )
+            assert 0 < interleave <= block_size and block_size % interleave == 0, (
                 f"Block_size({block_size}) should be greater "
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
-                f"({self.parallel_config.cp_kv_cache_interleave_size})."
+                f"({interleave})."
             )
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":

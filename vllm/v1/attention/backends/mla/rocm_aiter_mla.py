@@ -395,6 +395,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         device: torch.device,
     ):
         parallel_config = vllm_config.parallel_config
+        assert parallel_config.cp_kv_cache_interleave_size is not None
         supports_segmented_dcp_verify = _segmented_dcp_verify_supported(
             parallel_config.decode_context_parallel_size,
             parallel_config.cp_kv_cache_interleave_size,

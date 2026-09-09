@@ -173,6 +173,7 @@ class PackDCPTopkCandidatesKernel(
         if dcp_world_size <= 1:
             return []
         cp_interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        assert cp_interleave is not None
         topk = vllm_config.model_config.hf_config.index_topk
         if topk <= 0:
             return []

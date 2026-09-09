@@ -115,6 +115,22 @@ def test_per_request_spec_decode_metrics_requires_spec_decode():
             )
 
 
+@pytest.fixture
+def dcp_config_args():
+    return dict(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=dict(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     "kv_transfer_config",
     [
@@ -140,74 +156,141 @@ def test_per_request_spec_decode_metrics_requires_spec_decode():
         ),
     ],
 )
-def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
-    caplog, disable_log_dedup, kv_transfer_config
+def test_pd_dcp_interleave_size_is_resolved_from_final_group_block_size(
+    caplog, disable_log_dedup, dcp_config_args, kv_transfer_config
 ):
-    config = VllmConfig(
-        cache_config=CacheConfig(block_size=16),
-        device_config=DeviceConfig(device="cpu"),
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=2,
-            decode_context_parallel_size=2,
-            cp_kv_cache_interleave_size=3,
-            distributed_executor_backend="mp",
-        ),
-        kv_transfer_config=kv_transfer_config,
-    )
+    dcp_config_args["kv_transfer_config"] = kv_transfer_config
+    config = VllmConfig(**dcp_config_args)
+    assert config.parallel_config.cp_kv_cache_interleave_size is None
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
-    )
+    kv_cache_groups = [
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64)),
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32)),
+    ]
     with caplog.at_level(logging.INFO):
-        config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+        config.resolve_cp_kv_cache_interleave_size(kv_cache_groups)
 
-    assert config.parallel_config.cp_kv_cache_interleave_size == 16
-    assert "automatically adjusted from 3 to block_size 16" in caplog.text
+    assert config.parallel_config.cp_kv_cache_interleave_size == 32
+    assert "automatically resolved" in caplog.text
 
 
-def test_kv_offloading_does_not_adjust_dcp_interleave_size():
-    config = VllmConfig(
-        cache_config=CacheConfig(block_size=16),
-        device_config=DeviceConfig(device="cpu"),
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=2,
-            decode_context_parallel_size=2,
-            cp_kv_cache_interleave_size=1,
-            distributed_executor_backend="mp",
-        ),
-        kv_transfer_config=KVTransferConfig(
-            kv_connector="OffloadingConnector",
-            kv_role="kv_both",
-        ),
+@pytest.mark.parametrize(
+    "interleave,legacy_interleave,expected",
+    [(1, 1, 1), (8, 1, 8), (32, 1, 32), (None, 8, 8), (1, 8, 8)],
+)
+def test_pd_dcp_explicit_interleave_survives_final_block_size(
+    dcp_config_args, interleave, legacy_interleave, expected
+):
+    dcp_config_args["parallel_config"].update(
+        cp_kv_cache_interleave_size=interleave,
+        dcp_kv_cache_interleave_size=legacy_interleave,
+    )
+    config = VllmConfig(**dcp_config_args)
+    config.resolve_cp_kv_cache_interleave_size(
+        [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))]
     )
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    assert config.parallel_config.cp_kv_cache_interleave_size == expected
+
+
+@pytest.mark.parametrize(
+    "connector,dcp_size,native_offloading",
+    [
+        (None, 2, False),
+        ("OffloadingConnector", 2, False),
+        ("NixlConnector", 1, False),
+        ("NixlConnector", 2, True),
+    ],
+)
+def test_dcp_interleave_auto_without_nixl_dcp_resolves_to_one(
+    dcp_config_args, connector, dcp_size, native_offloading
+):
+    if native_offloading:
+        dcp_config_args["cache_config"] = CacheConfig(
+            kv_offloading_size=1, kv_offloading_backend="native"
+        )
+    dcp_config_args["parallel_config"]["decode_context_parallel_size"] = dcp_size
+    dcp_config_args["kv_transfer_config"] = (
+        KVTransferConfig(kv_connector=connector, kv_role="kv_both")
+        if connector is not None
+        else None
     )
-    config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+    config = VllmConfig(**dcp_config_args)
 
     assert config.parallel_config.cp_kv_cache_interleave_size == 1
 
 
-def test_kv_offloading_does_not_skip_dcp_interleave_validation():
-    config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            block_size=16,
-            mamba_cache_mode="none",
-        ),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=2,
-            cp_kv_cache_interleave_size=3,
-        ),
-        scheduler_config=SimpleNamespace(disable_chunked_mm_input=False),
-        kv_transfer_config=KVTransferConfig(
-            kv_connector="OffloadingConnector",
-            kv_role="kv_both",
-        ),
+@pytest.mark.parametrize("interleave", [None, 1, 8])
+def test_dcp_interleave_serialization_preserves_auto(interleave):
+    config = ParallelConfig(cp_kv_cache_interleave_size=interleave)
+    adapter = pydantic.TypeAdapter(ParallelConfig)
+    payload = adapter.dump_json(config, include={"cp_kv_cache_interleave_size"})
+    restored = adapter.validate_json(payload)
+
+    assert restored.cp_kv_cache_interleave_size == interleave
+
+
+@pytest.mark.parametrize("interleave", [0, -1])
+def test_dcp_interleave_must_be_positive(interleave):
+    with pytest.raises(ValidationError):
+        ParallelConfig(cp_kv_cache_interleave_size=interleave)
+
+
+def test_kv_offloading_does_not_override_explicit_dcp_interleave_size(
+    dcp_config_args,
+):
+    dcp_config_args["parallel_config"]["cp_kv_cache_interleave_size"] = 1
+    dcp_config_args["kv_transfer_config"] = KVTransferConfig(
+        kv_connector="OffloadingConnector", kv_role="kv_both"
+    )
+    config = VllmConfig(**dcp_config_args)
+
+    config.resolve_cp_kv_cache_interleave_size(
+        [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
     )
 
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+
+
+def test_pd_dcp_interleave_auto_without_kv_groups_resolves_to_one(dcp_config_args):
+    config = VllmConfig(**dcp_config_args)
+    assert config.parallel_config.cp_kv_cache_interleave_size is None
+
+    config.resolve_cp_kv_cache_interleave_size([])
+
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+
+
+@pytest.mark.parametrize("connector", ["OffloadingConnector", "NixlConnector"])
+def test_dcp_interleave_validates_final_group_block_size(dcp_config_args, connector):
+    dcp_config_args["parallel_config"]["cp_kv_cache_interleave_size"] = 16
+    dcp_config_args["kv_transfer_config"] = KVTransferConfig(
+        kv_connector=connector, kv_role="kv_both"
+    )
+    config = VllmConfig(**dcp_config_args)
+
     with pytest.raises(AssertionError, match="divisible by"):
-        VllmConfig.validate_block_size(config)
+        config.resolve_cp_kv_cache_interleave_size(
+            [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8))]
+        )
+
+
+@pytest.mark.parametrize("connector", ["OffloadingConnector", "NixlConnector"])
+@pytest.mark.parametrize("legacy_alias", [False, True])
+def test_kv_transfer_does_not_skip_explicit_dcp_interleave_validation(
+    dcp_config_args, connector, legacy_alias
+):
+    dcp_config_args["parallel_config"].update(
+        cp_kv_cache_interleave_size=None if legacy_alias else 3,
+        dcp_kv_cache_interleave_size=3 if legacy_alias else 1,
+    )
+    dcp_config_args["kv_transfer_config"] = KVTransferConfig(
+        kv_connector=connector, kv_role="kv_both"
+    )
+    config = VllmConfig(**dcp_config_args)
+
+    with pytest.raises(AssertionError, match="divisible by"):
+        config.validate_block_size()
 
 
 def test_compile_config_repr_succeeds():

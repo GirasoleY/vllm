@@ -79,6 +79,21 @@ def test_engram_config_cli_optional(options, provided):
     assert (args.engram_config is not None) == provided
 
 
+@pytest.mark.parametrize("interleave", [None, 1, 8])
+def test_cp_interleave_cli_preserves_auto_and_explicit_values(interleave):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    options = (
+        [] if interleave is None else ["--cp-kv-cache-interleave-size", str(interleave)]
+    )
+    args = EngineArgs.from_cli_args(parser.parse_args(options))
+
+    assert args.cp_kv_cache_interleave_size == interleave
+    assert (
+        EngineArgs(cp_kv_cache_interleave_size=interleave).cp_kv_cache_interleave_size
+        == interleave
+    )
+
+
 @pytest.mark.parametrize(
     ("type_hint", "type", "expected"),
     [

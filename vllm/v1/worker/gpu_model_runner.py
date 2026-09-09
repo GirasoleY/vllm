@@ -612,6 +612,7 @@ class GPUModelRunner(
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+        self.kv_cache_groups_for_profiling: list[KVCacheGroupSpec] | None = None
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -746,8 +747,9 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
+        cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         self.cp_kv_cache_interleave_size = (
-            self.parallel_config.cp_kv_cache_interleave_size
+            cp_interleave if cp_interleave is not None else 1
         )
         # Capture warmup providers registered by the initial placeholder InputBatch
         with self.jit_warmup_registry.activate():
@@ -776,7 +778,7 @@ class GPUModelRunner(
                 # batch.
                 logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
                 is_pooling_model=self.is_pooling_model,
-                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
             )
@@ -2454,6 +2456,7 @@ class GPUModelRunner(
         )
 
         if self.dcp_world_size > 1:
+            assert self.parallel_config.cp_kv_cache_interleave_size is not None
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                 self.optimistic_seq_lens_cpu[:num_reqs],
                 self.dcp_world_size,
@@ -5954,6 +5957,7 @@ class GPUModelRunner(
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         )
+        assert self.parallel_config.cp_kv_cache_interleave_size is not None
         dcp_dummy_context_len = get_dcp_dummy_context_len(
             self.dcp_world_size,
             self.parallel_config.cp_kv_cache_interleave_size,
@@ -6507,9 +6511,11 @@ class GPUModelRunner(
             get_kv_cache_groups,
         )
 
-        kv_cache_spec = self.get_kv_cache_spec()
-        KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
-        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        kv_cache_groups = getattr(self, "kv_cache_groups_for_profiling", None)
+        if kv_cache_groups is None:
+            kv_cache_spec = self.get_kv_cache_spec()
+            KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
+            kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         # the minimum number of blocks required is 1 block *per sequence*
         min_blocks = (
             min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
@@ -7252,21 +7258,20 @@ class GPUModelRunner(
             )
             max_num_blocks.append(max_num_blocks_per_req)
 
+        cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        assert cp_interleave is not None
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
-            or self.cp_kv_cache_interleave_size
-            != self.parallel_config.cp_kv_cache_interleave_size
+            or self.cp_kv_cache_interleave_size != cp_interleave
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
-            self.cp_kv_cache_interleave_size = (
-                self.parallel_config.cp_kv_cache_interleave_size
-            )
+            self.cp_kv_cache_interleave_size = cp_interleave
             # Capture warmup providers registered after final KV-cache geometry is known
             with self.jit_warmup_registry.activate():
                 self.input_batch = InputBatch(
@@ -7282,7 +7287,7 @@ class GPUModelRunner(
                     logitsprocs=self.input_batch.logitsprocs,
                     logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                     is_pooling_model=self.is_pooling_model,
-                    cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                    cp_kv_cache_interleave_size=cp_interleave,
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,

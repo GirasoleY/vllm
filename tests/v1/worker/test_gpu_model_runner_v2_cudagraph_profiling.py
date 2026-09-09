@@ -14,6 +14,7 @@ import contextlib
 import gc
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -26,6 +27,59 @@ from vllm.v1.worker.gpu import model_runner as mrv2
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
+
+
+@pytest.mark.parametrize("runner_version", ["v1", "v2"])
+@pytest.mark.parametrize("empty_groups", [False, True])
+def test_profiling_reuses_prepared_kv_cache_groups(
+    monkeypatch, runner_version, empty_groups
+):
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu_worker import Worker
+
+    # Allocation is mocked: only the identity of the globally prepared groups
+    # matters here, including an empty list on a worker without cache layers.
+    groups = [] if empty_groups else [object()]
+    config = SimpleNamespace(resolve_cp_kv_cache_interleave_size=Mock())
+    runner = SimpleNamespace(
+        vllm_config=config,
+        cache_config=SimpleNamespace(num_gpu_blocks_override=123),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=4),
+        max_num_reqs=8,
+        get_kv_cache_spec=Mock(side_effect=AssertionError("must not regroup locally")),
+        initialize_kv_cache=Mock(),
+    )
+    worker = Worker.__new__(Worker)
+    worker.vllm_config = config
+    worker.model_runner = runner
+    worker.prepare_kv_cache_groups(groups)
+
+    config.resolve_cp_kv_cache_interleave_size.assert_called_once_with(groups)
+    assert runner.kv_cache_groups_for_profiling is groups
+    minimal_config = SimpleNamespace(num_blocks=4)
+
+    def allocate(actual_config, actual_groups, *, available_memory):
+        assert actual_config is config
+        assert actual_groups is groups
+        assert available_memory == 0
+        assert runner.cache_config.num_gpu_blocks_override == 4
+        return minimal_config
+
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_config_from_groups", allocate)
+    initialize = (
+        GPUModelRunner._init_minimal_kv_cache_for_profiling
+        if runner_version == "v1"
+        else cgu._init_minimal_kv_cache_for_profiling
+    )
+    initialize(runner)
+
+    runner.get_kv_cache_spec.assert_not_called()
+    runner.initialize_kv_cache.assert_called_once_with(
+        minimal_config, is_profiling=True
+    )
+    assert runner.cache_config.num_gpu_blocks_override == 123
+    assert runner.cache_config.num_gpu_blocks == 4
 
 
 class _FakeCudaGraphManager:

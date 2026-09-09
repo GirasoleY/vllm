@@ -79,7 +79,7 @@ from vllm.utils.mem_utils import (
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -707,6 +707,10 @@ class Worker(WorkerBase):
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
+
+    def prepare_kv_cache_groups(self, kv_cache_groups: list[KVCacheGroupSpec]) -> None:
+        super().prepare_kv_cache_groups(kv_cache_groups)
+        self.model_runner.kv_cache_groups_for_profiling = kv_cache_groups
 
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
