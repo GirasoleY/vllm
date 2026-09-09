@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from contextlib import nullcontext
 
 import pytest
 
@@ -131,7 +132,16 @@ def test_dspark_mla_uses_latent_kv_geometry(
     assert model_config.get_num_experts() == 0
 
 
-def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
+@pytest.mark.parametrize(
+    ("tp_size", "dcp_size", "pp_size"),
+    [(1, 1, 1), (8, 1, 1), (8, 8, 1), (8, 8, 2)],
+    ids=["single-gpu", "tp", "tp-dcp", "tp-dcp-pp"],
+)
+@pytest.mark.parametrize("draft_tp_size", [None, 1, 8], ids=["default", "tp1", "tp8"])
+def test_dspark_mla_speculative_config(
+    tmp_path, tp_size, dcp_size, pp_size, draft_tp_size
+):
+    """Validate draft TP against target groups before launching workers."""
     target_path = tmp_path / "target"
     draft_path = tmp_path / "draft"
     _write_target_config(target_path)
@@ -139,14 +149,31 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     target_config = ModelConfig(
         model=str(target_path), tokenizer_mode="skip", max_model_len=32768
     )
-    speculative_config = SpeculativeConfig(
-        model=str(draft_path),
-        method="dspark",
-        num_speculative_tokens=8,
-        target_model_config=target_config,
-        target_parallel_config=ParallelConfig(),
+    target_parallel_config = ParallelConfig(
+        tensor_parallel_size=tp_size,
+        decode_context_parallel_size=dcp_size,
+        pipeline_parallel_size=pp_size,
+        distributed_executor_backend="external_launcher",
     )
+    unsupported_tp = draft_tp_size not in (None, tp_size)
+    expected = (
+        pytest.raises(ValueError, match="DSpark requires draft_tensor_parallel_size")
+        if unsupported_tp
+        else nullcontext()
+    )
+    with expected:
+        speculative_config = SpeculativeConfig(
+            model=str(draft_path),
+            method="dspark",
+            num_speculative_tokens=8,
+            draft_tensor_parallel_size=draft_tp_size,
+            target_model_config=target_config,
+            target_parallel_config=target_parallel_config,
+        )
+    if unsupported_tp:
+        return
 
+    assert speculative_config.draft_tensor_parallel_size == tp_size
     assert speculative_config.parallel_drafting
     assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]
     assert speculative_config.draft_model_config.hf_config.model_type == "k3_dspark"

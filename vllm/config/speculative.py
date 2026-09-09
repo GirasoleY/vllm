@@ -1454,6 +1454,15 @@ class SpeculativeConfig:
 
                 dspark_draft_topk = None
                 if self.method == "dspark":
+                    target_tp = self.target_parallel_config.tensor_parallel_size
+                    if self.draft_tensor_parallel_size not in (None, target_tp):
+                        raise ValueError(
+                            "DSpark requires draft_tensor_parallel_size to match "
+                            f"target tensor_parallel_size ({target_tp}), but got "
+                            f"{self.draft_tensor_parallel_size}. Omit "
+                            "draft_tensor_parallel_size or set it to "
+                            f"{target_tp}; DSpark shares the target's TP group."
+                        )
                     hf_config = self.draft_model_config.hf_config
                     dspark_draft_topk = self.dspark_draft_topk
                     if dspark_draft_topk is None:

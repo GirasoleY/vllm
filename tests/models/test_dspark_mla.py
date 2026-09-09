@@ -166,10 +166,10 @@ def mla_dspark_models(tmp_path):
         (1, 1, None, True),
         (2, 1, None, False),
         (2, 2, None, False),
-        (2, 1, 1, False),
-        (2, 2, 1, False),
+        (2, 1, 2, False),
+        (2, 2, 2, False),
     ],
-    ids=["eager", "tp", "tp-dcp", "tp-draft-tp1", "tp-dcp-draft-tp1"],
+    ids=["eager", "tp", "tp-dcp", "tp-explicit-draft-tp", "tp-dcp-explicit-draft-tp"],
 )
 @multi_gpu_test(num_gpus=2)
 def test_dspark_mla_parallel_generation(
