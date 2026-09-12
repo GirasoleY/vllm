@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import typing
 from collections.abc import Callable, Iterable
 
@@ -210,6 +211,12 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        quant_config = vllm_config.quant_config
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            # NVFP4 checkpoints keep the MTP layer in BF16; build the draft
+            # model without quantization.
+            vllm_config = copy.copy(vllm_config)
+            vllm_config.quant_config = None
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.model = Glm5NextMultiTokenPredictor(
