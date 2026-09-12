@@ -363,6 +363,25 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+# Explicit CommonAttentionMetadata constructor parameters that model-specific
+# metadata may override per kv-cache group (e.g. hybrid-PCP mamba groups build
+# their metadata on the global, unpartitioned batch).
+_COMMON_ATTN_METADATA_OVERRIDE_KEYS = (
+    "query_start_loc",
+    "query_start_loc_cpu",
+    "seq_lens",
+    "seq_lens_cpu_upper_bound",
+    "max_seq_len",
+    "num_reqs",
+    "num_actual_tokens",
+    "max_query_len",
+    "block_table_tensor",
+    "slot_mapping",
+    "positions",
+    "causal",
+)
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -413,6 +432,14 @@ def build_attn_metadata(
         group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
             "is_prefilling", is_prefilling
         )
+        # Explicit CommonAttentionMetadata parameters supplied per group (e.g.
+        # global-batch values for hybrid-PCP mamba groups) override the shared
+        # locals; pop them so they are not passed twice.
+        group_overrides = {
+            key: common_attn_metadata_extra_kwargs.pop(key)
+            for key in _COMMON_ATTN_METADATA_OVERRIDE_KEYS
+            if key in common_attn_metadata_extra_kwargs
+        }
         if fast_prefill is not None:
             common_attn_metadata_extra_kwargs.update(
                 logits_indices_padded=fast_prefill.logits_indices_padded,
@@ -420,19 +447,23 @@ def build_attn_metadata(
                 max_logits_per_req=fast_prefill.max_logits_per_req,
             )
         common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=group_causal,
+            query_start_loc=group_overrides.get("query_start_loc", query_start_loc_gpu),
+            query_start_loc_cpu=group_overrides.get(
+                "query_start_loc_cpu", query_start_loc_cpu
+            ),
+            seq_lens=group_overrides.get("seq_lens", seq_lens),
+            seq_lens_cpu_upper_bound=group_overrides.get(
+                "seq_lens_cpu_upper_bound", seq_lens_cpu_upper_bound
+            ),
+            max_seq_len=group_overrides.get("max_seq_len", max_seq_len),
+            num_reqs=group_overrides.get("num_reqs", num_reqs),
+            num_actual_tokens=group_overrides.get("num_actual_tokens", num_tokens),
+            max_query_len=group_overrides.get("max_query_len", max_query_len),
+            block_table_tensor=group_overrides.get("block_table_tensor", block_table),
+            slot_mapping=group_overrides.get("slot_mapping", slot_mapping),
+            causal=group_overrides.get("causal", group_causal),
             dcp_local_seq_lens=dcp_local_seq_lens,
-            positions=positions,
+            positions=group_overrides.get("positions", positions),
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,

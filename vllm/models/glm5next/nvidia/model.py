@@ -890,6 +890,10 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    # Under PCP, KDA layers run in gather-replicate mode: they see the full
+    # sequence (gathered across the PCP group) instead of this rank's shard.
+    supports_hybrid_pcp = True
+
     # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix the text
     # tower with "model.language_model."; strip it for the text-only model.
     hf_to_vllm_mapper = WeightsMapper(

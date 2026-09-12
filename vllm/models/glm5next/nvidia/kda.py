@@ -287,6 +287,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # positions is unused (NoPE), so only hidden_states is gathered.
+        forward_context = get_forward_context()
+        mgr = getattr(forward_context, "pcp_manager", None)
+        # Under hybrid PCP, KDA runs replicated on the global batch: gather the
+        # full sequence across the PCP group, compute with the global GDN
+        # metadata, and slice the output back to this rank's local rows. Dummy
+        # runs without metadata for this layer keep the local shapes.
+        attn_metadata = forward_context.attn_metadata
+        gather_replicate = (
+            mgr is not None
+            and mgr.hybrid_kda_replicated
+            and isinstance(attn_metadata, dict)
+            and attn_metadata.get(self.prefix) is not None
+        )
+        if gather_replicate:
+            assert mgr is not None
+            hidden_states = mgr.gather_to_global(hidden_states)
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
@@ -328,7 +345,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        out = self.o_proj(core_attn_out)[0]
+        if gather_replicate:
+            assert mgr is not None
+            out = mgr.scatter_to_local(out)
+        return out
 
     @eager_break_during_capture
     def _forward(
