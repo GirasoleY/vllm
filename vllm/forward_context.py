@@ -157,7 +157,9 @@ class ForwardContext:
 
     # The PCP batch manager for the current step, when MRV2 PCP is active.
     # Layers that write to a PCP-replicated cache (e.g. the kpool sparse
-    # indexer) use it to gather per-token values across the PCP group.
+    # indexer) use it to gather per-token values across the PCP group, and
+    # layers that run replicated on the global batch (e.g. KDA under hybrid
+    # PCP) use it to gather/scatter hidden states across the PCP group.
     pcp_manager: Any | None = None
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly

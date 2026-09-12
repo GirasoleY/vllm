@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -35,18 +35,33 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
 
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    # Hybrid-PCP gather-replicate: per mamba kv-cache-group
+    # CommonAttentionMetadata overrides built on the global (unpartitioned)
+    # batch, plus the matching global per-request tensors for the mamba
+    # builders. All None when hybrid PCP is inactive.
+    pcp_mamba_common_kwargs: dict[int, dict[str, Any]] | None = None
+    pcp_is_prefilling: torch.Tensor | None = None
+    pcp_num_accepted_tokens: torch.Tensor | None = None
+    pcp_num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
+        if self.pcp_mamba_common_kwargs is not None:
+            group_kwargs = self.pcp_mamba_common_kwargs.get(kv_cache_group_id)
+            if group_kwargs is not None:
+                return {**group_kwargs, "is_prefilling": self.pcp_is_prefilling}
         return {"is_prefilling": self.is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(
@@ -64,6 +79,12 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             ),
         ):
             return {}
+        if self.pcp_mamba_common_kwargs is not None:
+            # Hybrid PCP: mamba groups consume the global batch.
+            return {
+                "num_accepted_tokens": self.pcp_num_accepted_tokens,
+                "num_decode_draft_tokens_cpu": self.pcp_num_decode_draft_tokens_cpu,
+            }
         return {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
@@ -86,6 +107,9 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # Set by the model runner when MRV2 PCP is active; used to build the
+        # mamba groups' metadata on the global batch (hybrid gather-replicate).
+        self.pcp_manager: PCPManager | None = None
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -195,6 +219,16 @@ class MambaHybridModelState(DefaultModelState):
         """
         if not self._align_mode:
             return
+        pcp = self.pcp_manager
+        if pcp is not None and pcp.hybrid_kda_replicated:
+            global_batch = pcp.global_batch
+            if global_batch is not None:
+                # Hybrid PCP: KDA layers run replicated on the global batch and
+                # the mamba state slots are global, so the align pre-copy must
+                # run for every request on every rank, indexed by the global
+                # batch.
+                input_batch = global_batch
+                block_tables = pcp.global_block_tables
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
             return
@@ -228,6 +262,38 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_off_gpu,
             input_batch.idx_mapping,
         )
+
+    def _build_spec_token_metadata(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather num_accepted_tokens and num_decode_draft_tokens for a batch."""
+        num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+        num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
+            input_batch.idx_mapping
+        ]
+
+        # GDN uses >= 0 to select spec-decode rows, so non-decode rows
+        # need the -1 sentinel rather than a raw zero draft count.
+        num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
+        num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+        if num_draft_tokens_per_req is not None:
+            # A row is a spec-decode row only when its whole prompt is already
+            # computed, i.e. exactly one non-draft (decode) token is scheduled.
+            is_decode = input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
+            spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
+            num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
+                spec_decode_mask, num_draft_tokens_per_req, -1
+            )
+        return num_accepted_tokens, torch.from_numpy(num_decode_draft_tokens_np)
+
+    def _get_pcp_global_batch(self, for_capture: bool) -> InputBatch | None:
+        """The step's global batch when KDA layers run gather-replicated."""
+        pcp = self.pcp_manager
+        if pcp is None or not pcp.hybrid_kda_replicated or for_capture:
+            return None
+        return pcp.global_batch
 
     def prepare_attn(
         self,
@@ -266,26 +332,39 @@ class MambaHybridModelState(DefaultModelState):
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
-            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
-                input_batch.idx_mapping
-            ]
+            num_accepted_tokens, num_decode_draft_tokens_cpu = (
+                self._build_spec_token_metadata(input_batch, num_reqs)
+            )
 
-            # GDN uses >= 0 to select spec-decode rows, so non-decode rows
-            # need the -1 sentinel rather than a raw zero draft count.
-            num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
-            num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
-            if num_draft_tokens_per_req is not None:
-                # A row is a spec-decode row only when its whole prompt is already
-                # computed, i.e. exactly one non-draft (decode) token is scheduled.
-                is_decode = (
-                    input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
-                )
-                spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
-                num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
-                    spec_decode_mask, num_draft_tokens_per_req, -1
-                )
-            num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+        # Hybrid PCP: mamba groups run replicated on the global (unpartitioned)
+        # batch, so their attention metadata is built from it instead of this
+        # rank's local shard.
+        global_batch = self._get_pcp_global_batch(for_capture)
+        pcp_mamba_common_kwargs: dict[int, dict[str, Any]] | None = None
+        pcp_is_prefilling = None
+        pcp_num_accepted_tokens = None
+        pcp_num_decode_draft_tokens_cpu = None
+        if global_batch is not None:
+            pcp = self.pcp_manager
+            assert pcp is not None
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            if mamba_group_ids:
+                gdn_inputs = pcp.global_gdn_inputs()
+                global_block_tables = gdn_inputs.pop("block_tables")
+                pcp_mamba_common_kwargs = {
+                    group_id: {
+                        **gdn_inputs,
+                        "block_table_tensor": global_block_tables[group_id],
+                    }
+                    for group_id in mamba_group_ids
+                }
+                pcp_is_prefilling = torch.from_numpy(global_batch.is_prefilling_np)
+                if self.vllm_config.num_speculative_tokens > 0:
+                    pcp_num_accepted_tokens, pcp_num_decode_draft_tokens_cpu = (
+                        self._build_spec_token_metadata(
+                            global_batch, global_batch.num_reqs
+                        )
+                    )
 
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
@@ -296,11 +375,21 @@ class MambaHybridModelState(DefaultModelState):
                     if hasattr(builder, "mamba_aligned_state_indices"):
                         aligned_index_builders.append((group_idx, builder))
             if aligned_index_builders:
+                align_seq_lens = input_batch.seq_lens
+                align_num_reqs = num_reqs
+                align_block_tables = block_tables
+                if global_batch is not None:
+                    # Match preprocess_state: the align kernels run on the
+                    # global batch under hybrid PCP.
+                    assert self.pcp_manager is not None
+                    align_seq_lens = global_batch.seq_lens
+                    align_num_reqs = global_batch.num_reqs
+                    align_block_tables = self.pcp_manager.global_block_tables
                 ctx = self._ensure_align_ctx(
-                    kv_cache_config, mamba_group_ids, block_tables
+                    kv_cache_config, mamba_group_ids, align_block_tables
                 )
                 all_group_indices = ctx.compute_aligned_state_indices(
-                    input_batch.seq_lens, num_reqs
+                    align_seq_lens, align_num_reqs
                 )
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
@@ -309,6 +398,10 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            pcp_mamba_common_kwargs=pcp_mamba_common_kwargs,
+            pcp_is_prefilling=pcp_is_prefilling,
+            pcp_num_accepted_tokens=pcp_num_accepted_tokens,
+            pcp_num_decode_draft_tokens_cpu=pcp_num_decode_draft_tokens_cpu,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
