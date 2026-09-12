@@ -68,6 +68,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -933,6 +934,12 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix the text
+    # tower with "model.language_model."; strip it for the text-only model.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."}
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1017,8 +1024,9 @@ class Glm5NextForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = ((n, w) for n, w in weights if not n.startswith("model.visual."))
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
