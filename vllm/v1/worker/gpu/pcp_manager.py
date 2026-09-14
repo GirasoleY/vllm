@@ -791,6 +791,12 @@ class PCPManager:
         self.num_gathered_tokens = self._hidden_restore_idx.shape[0]
         return gathered[self._hidden_restore_idx]
 
+    def reorder_gathered_to_global(self, gathered: torch.Tensor) -> torch.Tensor:
+        """Restore global token order for a tensor already in the padded
+        gathered layout (PCP-group all-gather concat), without the gather."""
+        assert self._hidden_restore_idx is not None
+        return gathered[self._hidden_restore_idx]
+
     def scatter_to_local(self, full: torch.Tensor) -> torch.Tensor:
         """Slice a global-order full tensor back to this rank's local padded rows."""
         assert self._local_batch is not None

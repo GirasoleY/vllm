@@ -9,7 +9,8 @@ import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -17,6 +18,7 @@ from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
 elif current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops import kpool_compress as kpool_ops
 else:
@@ -32,6 +34,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
@@ -215,6 +218,130 @@ def _fill_short_decode_causal_indices(
     return True
 
 
+def _kpool_pcp_cache_update(
+    pcp_mgr: "PCPManager",
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    tail_slot_mapping: torch.Tensor | None,
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor | None,
+    compress_ape: torch.Tensor,
+    index_kpool: int,
+    head_dim: int,
+    round_scale: bool,
+) -> None:
+    """Replicated kpool cache update under PCP.
+
+    Each rank computed only its own rows (zig-zag prefill chunks, owned decode
+    rows), and pooling needs sequence-consecutive tokens, so the per-token
+    K/gate are all-gathered and reordered to the global (unpartitioned) batch
+    order; every rank then applies the full batch's pool-compression and tail
+    writes, keeping the caches coherent replicas. The slot mappings arrive in
+    the padded gathered layout and are reordered with the same index.
+    """
+    global_batch = pcp_mgr.global_batch
+    assert global_batch is not None
+    assert slot_mapping.shape[0] == pcp_mgr.pcp_world_size * k.shape[0], (
+        "kpool PCP write requires the group-expanded slot mapping matching "
+        f"the local batch: {slot_mapping.shape[0]} != "
+        f"{pcp_mgr.pcp_world_size} * {k.shape[0]}"
+    )
+    k_global = pcp_mgr.gather_to_global(k)
+    gate_global = pcp_mgr.gather_to_global(gate_score)
+    slot_global = pcp_mgr.reorder_gathered_to_global(slot_mapping)
+    num_tokens = slot_global.shape[0]
+    assert k_global.shape[0] == num_tokens
+
+    # The global batch is decode-first (the invariant the indexer metadata
+    # builder assumes). For cache writes, still-prefilling rows (including
+    # short final chunks) are prefill rows: their K is pool-compressed here,
+    # while decode rows go through the tail-buffer kernel.
+    is_prefilling = global_batch.is_prefilling_np
+    num_decode_reqs = int((~is_prefilling).sum())
+    assert not is_prefilling[:num_decode_reqs].any()
+    decode_lens_np = global_batch.num_scheduled_tokens[:num_decode_reqs]
+    num_decode_tokens = int(decode_lens_np.sum())
+
+    tail_global = None
+    if tail_slot_mapping is not None and tail_kv_cache is not None:
+        tail_global = pcp_mgr.reorder_gathered_to_global(tail_slot_mapping)
+
+    if num_tokens > num_decode_tokens:
+        prefill_slice = slice(num_decode_tokens, num_tokens)
+        _kpool_compress_insert(
+            k_global[prefill_slice],
+            gate_global[prefill_slice],
+            compress_ape,
+            kv_cache,
+            slot_global[prefill_slice],
+            index_kpool,
+            head_dim,
+            round_scale=round_scale,
+        )
+        # Persist each request's incomplete prefill pool so decode can finish
+        # it, including after PD transfer (same as the non-PCP path).
+        if tail_global is not None:
+            kpool_ops.kpool_seed_tail_cache(
+                tail_kv_cache,
+                k_global[prefill_slice],
+                gate_global[prefill_slice],
+                tail_global[prefill_slice],
+                index_kpool,
+                head_dim,
+            )
+
+    if num_decode_tokens > 0 and tail_global is not None:
+        dec_k = k_global[:num_decode_tokens]
+        dec_gate = gate_global[:num_decode_tokens]
+        dec_slot = slot_global[:num_decode_tokens]
+        dec_tail = tail_global[:num_decode_tokens]
+        dec_pos = global_batch.positions[:num_decode_tokens].to(torch.int32)
+        lmax = int(decode_lens_np.max())
+        if int(decode_lens_np.min()) == lmax:
+            next_n = num_decode_tokens // num_decode_reqs
+            shape2 = (num_decode_reqs, next_n)
+            dec_k = dec_k.view(*shape2, head_dim)
+            dec_gate = dec_gate.view(*shape2, head_dim)
+            dec_slot = dec_slot.view(shape2)
+            dec_pos = dec_pos.view(shape2)
+            dec_tail = dec_tail.view(shape2)
+        else:
+            scatter_idx = _build_decode_scatter_indices(
+                torch.from_numpy(decode_lens_np).to(k.device),
+                num_decode_reqs,
+                num_decode_tokens,
+            )
+            dec_k = _scatter_decode_tokens_by_request(
+                dec_k, 0, num_decode_reqs, lmax, scatter_idx
+            )
+            dec_gate = _scatter_decode_tokens_by_request(
+                dec_gate, 0, num_decode_reqs, lmax, scatter_idx
+            )
+            dec_slot = _scatter_decode_tokens_by_request(
+                dec_slot, -1, num_decode_reqs, lmax, scatter_idx
+            )
+            dec_pos = _scatter_decode_tokens_by_request(
+                dec_pos, -1, num_decode_reqs, lmax, scatter_idx
+            )
+            dec_tail = _scatter_decode_tokens_by_request(
+                dec_tail, -1, num_decode_reqs, lmax, scatter_idx
+            )
+        kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+            kv_cache,
+            tail_kv_cache,
+            dec_tail,
+            dec_k,
+            dec_gate,
+            compress_ape,
+            dec_slot,
+            dec_pos,
+            index_kpool,
+            head_dim,
+            round_scale=round_scale,
+        )
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -286,6 +413,8 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    use_pcp: bool = False,
+    pcp_shard_decode_requests: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -346,53 +475,94 @@ def sparse_attn_indexer_kpool(
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
+    # Under PCP the slot mapping is expanded across the group
+    # (world * local padded); keep the local padding rows so every rank
+    # contributes the same all-gather shape.
     num_tokens = slot_mapping.shape[0]
     if k is not None:
+        if use_pcp and num_tokens > k.shape[0]:
+            num_tokens //= get_pcp_group().world_size
         k = k[:num_tokens]
 
     if not skip_k_cache_insert:
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
         if index_kpool > 1 and gate_score is not None and compress_ape is not None:
-            # kpool prefill write: pool kpool consecutive prefill tokens via
-            # softmax(gate+ape)-weighted sum -> Hadamard -> fp8 -> pool slots.
-            # Decode tokens (the first num_decode_tokens in the batch) cannot be
-            # pooled here — their pool's earlier tokens are not in this batch —
-            # so they are deferred to the tail-buffer kernel in has_decode.
-            # compress_ratio == index_kpool makes slot_mapping pool-granular.
-            n_prefill = num_tokens - num_decode_tokens
-            if n_prefill > 0:
-                # decode tokens are batched first; prefill tokens follow.
-                prefill_slice = slice(num_decode_tokens, num_tokens)
-                _kpool_compress_insert(
-                    k[prefill_slice],
-                    gate_score[prefill_slice],
-                    compress_ape,
-                    kv_cache,
-                    slot_mapping[prefill_slice],
-                    index_kpool,
-                    head_dim,
-                    round_scale=(scale_fmt is not None),
-                )
-                # Persist each request's incomplete prefill pool so decode can
-                # finish it, including after PD transfer. Tail slots use
-                # ``pos % kpool`` within the request's tail block. Processing
-                # only the batch's trailing tokens would miss all but the last
-                # request in a multi-request prefill.
-                if tail_kv_cache is not None and tail_prefix is not None:
-                    tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
-                    if tail_meta is not None:
-                        assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-                        kpool_ops.kpool_seed_tail_cache(
-                            tail_kv_cache,
-                            k[prefill_slice],
-                            gate_score[prefill_slice],
-                            tail_meta.slot_mapping[prefill_slice],
-                            index_kpool,
-                            head_dim,
-                        )
+            if use_pcp:
+                # Pooling needs sequence-consecutive tokens, but each rank
+                # holds only its own zig-zag chunks / owned decode rows. Gather
+                # to the global batch order and let every rank apply the full
+                # batch's writes, keeping the replicated caches coherent.
+                # Skipped when the step has no global partition (dummy/capture
+                # runs, or a drafter forward outside the target's partition).
+                pcp_mgr = getattr(get_forward_context(), "pcp_manager", None)
+                if pcp_mgr is not None and pcp_mgr.global_batch is not None:
+                    tail_slot_mapping = None
+                    if tail_prefix is not None:
+                        tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
+                        if tail_meta is not None:
+                            assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+                            tail_slot_mapping = tail_meta.slot_mapping
+                    _kpool_pcp_cache_update(
+                        pcp_mgr,
+                        k,
+                        gate_score,
+                        slot_mapping,
+                        tail_slot_mapping,
+                        kv_cache,
+                        tail_kv_cache,
+                        compress_ape,
+                        index_kpool,
+                        head_dim,
+                        round_scale=(scale_fmt is not None),
+                    )
+            else:
+                # kpool prefill write: pool kpool consecutive prefill tokens via
+                # softmax(gate+ape)-weighted sum -> Hadamard -> fp8 -> pool slots.
+                # Decode tokens (the first num_decode_tokens in the batch) cannot be
+                # pooled here — their pool's earlier tokens are not in this batch —
+                # so they are deferred to the tail-buffer kernel in has_decode.
+                # compress_ratio == index_kpool makes slot_mapping pool-granular.
+                n_prefill = num_tokens - num_decode_tokens
+                if n_prefill > 0:
+                    # decode tokens are batched first; prefill tokens follow.
+                    prefill_slice = slice(num_decode_tokens, num_tokens)
+                    _kpool_compress_insert(
+                        k[prefill_slice],
+                        gate_score[prefill_slice],
+                        compress_ape,
+                        kv_cache,
+                        slot_mapping[prefill_slice],
+                        index_kpool,
+                        head_dim,
+                        round_scale=(scale_fmt is not None),
+                    )
+                    # Persist each request's incomplete prefill pool so decode can
+                    # finish it, including after PD transfer. Tail slots use
+                    # ``pos % kpool`` within the request's tail block. Processing
+                    # only the batch's trailing tokens would miss all but the last
+                    # request in a multi-request prefill.
+                    if tail_kv_cache is not None and tail_prefix is not None:
+                        tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
+                        if tail_meta is not None:
+                            assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+                            kpool_ops.kpool_seed_tail_cache(
+                                tail_kv_cache,
+                                k[prefill_slice],
+                                gate_score[prefill_slice],
+                                tail_meta.slot_mapping[prefill_slice],
+                                index_kpool,
+                                head_dim,
+                            )
         else:
             # standard: per-token fp8 quant + scatter (all tokens).
             assert scale_fmt is not None
+            k, slot_mapping_for_cache = maybe_gather_indexer_k(
+                k,
+                slot_mapping,
+                num_decode_tokens,
+                use_pcp,
+                pcp_shard_decode_requests=pcp_shard_decode_requests,
+            )
             if current_platform.is_rocm():
                 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                     indexer_k_quant_and_cache_triton,
@@ -401,7 +571,7 @@ def sparse_attn_indexer_kpool(
                 indexer_k_quant_and_cache_triton(
                     k,
                     kv_cache,
-                    slot_mapping,
+                    slot_mapping_for_cache,
                     quant_block_size,
                     scale_fmt,
                 )
@@ -409,7 +579,7 @@ def sparse_attn_indexer_kpool(
                 ops.indexer_k_quant_and_cache(
                     k,
                     kv_cache,
-                    slot_mapping,
+                    slot_mapping_for_cache,
                     quant_block_size,
                     scale_fmt,
                 )
@@ -601,12 +771,16 @@ def sparse_attn_indexer_kpool(
         # order so each token is stashed before the next completes its pool.
         # Positions must remain token-granular because the kernel derives the
         # pool phase and tail index from ``pos % kpool``.
+        # use_pcp: the tail/cache update already ran on the global batch in the
+        # write section above (every rank updates the replicated cache for all
+        # decode rows, not just its owned ones).
         if (
             index_kpool > 1
             and gate_score is not None
             and compress_ape is not None
             and positions is not None
             and not skip_k_cache_insert
+            and not use_pcp
         ):
             num_requests = attn_metadata_narrowed.num_decodes
             # Kpool writes must recover the original request grouping after the
@@ -915,6 +1089,11 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # DCP/PCP scalars are constant for the run; resolve them here (config is
+        # set during model construction), matching the plain sparse indexer.
+        parallel_config = get_current_vllm_config().parallel_config
+        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
@@ -1001,6 +1180,8 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            use_pcp=self.use_pcp,
+            pcp_shard_decode_requests=self.pcp_shard_decode_requests,
         )
 
     def forward_hip(
