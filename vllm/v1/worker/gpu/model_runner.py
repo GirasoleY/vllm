@@ -1931,6 +1931,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                pcp_manager=self.pcp_manager,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:

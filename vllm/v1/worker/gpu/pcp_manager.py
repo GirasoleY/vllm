@@ -748,6 +748,23 @@ class PCPManager:
         gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
+    @property
+    def global_batch(self) -> InputBatch | None:
+        """The unpartitioned scheduled batch for the current step."""
+        return self._global_batch
+
+    def gather_to_global(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """All-gather rank-local rows and restore global token order."""
+        assert self._hidden_restore_idx is not None
+        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
+        return gathered[self._hidden_restore_idx]
+
+    def reorder_gathered_to_global(self, gathered: torch.Tensor) -> torch.Tensor:
+        """Restore global token order for a tensor already in the padded
+        gathered layout (PCP-group all-gather concat), without the gather."""
+        assert self._hidden_restore_idx is not None
+        return gathered[self._hidden_restore_idx]
+
     def get_draft_input_buffers(
         self, input_buffers: InputBuffers
     ) -> InputBatch | InputBuffers:
