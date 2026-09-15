@@ -99,9 +99,8 @@ class PPHandler:
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
-        # Warmup steps run the pipeline with synthetic batches whose outputs are
-        # discarded; the sampled-token broadcast is disabled there so its
-        # side-stream NCCL ops cannot overlap the next step's activation p2p.
+        # Kernel preloading disables feedback to avoid pending NCCL operations
+        # during first-time kernel loads. The following PP warmup enables it.
         self.disabled = False
 
     def set_disabled(self, disabled: bool) -> None:

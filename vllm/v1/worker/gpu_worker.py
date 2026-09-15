@@ -771,52 +771,22 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        # All warmup phases below run synthetic steps whose sampled outputs are
-        # discarded. The PP sampled-token broadcast would carry no payload, and
-        # its side-stream NCCL ops can overlap the next step's activation p2p
-        # and deadlock the pipeline, so keep it disabled for the whole warmup
-        # window and restore it before serving.
         pp_handler = getattr(self.model_runner, "pp_handler", None)
+        feedback_was_disabled = pp_handler.disabled if pp_handler is not None else False
         if pp_handler is not None:
             pp_handler.set_disabled(True)
+        try:
+            self._preload_model_kernels()
+        finally:
+            if pp_handler is not None:
+                pp_handler.set_disabled(feedback_was_disabled)
 
-        warmup_sizes: list[int] = []
-
-        if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-            # warm up sizes that are not in cudagraph capture sizes,
-            # but users still want to compile for better performance,
-            # e.g. for the max-num-batched token size in chunked prefill.
-            compile_sizes = self.vllm_config.compilation_config.compile_sizes
-            warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []  # type: ignore[assignment]
-            cg_capture_sizes: list[int] = []
-
-            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
-                cg_capture_sizes = [] if cg_sizes is None else cg_sizes
-                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
-
-            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
-            # For each compile_range, if none of the batch sizes
-            # in warmup_sizes or cudagraph_capture_sizes are in the range,
-            # add the end of the range to ensure compilation/warmup.
-            all_sizes = set(cg_capture_sizes)
-            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
-            for compile_range in compile_ranges:
-                if not any(x in compile_range for x in all_sizes):
-                    warmup_sizes.append(compile_range.end)
-
-        # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
-        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
-
-        # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
-        kernel_warmup(self)
-
-        if self.use_v2_model_runner:
-            # A workspace resize after capture frees what the graphs point at.
+        if (
+            self.use_v2_model_runner
+            and pp_handler is not None
+            and not feedback_was_disabled
+            and not self.model_runner.is_pooling_model
+        ):
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
 
         cuda_graph_memory_bytes = 0
@@ -956,13 +926,55 @@ class Worker(WorkerBase):
         # intra-op parallelism.
         set_torch_threads_for_runtime()
 
-        if pp_handler is not None:
-            pp_handler.set_disabled(False)
-
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _preload_model_kernels(self) -> None:
+        """Compile and load startup kernels before enabling PP feedback."""
+        warmup_sizes: list[int] = []
+
+        if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+            # warm up sizes that are not in cudagraph capture sizes,
+            # but users still want to compile for better performance,
+            # e.g. for the max-num-batched token size in chunked prefill.
+            compile_sizes = self.vllm_config.compilation_config.compile_sizes
+            warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []  # type: ignore[assignment]
+            cg_capture_sizes: list[int] = []
+
+            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+                cg_capture_sizes = [] if cg_sizes is None else cg_sizes
+                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
+
+            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
+            # For each compile_range, if none of the batch sizes
+            # in warmup_sizes or cudagraph_capture_sizes are in the range,
+            # add the end of the range to ensure compilation/warmup.
+            all_sizes = set(cg_capture_sizes)
+            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
+            for compile_range in compile_ranges:
+                if not any(x in compile_range for x in all_sizes):
+                    warmup_sizes.append(compile_range.end)
+
+        # We skip EPLB here since we don't want to record dummy metrics
+        for size in sorted(warmup_sizes, reverse=True):
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+
+        # Warmup and tune the kernels used during model execution before
+        # cuda graph capture.
+        kernel_warmup(self)
+
+        if self.use_v2_model_runner:
+            model_runner = cast("GPUModelRunnerV2", self.model_runner)
+            if model_runner.pp_handler is not None and not model_runner.is_last_pp_rank:
+                model_runner.warmup_pp_decode_update()
+            # Execute the startup shapes to load kernels outside the JIT registry.
+            # A workspace resize after capture frees what the graphs point at.
+            warmup_kernels(model_runner, self.execute_model, self.sample_tokens)
 
     def _get_cudagraph_capture_context(self) -> AbstractContextManager[None]:
         """Let the configured profiler observe CUDA graph capture."""
