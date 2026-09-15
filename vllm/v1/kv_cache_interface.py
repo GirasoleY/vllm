@@ -653,8 +653,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     is_index_group_leader: bool = False
     storage_block_size: int | None = None
     """Token width used to view storage when it differs from the kernel block."""
-    # Group capability enabled when any member flattens a non-causal query block
-    # into decode rows. Runtime metadata still selects causal vs. non-causal mode.
+    # Merged layers must agree on this capability: it changes decode dispatch
+    # even when their physical KV cache layouts match.
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
@@ -686,6 +686,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             "quantization method, tokens per state, model version, cache role, "
             "index-sharing role, and storage block size."
         )
+        non_causal_multi_token_decode = specs[0].non_causal_multi_token_decode
+        assert all(
+            spec.non_causal_multi_token_decode == non_causal_multi_token_decode
+            for spec in specs
+        ), "Merged MLA layers must agree on non_causal_multi_token_decode."
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -701,9 +706,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_role=cache_role_set.pop(),
             is_index_group_leader=index_group_leader_set.pop(),
             storage_block_size=storage_block_size_set.pop(),
-            non_causal_multi_token_decode=any(
-                spec.non_causal_multi_token_decode for spec in specs
-            ),
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
         for spec in specs:
             for f in fields(AttentionSpec):

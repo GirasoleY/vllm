@@ -73,13 +73,10 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         ``repeat_interleave`` on a Python int and performs no device->host
         sync, so it does satisfy the UNIFORM_BATCH contract.
 
-        ``non_causal_multi_token_decode`` is a KV-cache-group property, not a
-        per-layer one: ``MLAAttentionSpec.merge`` ORs it over every layer in
-        the group, so a group holding both a draft and its target reports it
-        for both. That is the same predicate ``__init__`` below already uses to
-        raise ``reorder_batch_threshold``, so the two stay consistent, but it
-        does mean this lifts a causal target sharing the draft's KV cache group
-        as well.
+        The capability comes from the attention group's spec. Causal target
+        and non-causal draft layers keep distinct specs even when they share
+        a KV cache allocation group, so only the draft gets this support and
+        the raised ``reorder_batch_threshold`` in ``__init__`` below.
         """
         if getattr(kv_cache_spec, "non_causal_multi_token_decode", False):
             return AttentionCGSupport.UNIFORM_BATCH

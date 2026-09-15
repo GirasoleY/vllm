@@ -3034,6 +3034,39 @@ def _grouping_config():
     )
 
 
+@pytest.mark.parametrize("layout", ["LBNHC", "BLNHC"])
+@pytest.mark.parametrize("mamba_page_scale", [0, 1, 2])
+def test_grouping_preserves_mla_decode_capabilities(layout, mamba_page_scale):
+    """Allocation grouping must preserve each layer's decode semantics."""
+    config = _grouping_config()
+    config.cache_config.kv_cache_layout = layout
+    target = new_mla_spec(block_size=64)
+    specs = {
+        "target.attn": target,
+        "draft.attn": replace(target, non_causal_multi_token_decode=True),
+    }
+    if mamba_page_scale:
+        # Exercise uniform-page grouping and mixed-page packing/fallback.
+        specs["target.mamba"] = MambaSpec(
+            block_size=64,
+            shapes=((target.page_size_bytes * mamba_page_scale // 4,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+
+    layer_specs = {}
+    for group in get_kv_cache_groups(config, specs):
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+            layer_specs.update(group.kv_cache_spec.kv_cache_specs)
+        else:
+            layer_specs.update(
+                {name: group.kv_cache_spec for name in group.layer_names}
+            )
+
+    assert not layer_specs["target.attn"].non_causal_multi_token_decode
+    assert layer_specs["draft.attn"].non_causal_multi_token_decode
+
+
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     block_size = 544
     full_spec = FullAttentionSpec(

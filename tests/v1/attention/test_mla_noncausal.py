@@ -122,7 +122,7 @@ def test_noncausal_decode_metadata_keeps_live_request_buffers():
     )
 
 
-def test_mla_cache_marker_is_promoted_to_group_capability():
+def test_mla_merge_preserves_matching_decode_capabilities():
     kwargs = {
         "block_size": 64,
         "num_kv_heads": 1,
@@ -136,4 +136,20 @@ def test_mla_cache_marker_is_promoted_to_group_capability():
     assert not MLAAttentionSpec.merge(
         [unmarked, unmarked]
     ).non_causal_multi_token_decode
-    assert MLAAttentionSpec.merge([unmarked, marked]).non_causal_multi_token_decode
+
+
+@pytest.mark.parametrize("first_noncausal", [False, True])
+def test_mla_merge_rejects_mixed_decode_capabilities(first_noncausal):
+    """A draft must not enable multi-token decode for a causal target."""
+    specs = [
+        MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            non_causal_multi_token_decode=noncausal,
+        )
+        for noncausal in (first_noncausal, not first_noncausal)
+    ]
+    with pytest.raises(AssertionError, match="non_causal_multi_token_decode"):
+        MLAAttentionSpec.merge(specs)
