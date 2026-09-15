@@ -175,6 +175,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.target_attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing prefill CUDA graphs",
+            pcp_manager=self.pcp_manager,
         )
         self.on_prefill_end(self.max_num_reqs)
 

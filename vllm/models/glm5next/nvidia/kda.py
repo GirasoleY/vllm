@@ -40,6 +40,12 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 if current_platform.is_rocm():
@@ -303,7 +309,21 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        # positions is unused (NoPE), so only hidden_states is gathered.
+        # positions is unused (NoPE). The custom-op boundary keeps the PCP
+        # host logic (KCP plan building, gather/scatter collectives, cache
+        # writes) out of the compiled region: under piecewise compilation each
+        # KDA layer is one opaque node whose Python body re-runs per step
+        # instead of traced fragments that recompile and fault at runtime.
+        out = torch.zeros_like(hidden_states)
+        torch.ops.vllm.glm5next_kda_forward(
+            hidden_states, out, layer_name=_encode_layer_name(self.prefix)
+        )
+        return out
+
+    def _forward_pcp(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
         forward_context = get_forward_context()
         mgr = getattr(forward_context, "pcp_manager", None)
         # Under hybrid PCP, KDA runs replicated on the global batch: gather the
@@ -1016,3 +1036,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
                     0, :num_actual_tokens
                 ]
+
+
+@eager_break_during_capture
+def glm5next_kda_forward(
+    hidden_states: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """KDA forward as one opaque custom op; ``out`` is mutated in-place."""
+    layer_name = _resolve_layer_name(layer_name)
+    self = get_forward_context().no_compile_layers[layer_name]
+    out.copy_(self._forward_pcp(hidden_states))
+
+
+direct_register_custom_op(
+    op_name="glm5next_kda_forward",
+    op_func=glm5next_kda_forward,
+    mutates_args=["out"],
+)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -15,6 +16,9 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 
 class SpeculatorCudaGraphManager(CudaGraphManager):
@@ -36,6 +40,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        pcp_manager: "PCPManager | None" = None,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -57,6 +62,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                pcp_manager=pcp_manager,
             )
 
             return lambda cg_mode: forward_fn(
