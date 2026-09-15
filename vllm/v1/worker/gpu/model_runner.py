@@ -1123,14 +1123,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def warmup_pp_decode_update(self) -> None:
-        """Compile and load the deferred update before PP feedback is enabled.
+        """Preload PP state-update kernels before posting feedback receives.
 
-        The synthetic trajectory may be shorter than the PP receive FIFO, so
-        executing it alone does not guarantee this path is reached. An all -1
-        idx_mapping exercises the kernel without updating request state. The
-        aligned count buffers match the padded views allocated by PPHandler.
+        The deferred path may not run during a short warmup trajectory. Use
+        scratch counters and a negative request index to preserve request state.
+        Aligned count buffers match PPHandler's padded receive buffers.
         """
         assert self.pp_handler is not None
+        post_update_num_computed_tokens(
+            torch.zeros(1, dtype=torch.int64, device=self.device),
+            torch.zeros(1, dtype=torch.int32, device=self.device),
+            torch.zeros(2, dtype=torch.int32, device=self.device),
+        )
         num_spec = self.pp_handler.max_sample_len - 1
         broadcast_drafts = (
             torch.zeros((1, num_spec), dtype=torch.int64, device=self.device)

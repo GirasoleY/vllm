@@ -99,13 +99,6 @@ class PPHandler:
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
-        # Kernel preloading disables feedback to avoid pending NCCL operations
-        # during first-time kernel loads. The following PP warmup enables it.
-        self.disabled = False
-
-    def set_disabled(self, disabled: bool) -> None:
-        self.disabled = disabled
-
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
 
@@ -184,8 +177,6 @@ class PPHandler:
         """Returns True iff sampled tokens need to be gathered from *all*
         requests in the batch."""
         assert not self.is_last_rank
-        if self.disabled:
-            return False
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
@@ -249,8 +240,6 @@ class PPHandler:
         input_batch: InputBatch,
     ) -> None:
         assert self.is_last_rank
-        if self.disabled:
-            return
         mask = compute_need_sampled_mask(input_batch)
         if mask is None:
             # No request needs sampled outputs for a subsequent decode step.
@@ -296,7 +285,7 @@ class PPHandler:
         before this async send completes.
         """
         assert self.is_last_rank
-        if self.disabled or self.max_sample_len == 1:
+        if self.max_sample_len == 1:
             return
         if compute_need_sampled_mask(input_batch) is None:
             return
