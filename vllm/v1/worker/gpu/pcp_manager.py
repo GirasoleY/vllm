@@ -73,6 +73,8 @@ class PCPManager:
         self._local_batch: InputBatch | None = None
         self._local_gather_idx: torch.Tensor | None = None
         self.draft_prefill_batch: InputBatch | None = None
+        # Per-partition KCP layout plan cache (built lazily by the KDA layers).
+        self._kcp_plan_cache: tuple[Any, Any] | None = None
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
@@ -423,6 +425,11 @@ class PCPManager:
         return self._global_batch
 
     @property
+    def local_batch(self) -> InputBatch | None:
+        """This rank's partitioned batch for the current step."""
+        return self._local_batch
+
+    @property
     def global_block_tables(self) -> tuple[torch.Tensor, ...]:
         """Per-kv-cache-group block tables in global batch order."""
         assert self._global_block_tables is not None
@@ -464,6 +471,7 @@ class PCPManager:
 
         global_batch = input_batch
         self._global_batch = global_batch
+        self._kcp_plan_cache = None
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
