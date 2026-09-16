@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_KDA_KCP_MIN_TOKENS: int = 12288
+    VLLM_KDA_KCP_MERGE: str = "torch"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1108,6 +1109,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KDA_KCP_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_KDA_KCP_MIN_TOKENS", "12288")
     ),
+    # KCP merge implementation: "torch" (cuBLAS fp32 bmm chain, default) or
+    # "kernel" (the original Triton chain kernel).
+    "VLLM_KDA_KCP_MERGE": lambda: os.getenv("VLLM_KDA_KCP_MERGE", "torch"),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
