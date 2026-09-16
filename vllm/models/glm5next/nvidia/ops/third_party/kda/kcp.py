@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.third_party.flash_linear_attention.ops.op import exp2
@@ -317,6 +318,27 @@ def kcp_merge_fwd_kernel(
     tl.store(p_final, b_h.to(p_final.dtype.element_ty), mask=m_final)
 
 
+def kcp_merge_states_torch(
+    slots_hm: torch.Tensor,
+    base_state: torch.Tensor,
+    num_slots: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chain-merge slot summaries via batched cuBLAS bmms (same math as the
+    Triton kernel, but fully parallel across N*H per step instead of one
+    sequential dot per (v-block, request, head) block)."""
+    S, N, H, K, VK = slots_hm.shape
+    V = VK - K
+    init_states = slots_hm.new_empty(N, S, H, V, K)
+    h = base_state
+    for c in range(S):
+        init_states[:, c] = h
+        m_c = slots_hm[c, ..., V:]  # [N,H,K,K]
+        se_c = slots_hm[c, ..., :V].transpose(-1, -2)  # [N,H,V,K]
+        h_new = torch.matmul(h, m_c.transpose(-1, -2)) + se_c
+        h = torch.where((c < num_slots).view(N, 1, 1, 1), h_new, h)
+    return init_states, h
+
+
 def kcp_merge_states(
     slots_hm: torch.Tensor,
     base_state: torch.Tensor,
@@ -333,6 +355,8 @@ def kcp_merge_states(
     Returns:
         (initial states [N, S, H, V, K] fp32, final states [N, H, V, K] fp32).
     """
+    if envs.VLLM_KDA_KCP_MERGE != "kernel":
+        return kcp_merge_states_torch(slots_hm, base_state, num_slots)
     S, N, H, K, _ = slots_hm.shape
     V = slots_hm.shape[-1] - K
     init_states = slots_hm.new_empty(N, S, H, V, K, dtype=torch.float32)
