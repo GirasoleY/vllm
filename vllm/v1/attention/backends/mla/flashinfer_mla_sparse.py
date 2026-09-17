@@ -29,6 +29,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
+    mask_empty_sparse_mla_queries,
+    prepare_sparse_mla_safe_lengths,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
@@ -463,7 +465,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         sparse_topk_capacity = topk_indices_physical.shape[1]
 
         extra_kwargs: dict[str, torch.Tensor] = {}
-        empty_rows: torch.Tensor | None = None
         if self.is_nope_mla:
             # The native no-rope kernel takes the active top-k length per query
             # token (``seq_lens`` here is already the compacted per-token valid
@@ -472,11 +473,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             # the launch. ``triton_convert_req_index_to_global_index`` packs the
             # valid indices into a contiguous prefix, which is what the kernel
             # requires of the page table.
-            empty_rows = seq_lens == 0
-            topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
-                empty_rows, 0
+            extra_kwargs["sparse_mla_top_k_lens"] = prepare_sparse_mla_safe_lengths(
+                topk_indices_physical, seq_lens
             )
-            extra_kwargs["sparse_mla_top_k_lens"] = seq_lens.clamp(min=1)
 
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -505,12 +504,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         out = o.view(-1, o.shape[-2], o.shape[-1])
         if lse is not None:
             lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
-        if empty_rows is None and lse is not None:
+        if self.is_nope_mla:
+            mask_empty_sparse_mla_queries(out, seq_lens, lse)
+        elif lse is not None:
             empty_rows = (topk_indices_physical == -1).all(dim=-1)
-        if empty_rows is not None:
             out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-            if lse is not None:
-                lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
         return out, lse
 
     @staticmethod

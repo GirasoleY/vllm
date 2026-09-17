@@ -130,69 +130,141 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
     torch.testing.assert_close(out_ans, out_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("num_heads", [8, 64])
+@pytest.mark.parametrize("sparse_topk", [128, 2176])
 @requires_sm10x
-def test_flashinfer_trtllm_sparse_mla_decode_without_rope():
-    """The native sparse MLA path supports a zero-width rotary tail."""
+def test_flashinfer_trtllm_sparse_mla_decode_without_rope(
+    dtype: torch.dtype, num_heads: int, sparse_topk: int
+):
+    """Remap and empty-query handling preserve the native NoPE attention result."""
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        mask_empty_sparse_mla_queries,
+        prepare_sparse_mla_safe_lengths,
+        triton_convert_req_index_to_global_index,
+    )
+
     torch.set_default_device("cuda")
     torch.manual_seed(42)
-
-    batch_size = 2
-    block_size = 64
-    num_blocks = 4
-    sparse_topk = 128
-    valid_lens = torch.tensor([17, 73], dtype=torch.int32)
-
-    query = torch.randn(
-        batch_size,
-        1,
-        NUM_HEADS,
-        KV_LORA_RANK,
-        dtype=torch.bfloat16,
-    )
-    kv_cache = torch.randn(
-        num_blocks,
-        block_size,
-        KV_LORA_RANK,
-        dtype=torch.bfloat16,
-    )
-
+    batch_size, block_size, num_blocks = 3, 64, 4
+    valid_lens = torch.tensor([0, 17, 73], dtype=torch.int32)
+    query = torch.randn(batch_size, 1, num_heads, KV_LORA_RANK).to(dtype)
+    kv_cache = torch.randn(num_blocks, block_size, KV_LORA_RANK).to(dtype)
     num_slots = num_blocks * block_size
-    slot_tables = torch.stack(
-        [torch.randperm(num_slots)[:sparse_topk] for _ in range(batch_size)]
-    ).to(torch.int32)
-    for row, valid_len in zip(slot_tables, valid_lens.tolist()):
-        row[valid_len:] = -1
-
-    workspace_buffer = torch.empty(
-        FLASHINFER_WORKSPACE_BUFFER_SIZE,
-        dtype=torch.int8,
+    slot_tables = torch.full((batch_size, sparse_topk), -1, dtype=torch.int32)
+    for token, valid_len in enumerate(valid_lens.tolist()):
+        # Interior gaps exercise compaction, including a completely empty query.
+        positions = torch.randperm(sparse_topk)[:valid_len]
+        slot_tables[token, positions] = torch.randperm(num_slots)[:valid_len].int()
+    physical, counts = triton_convert_req_index_to_global_index(
+        torch.zeros(batch_size, dtype=torch.int32),
+        torch.arange(num_blocks, dtype=torch.int32).view(1, -1),
+        slot_tables,
+        BLOCK_SIZE=block_size,
+        NUM_TOPK_TOKENS=sparse_topk,
+        return_valid_counts=True,
     )
-    out = trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
-        kv_cache=kv_cache.unsqueeze(1),
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
-        kv_lora_rank=KV_LORA_RANK,
-        qk_rope_head_dim=0,
-        block_tables=slot_tables.unsqueeze(1),
-        seq_lens=valid_lens,
-        max_seq_len=sparse_topk,
-        sparse_mla_top_k=sparse_topk,
-        sparse_mla_top_k_lens=valid_lens,
-        bmm1_scale=QK_NOPE_HEAD_DIM**-0.5,
-        bmm2_scale=1.0,
-    ).squeeze(1)
+    torch.testing.assert_close(counts, valid_lens)
+    safe_lens = prepare_sparse_mla_safe_lengths(physical, counts)
+    workspace_buffer = torch.empty(FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.int8)
+
+    def run_attention(indices, counts, safe_lens):
+        return trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache.unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=0,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=counts,
+            max_seq_len=sparse_topk,
+            sparse_mla_top_k=sparse_topk,
+            sparse_mla_top_k_lens=safe_lens,
+            bmm1_scale=QK_NOPE_HEAD_DIM**-0.5,
+            bmm2_scale=1.0,
+        ).squeeze(1)
+
+    out = run_attention(physical, counts, safe_lens)
+    mask_empty_sparse_mla_queries(out, counts)
+
+    # An independent PyTorch preparation must produce the same native result,
+    # including FP8's internal attention arithmetic and empty-query handling.
+    reference_indices = torch.full_like(slot_tables, -1)
+    for token, valid_len in enumerate(valid_lens.tolist()):
+        reference_indices[token, :valid_len] = slot_tables[token][
+            slot_tables[token] >= 0
+        ]
+    empty = valid_lens == 0
+    reference_indices[:, 0] = reference_indices[:, 0].masked_fill(empty, 0)
+    reference_out = run_attention(
+        reference_indices, valid_lens, valid_lens.clamp(min=1)
+    )
+    reference_out.masked_fill_(empty[:, None, None], 0)
+    torch.testing.assert_close(out, reference_out, atol=0, rtol=0)
 
     flat_cache = kv_cache.view(num_slots, KV_LORA_RANK).float()
     refs = []
-    for batch_idx, valid_len in enumerate(valid_lens.tolist()):
-        selected_kv = flat_cache[slot_tables[batch_idx, :valid_len].long()]
-        scores = torch.einsum("hd,kd->hk", query[batch_idx, 0].float(), selected_kv)
+    for token, valid_len in enumerate(valid_lens.tolist()):
+        if valid_len == 0:
+            refs.append(torch.zeros(num_heads, KV_LORA_RANK))
+            continue
+        selected = slot_tables[token][slot_tables[token] >= 0].long()
+        selected_kv = flat_cache[selected]
+        scores = torch.einsum("hd,kd->hk", query[token, 0].float(), selected_kv)
         probs = torch.softmax(scores * QK_NOPE_HEAD_DIM**-0.5, dim=-1)
         refs.append(torch.einsum("hk,kd->hd", probs, selected_kv))
     ref = torch.stack(refs).to(torch.bfloat16)
+    if dtype == torch.bfloat16:
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+@pytest.mark.parametrize("num_tokens,num_heads", [(0, 8), (1, 8), (35, 64)])
+@pytest.mark.parametrize("empty_pattern", ["none", "some", "all"])
+@pytest.mark.parametrize("with_lse", [False, True])
+@requires_sm10x
+def test_sparse_mla_empty_query_helpers(num_tokens, num_heads, empty_pattern, with_lse):
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        mask_empty_sparse_mla_queries,
+        prepare_sparse_mla_safe_lengths,
+    )
+
+    device = "cuda"
+    # Strided views also expose accidental writes into adjacent storage.
+    counts_storage = torch.full((num_tokens, 2), 17, dtype=torch.int32, device=device)
+    counts = counts_storage[:, 0]
+    if empty_pattern == "all":
+        counts.zero_()
+    elif empty_pattern == "some":
+        counts[::3] = 0
+    original_counts = counts_storage.clone()
+    empty = counts == 0
+    indices_storage = torch.full(
+        (num_tokens, 256), 42, dtype=torch.int32, device=device
+    )
+    indices = indices_storage[:, ::2]
+    expected_indices = indices_storage.clone()
+    expected_indices[:, 0].masked_fill_(empty, 0)
+    safe = prepare_sparse_mla_safe_lengths(indices, counts)
+    torch.testing.assert_close(safe, counts.clamp(min=1), rtol=0, atol=0)
+    torch.testing.assert_close(indices_storage, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(counts_storage, original_counts, rtol=0, atol=0)
+
+    out_storage = torch.randn(
+        num_tokens, num_heads, 1024, device=device, dtype=torch.bfloat16
+    )
+    out = out_storage[:, :, ::2]
+    out.masked_fill_(empty[:, None, None], float("nan"))
+    expected_out = out_storage.clone()
+    expected_out[:, :, ::2].masked_fill_(empty[:, None, None], 0)
+    lse_storage = torch.randn(num_heads, num_tokens * 2, device=device)
+    lse = lse_storage[:, ::2].T if with_lse else None
+    expected_lse = lse_storage.clone()
+    if with_lse:
+        expected_lse[:, ::2].T.masked_fill_(empty[:, None], float("-inf"))
+    mask_empty_sparse_mla_queries(out, counts, lse)
+    torch.testing.assert_close(out_storage, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lse_storage, expected_lse, rtol=0, atol=0)
 
 
 @requires_sm90

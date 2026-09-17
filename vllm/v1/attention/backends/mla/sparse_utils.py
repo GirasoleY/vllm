@@ -629,3 +629,117 @@ def triton_filter_and_convert_dcp_index(
 
 
 _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL = ConvertReqIndexToGlobalIndexKernel()
+
+
+@triton.jit
+def sparse_mla_prepare_safe_lengths_kernel(
+    indices_ptr,
+    counts_ptr,
+    safe_lengths_ptr,
+    NUM_TOKENS: tl.constexpr,
+    index_stride0: tl.constexpr,
+    count_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    count = tl.load(counts_ptr + token * count_stride, token < NUM_TOKENS, other=1)
+    tl.store(safe_lengths_ptr + token, tl.maximum(count, 1), token < NUM_TOKENS)
+    # TRTLLM's NoPE sparse kernel requires at least one valid KV-cache entry.
+    tl.store(
+        indices_ptr + token * index_stride0, 0, (token < NUM_TOKENS) & (count == 0)
+    )
+
+
+def prepare_sparse_mla_safe_lengths(
+    physical_indices: torch.Tensor, valid_counts: torch.Tensor
+) -> torch.Tensor:
+    """Install dummy slots for empty queries and return nonzero kernel lengths.
+
+    Preserve the raw counts so empty outputs and LSE can be neutralized later.
+    """
+    num_tokens = valid_counts.numel()
+    safe_lengths = torch.empty(
+        (num_tokens,), dtype=valid_counts.dtype, device=valid_counts.device
+    )
+    if num_tokens:
+        sparse_mla_prepare_safe_lengths_kernel[(triton.cdiv(num_tokens, 256),)](
+            physical_indices,
+            valid_counts,
+            safe_lengths,
+            num_tokens,
+            physical_indices.stride(0),
+            valid_counts.stride(0),
+            BLOCK=256,
+        )
+    return safe_lengths
+
+
+@triton.jit
+def sparse_mla_zero_empty_queries_kernel(
+    out_ptr,
+    counts_ptr,
+    lse_ptr,
+    NUM_TOKENS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    out_stride0: tl.constexpr,
+    out_stride1: tl.constexpr,
+    out_stride2: tl.constexpr,
+    count_stride: tl.constexpr,
+    lse_stride0: tl.constexpr,
+    lse_stride1: tl.constexpr,
+    HAS_LSE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    count = tl.load(counts_ptr + token * count_stride, token < NUM_TOKENS, other=1)
+    empty = (token < NUM_TOKENS) & (count == 0)
+    # Most prefill queries are nonempty. Do not read or rewrite their outputs.
+    if tl.sum(empty.to(tl.int32)) > 0:
+        col = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+        offset = (
+            token[:, None] * out_stride0
+            + (col[None, :] // HEAD_DIM) * out_stride1
+            + (col[None, :] % HEAD_DIM) * out_stride2
+        )
+        tl.store(
+            out_ptr + offset, 0, empty[:, None] & (col[None, :] < NUM_HEADS * HEAD_DIM)
+        )
+        if HAS_LSE:  # noqa: SIM102 - guard the optional pointer at compile time.
+            if tl.program_id(1) == 0:
+                head = tl.arange(0, triton.next_power_of_2(NUM_HEADS))
+                tl.store(
+                    lse_ptr
+                    + token[:, None] * lse_stride0
+                    + head[None, :] * lse_stride1,
+                    -float("inf"),
+                    empty[:, None] & (head[None, :] < NUM_HEADS),
+                )
+
+
+def mask_empty_sparse_mla_queries(
+    out: torch.Tensor, valid_counts: torch.Tensor, lse: torch.Tensor | None = None
+) -> None:
+    """Zero only empty query outputs and set their optional LSE to -inf in place."""
+    num_tokens, num_heads, head_dim = out.shape
+    if not num_tokens:
+        return
+    sparse_mla_zero_empty_queries_kernel[
+        (triton.cdiv(num_tokens, 32), triton.cdiv(num_heads * head_dim, 1024))
+    ](
+        out,
+        valid_counts,
+        lse,
+        num_tokens,
+        num_heads,
+        head_dim,
+        *out.stride(),
+        valid_counts.stride(0),
+        lse.stride(0) if lse is not None else 0,
+        lse.stride(1) if lse is not None else 0,
+        HAS_LSE=lse is not None,
+        BLOCK_T=32,
+        BLOCK_C=1024,
+        num_warps=4,
+    )
