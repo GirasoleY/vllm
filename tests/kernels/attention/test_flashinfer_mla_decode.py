@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -133,83 +135,119 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("sparse_topk", [128, 2176])
+@pytest.mark.parametrize("dcp_size,dcp_rank", [(1, 0), (2, 0), (2, 1)])
 @requires_sm10x
 def test_flashinfer_trtllm_sparse_mla_decode_without_rope(
-    dtype: torch.dtype, num_heads: int, sparse_topk: int
+    dtype: torch.dtype,
+    num_heads: int,
+    sparse_topk: int,
+    dcp_size,
+    dcp_rank,
+    monkeypatch,
 ):
-    """Remap and empty-query handling preserve the native NoPE attention result."""
-    from vllm.v1.attention.backends.mla.sparse_utils import (
-        mask_empty_sparse_mla_queries,
-        prepare_sparse_mla_safe_lengths,
-        triton_convert_req_index_to_global_index,
-    )
+    """TP skips empty-query helpers; DCP preserves empty local outputs and LSE."""
+    import vllm.v1.attention.backends.mla.flashinfer_mla_sparse as backend
 
     torch.set_default_device("cuda")
     torch.manual_seed(42)
-    batch_size, block_size, num_blocks = 3, 64, 4
-    valid_lens = torch.tensor([0, 17, 73], dtype=torch.int32)
+    batch_size, block_size, num_blocks, interleave = 3, 64, 4, 8
+    valid_lens = [1, 17, 73]
     query = torch.randn(batch_size, 1, num_heads, KV_LORA_RANK).to(dtype)
     kv_cache = torch.randn(num_blocks, block_size, KV_LORA_RANK).to(dtype)
     num_slots = num_blocks * block_size
     slot_tables = torch.full((batch_size, sparse_topk), -1, dtype=torch.int32)
-    for token, valid_len in enumerate(valid_lens.tolist()):
-        # Interior gaps exercise compaction, including a completely empty query.
+    for token, valid_len in enumerate(valid_lens):
+        # Interior gaps exercise compaction. Every global selection is nonempty.
         positions = torch.randperm(sparse_topk)[:valid_len]
-        slot_tables[token, positions] = torch.randperm(num_slots)[:valid_len].int()
-    physical, counts = triton_convert_req_index_to_global_index(
-        torch.zeros(batch_size, dtype=torch.int32),
-        torch.arange(num_blocks, dtype=torch.int32).view(1, -1),
-        slot_tables,
-        BLOCK_SIZE=block_size,
-        NUM_TOPK_TOKENS=sparse_topk,
-        return_valid_counts=True,
-    )
-    torch.testing.assert_close(counts, valid_lens)
-    safe_lens = prepare_sparse_mla_safe_lengths(physical, counts)
+        selected = torch.randperm(num_slots * dcp_size)[:valid_len].int()
+        if token == 0:
+            # DCP's first query has a valid key, owned entirely by the other rank.
+            selected[0] = (1 - dcp_rank) * interleave if dcp_size > 1 else 0
+        slot_tables[token, positions] = selected
+
+    # Independent PyTorch filtering and compaction for the native reference.
+    reference_indices = torch.full_like(slot_tables, -1)
+    local_lens = []
+    for token in range(batch_size):
+        selected = slot_tables[token][slot_tables[token] >= 0]
+        selected = selected[(selected // interleave) % dcp_size == dcp_rank]
+        local = (
+            selected // (dcp_size * interleave)
+        ) * interleave + selected % interleave
+        local_lens.append(local.numel())
+        reference_indices[token, : local.numel()] = local
+    counts = torch.tensor(local_lens, dtype=torch.int32)
+    empty = counts == 0
+    reference_indices[:, 0] = reference_indices[:, 0].masked_fill(empty, 0)
     workspace_buffer = torch.empty(FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.int8)
 
-    def run_attention(indices, counts, safe_lens):
-        return trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache.unsqueeze(1),
-            workspace_buffer=workspace_buffer,
-            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_rope_head_dim=0,
-            block_tables=indices.unsqueeze(1),
-            seq_lens=counts,
-            max_seq_len=sparse_topk,
-            sparse_mla_top_k=sparse_topk,
-            sparse_mla_top_k_lens=safe_lens,
-            bmm1_scale=QK_NOPE_HEAD_DIM**-0.5,
-            bmm2_scale=1.0,
-        ).squeeze(1)
-
-    out = run_attention(physical, counts, safe_lens)
-    mask_empty_sparse_mla_queries(out, counts)
-
-    # An independent PyTorch preparation must produce the same native result,
-    # including FP8's internal attention arithmetic and empty-query handling.
-    reference_indices = torch.full_like(slot_tables, -1)
-    for token, valid_len in enumerate(valid_lens.tolist()):
-        reference_indices[token, :valid_len] = slot_tables[token][
-            slot_tables[token] >= 0
-        ]
-    empty = valid_lens == 0
-    reference_indices[:, 0] = reference_indices[:, 0].masked_fill(empty, 0)
-    reference_out = run_attention(
-        reference_indices, valid_lens, valid_lens.clamp(min=1)
+    impl = object.__new__(backend.FlashInferMLASparseImpl)
+    impl.qk_nope_head_dim = QK_NOPE_HEAD_DIM
+    impl.kv_lora_rank = KV_LORA_RANK
+    impl.qk_rope_head_dim = 0
+    impl.topk_indices_buffer = slot_tables
+    impl.dcp_world_size = dcp_size
+    impl.dcp_rank = dcp_rank
+    impl._workspace_buffer = workspace_buffer
+    impl.bmm1_scale = QK_NOPE_HEAD_DIM**-0.5
+    impl.bmm2_scale = 1.0
+    impl.is_nope_mla = True
+    impl.need_to_return_lse_for_decode = dcp_size > 1
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.zeros(batch_size, dtype=torch.int32),
+        block_table=torch.arange(num_blocks, dtype=torch.int32).view(1, -1),
+        block_size=block_size,
+        cp_kv_cache_interleave_size=interleave,
     )
+    if dcp_size == 1:
+
+        def unexpected_empty_query_helper(*args, **kwargs):
+            pytest.fail("TP must not launch empty-query preparation or masking")
+
+        monkeypatch.setattr(
+            backend, "prepare_sparse_mla_safe_lengths", unexpected_empty_query_helper
+        )
+        monkeypatch.setattr(
+            backend, "mask_empty_sparse_mla_queries", unexpected_empty_query_helper
+        )
+
+    out, lse = impl.forward_mqa(query.squeeze(1), kv_cache, metadata, SimpleNamespace())
+    reference = trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache.unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        kv_lora_rank=KV_LORA_RANK,
+        qk_rope_head_dim=0,
+        block_tables=reference_indices.unsqueeze(1),
+        seq_lens=counts,
+        max_seq_len=sparse_topk,
+        sparse_mla_top_k=sparse_topk,
+        sparse_mla_top_k_lens=counts.clamp(min=1),
+        bmm1_scale=QK_NOPE_HEAD_DIM**-0.5,
+        bmm2_scale=1.0,
+        return_lse=dcp_size > 1,
+    )
+    if dcp_size > 1:
+        reference_out, reference_lse = reference
+        reference_lse = reference_lse.reshape(batch_size, num_heads)
+        reference_lse.masked_fill_(empty[:, None], float("-inf"))
+        torch.testing.assert_close(lse, reference_lse, atol=0, rtol=0)
+        assert torch.isneginf(lse[0]).all()
+    else:
+        reference_out = reference
+        assert lse is None
+    reference_out = reference_out.squeeze(1)
     reference_out.masked_fill_(empty[:, None, None], 0)
     torch.testing.assert_close(out, reference_out, atol=0, rtol=0)
 
     flat_cache = kv_cache.view(num_slots, KV_LORA_RANK).float()
     refs = []
-    for token, valid_len in enumerate(valid_lens.tolist()):
+    for token, valid_len in enumerate(local_lens):
         if valid_len == 0:
             refs.append(torch.zeros(num_heads, KV_LORA_RANK))
             continue
-        selected = slot_tables[token][slot_tables[token] >= 0].long()
+        selected = reference_indices[token, :valid_len].long()
         selected_kv = flat_cache[selected]
         scores = torch.einsum("hd,kd->hk", query[token, 0].float(), selected_kv)
         probs = torch.softmax(scores * QK_NOPE_HEAD_DIM**-0.5, dim=-1)

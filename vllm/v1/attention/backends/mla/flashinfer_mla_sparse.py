@@ -466,16 +466,15 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         extra_kwargs: dict[str, torch.Tensor] = {}
         if self.is_nope_mla:
-            # The native no-rope kernel takes the active top-k length per query
-            # token (``seq_lens`` here is already the compacted per-token valid
-            # count, int32) and rejects zero-length rows. Point empty rows at a
-            # single valid dummy slot with length 1 and zero their output after
-            # the launch. ``triton_convert_req_index_to_global_index`` packs the
-            # valid indices into a contiguous prefix, which is what the kernel
-            # requires of the page table.
-            extra_kwargs["sparse_mla_top_k_lens"] = prepare_sparse_mla_safe_lengths(
-                topk_indices_physical, seq_lens
-            )
+            # Real queries have nonempty global selections. Only DCP filtering
+            # can leave a query without local KV entries; the LSE path must
+            # substitute a dummy entry and neutralize its contribution below.
+            topk_lens = seq_lens
+            if self.need_to_return_lse_for_decode:
+                topk_lens = prepare_sparse_mla_safe_lengths(
+                    topk_indices_physical, seq_lens
+                )
+            extra_kwargs["sparse_mla_top_k_lens"] = topk_lens
 
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -504,7 +503,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         out = o.view(-1, o.shape[-2], o.shape[-1])
         if lse is not None:
             lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
-        if self.is_nope_mla:
+        if self.is_nope_mla and lse is not None:
             mask_empty_sparse_mla_queries(out, seq_lens, lse)
         elif lse is not None:
             empty_rows = (topk_indices_physical == -1).all(dim=-1)
