@@ -25,7 +25,23 @@ def check_attention_cp_compatibility(
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+    hybrid_pcp = False
+    if pcp_size > 1:
+        # Hybrid models opt in to running their linear-attention (MambaBase)
+        # layers in gather-replicate mode under PCP: those layers see the full
+        # sequence instead of this rank's context shard.
+        try:
+            model_config = vllm_config.model_config
+            architectures = getattr(model_config.hf_config, "architectures", None) or []
+            model_cls, _ = model_config.registry.resolve_model_cls(
+                architectures, model_config=model_config
+            )
+            hybrid_pcp = getattr(model_cls, "supports_hybrid_pcp", False)
+        except Exception:
+            hybrid_pcp = False
     if pcp_size * dcp_size > 1:
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
         for layer_name, layer in layers.items():
@@ -33,6 +49,8 @@ def check_attention_cp_compatibility(
             get_attn_backend = getattr(layer, "get_attn_backend", None)
             if pcp_size > 1 and check_pcp and get_attn_backend is not None:
                 backend = get_attn_backend()
+                if hybrid_pcp and isinstance(layer, MambaBase):
+                    continue
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "
                     f"but {backend.get_name()} does not support PCP."

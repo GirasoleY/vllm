@@ -184,3 +184,88 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
         broken["cu_seqlens"] = None if q.shape[0] > 1 else inputs["cu_seqlens"]
         with pytest.raises(AssertionError, match=r"torch.Size"):
             run_kernel(broken, state)
+
+
+@pytest.mark.parametrize(
+    ("query_len", "prefix_kind"),
+    [
+        (3, None),
+        (32768, "fresh"),
+        (32768, "continued"),
+        (32768, "decode"),
+    ],
+)
+def test_kcp_plan_preserves_short_continuation_halos_and_empty_ranks(
+    query_len, prefix_kind
+):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import build_kcp_plan
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+    # Short prefills use the ordinary path's initial-state masking; plain
+    # decodes still share KCP batches with a large prefill.
+    prefix = int(prefix_kind is not None)
+    lengths = np.array([1] * prefix + [query_len], dtype=np.int32)
+    prefilling = np.array(([prefix_kind != "decode"] if prefix else []) + [True])
+    starts = np.array(
+        ([0 if prefix_kind == "fresh" else 9] if prefix else []) + [9], dtype=np.int32
+    )
+    query_start = np.concatenate(([0], lengths.cumsum())).astype(np.int32)
+    tails = torch.full((16, 3), -999, dtype=torch.int64)
+    chunk_size = (query_len + 15) // 16
+    for slot in range(16):
+        end = min((slot + 1) * chunk_size, query_len)
+        take = min(3, max(0, end - slot * chunk_size))
+        if take:
+            tails[slot, 3 - take :] = torch.arange(9 + end - take, 9 + end)
+    for rank in range(8):
+        manager = PCPManager(8, rank, torch.device("cpu"))
+        segments = manager._get_rank_segments(rank, lengths, prefilling, query_start)
+        local_lens = np.array([s.num_tokens for s in segments], dtype=np.int32)
+        manager._global_batch = SimpleNamespace(
+            num_scheduled_tokens=lengths,
+            is_prefilling_np=prefilling,
+            num_computed_tokens_np=starts,
+            query_start_loc_np=query_start,
+            num_reqs=len(lengths),
+            num_draft_tokens_per_req=None,
+            req_ids=list(range(len(lengths))),
+        )
+        manager._local_batch = SimpleNamespace(
+            req_ids=[s.global_batch_req_idx for s in segments],
+            num_reqs=len(segments),
+            num_scheduled_tokens=local_lens,
+            num_computed_tokens_np=np.array(
+                [
+                    starts[s.global_batch_req_idx]
+                    + s.global_batch_slice.start
+                    - query_start[s.global_batch_req_idx]
+                    for s in segments
+                ],
+                dtype=np.int32,
+            ),
+            query_start_loc_np=np.concatenate(([0], local_lens.cumsum())),
+            is_prefilling_np=np.array(
+                [prefilling[s.global_batch_req_idx] for s in segments], dtype=np.bool_
+            ),
+        )
+        plan = build_kcp_plan(manager, torch.device("cpu"))
+        if prefix_kind in ("fresh", "continued"):
+            assert plan is None  # Uniform fallback, including ranks without the token.
+            continue
+        assert plan is not None
+        assert plan.num_block_tokens == prefix
+        if plan.num_scan_rows == 0:
+            assert plan.scan_chunk_indices.shape == (0, 2)
+            continue
+        prefill_segments = [s for s in segments if prefilling[s.global_batch_req_idx]]
+        for scan_idx, segment in enumerate(prefill_segments):
+            indices = plan.halo_tail_idx[scan_idx]
+            actual = torch.where(
+                indices >= 0, tails.flatten()[indices.clamp(min=0)], 9 + indices
+            )
+            start = 9 + segment.global_batch_slice.start - prefix
+            torch.testing.assert_close(actual, torch.arange(start - 3, start))

@@ -676,6 +676,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.slot_mapping_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int64,
@@ -694,11 +695,21 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
         if positions is not None:
-            slot_mapping_buffer = self.slot_mapping_buffer[
-                : slot_mapping.numel()
-            ].view_as(slot_mapping)
+            num_slot_tokens = slot_mapping.numel()
+            base = slot_mapping
+            if self.pcp_world_size > 1:
+                # The incoming slot mapping is expanded across the PCP group.
+                # Compute tail slots for this rank's local rows only, then
+                # all-gather; the kpool op reorders to the global batch order.
+                num_slot_tokens //= self.pcp_world_size
+                base = self.slot_mapping_buffer[:num_slot_tokens]
+                # Padding rows never carry a tail slot.
+                base.fill_(-1)
+            slot_mapping_buffer = self.slot_mapping_buffer[:num_slot_tokens].view_as(
+                base[:num_slot_tokens]
+            )
             slot_mapping = compute_kpool_tail_slot_mapping(
-                slot_mapping,
+                base[:num_slot_tokens],
                 common_attn_metadata.block_table_tensor,
                 common_attn_metadata.query_start_loc,
                 positions,
@@ -707,6 +718,8 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
                 self.kv_cache_spec.block_size,
                 out=slot_mapping_buffer,
             )
+            if self.pcp_world_size > 1:
+                slot_mapping = get_pcp_group().all_gather(slot_mapping, dim=0)
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,

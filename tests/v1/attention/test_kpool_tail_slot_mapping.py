@@ -215,8 +215,9 @@ def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
     )
 
 
-def make_tail_builder(block_size=KPOOL, max_num_batched_tokens=128):
+def make_tail_builder(block_size=KPOOL, max_num_batched_tokens=128, pcp_world_size=1):
     builder = object.__new__(KpoolTailMetadataBuilder)
+    builder.pcp_world_size = pcp_world_size
     builder.kv_cache_spec = SimpleNamespace(block_size=block_size)
     builder.slot_mapping_buffer = torch.empty(max_num_batched_tokens, dtype=torch.int64)
     return builder
@@ -367,3 +368,23 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
 
     # The circular mapping keeps the rings isolated under interleaving.
     torch.testing.assert_close(circular, ground_truth)
+
+
+def test_pcp_tail_mapping_gathers_local_circular_slots(monkeypatch):
+    from vllm.v1.attention.backends.mla import indexer
+
+    builder = make_tail_builder(max_num_batched_tokens=7, pcp_world_size=4)
+    metadata = make_common_metadata([[9, 10, 11]], [5])
+    metadata.slot_mapping = torch.full((28,), -1, dtype=torch.int64)
+    expected_local = torch.tensor([21, 22, 23, -1, -1, -1, -1])
+
+    def gather(local, dim):
+        assert dim == 0
+        torch.testing.assert_close(local, expected_local)
+        return local.repeat(4)
+
+    monkeypatch.setattr(
+        indexer, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather)
+    )
+    result = builder.build(0, metadata)
+    torch.testing.assert_close(result.slot_mapping, expected_local.repeat(4))
