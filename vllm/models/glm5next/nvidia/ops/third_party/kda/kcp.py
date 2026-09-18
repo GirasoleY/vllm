@@ -43,10 +43,9 @@ logger = init_logger(__name__)
 
 
 @triton.autotune(
-    # The key dims are architectural constants for GLM KDA (H=64, K=V=128,
-    # BT=64), so a single measured-best GB300 config: a one-entry autotune
-    # skips benchmarking and the first KCP step stays fast.
-    configs=[triton.Config({}, num_warps=4, num_stages=2)],
+    # A single configuration avoids autotuning at the first KCP step.
+    # Eight warps keep the IEEE FP32 state chain in registers on SM103.
+    configs=[triton.Config({}, num_warps=8, num_stages=1)],
     key=["H", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
