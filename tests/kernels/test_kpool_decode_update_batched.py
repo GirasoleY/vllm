@@ -581,3 +581,167 @@ def test_batched_matches_reference_fuzz(seed):
     r_ref = _torch_reference(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     r_kern = _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     _assert_eq(r_ref, r_kern)
+
+
+def _make_shared_cache_writer_case(uniform):
+    """Mixed requests with distinct cache pages and poisoned padding/storage."""
+    torch.manual_seed(123)
+    lens = [3, 3 if uniform else 1, 35, 3]
+    starts = [13, 13 if uniform else 15, 0, 32]
+    blocks = [3, 5, 7, 9]
+    positions = torch.cat(
+        [torch.arange(s, s + n, device="cuda") for s, n in zip(starts, lens)]
+    )
+    block = torch.repeat_interleave(
+        torch.tensor(blocks, device="cuda"), torch.tensor(lens, device="cuda")
+    )
+    slots = torch.where(
+        positions % POOL_SIZE == POOL_SIZE - 1,
+        block * PAGE_SIZE + positions // POOL_SIZE,
+        -1,
+    )
+    tail_slots = block * POOL_SIZE + positions % POOL_SIZE
+    key = torch.randn(sum(lens), HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    score = torch.randn_like(key)
+    # An unwritten tail element remains poison, so missing/stray stores are visible.
+    kv, tail = _make_caches()
+    kv.fill_(0xA5)
+    tail.fill_(-91)
+    for request in range(2):
+        _seed_prior(tail, [blocks[request]], starts[request] % POOL_SIZE, 41 + request)
+    return dict(
+        lens=lens,
+        starts=starts,
+        kv=kv,
+        tail=tail,
+        key=key,
+        score=score,
+        ape=torch.randn(POOL_SIZE, HEAD_DIM, device="cuda", dtype=torch.float32),
+        slots=slots,
+        tail_slots=tail_slots,
+        positions=positions,
+    )
+
+
+def _run_shared_cache_writer(case, use_pcp, monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm.models.glm5next.nvidia import sparse_indexer as indexer
+    from vllm.v1.worker.gpu import pcp_manager as pcp_module
+
+    kv, tail = case["kv"].clone(), case["tail"].clone()
+    key, score, slots, tail_slots, positions = (
+        case[name] for name in ("key", "score", "slots", "tail_slots", "positions")
+    )
+    lens = case["lens"]
+    num_decode = sum(lens[:2])
+    write_args = (kv, tail, case["ape"], POOL_SIZE, HEAD_DIM, ROUND_SCALE)
+    if use_pcp:
+        manager = pcp_module.PCPManager(4, 0, key.device)
+        lengths = np.asarray(lens, dtype=np.int32)
+        is_prefilling = np.asarray([False, False, True, True])
+        segments, counts = manager._build_batch_layout(
+            lengths,
+            np.asarray(case["starts"], dtype=np.int32),
+            is_prefilling,
+            np.asarray([0, *np.cumsum(lengths)], dtype=np.int32),
+            padded_num_tokens=sum(lens),
+        )
+        manager._global_batch = SimpleNamespace(
+            is_prefilling_np=is_prefilling,
+            num_scheduled_tokens=lengths,
+            positions=positions,
+        )
+        gathered = []
+        for values in (key, score):
+            payload = values.new_full((4, sum(lens), HEAD_DIM), float("nan"))
+            for rank, rank_segments in enumerate(segments):
+                for segment in rank_segments:
+                    payload[rank, segment.rank_local_batch_slice] = values[
+                        segment.global_batch_slice
+                    ]
+            gathered.append(payload.flatten(0, 1))
+        local_key, local_score = (value[: sum(lens)] for value in gathered)
+        payloads = {
+            local_key.data_ptr(): gathered[0],
+            local_score.data_ptr(): gathered[1],
+        }
+        group = SimpleNamespace(
+            all_gather=lambda value, dim=0: payloads[value.data_ptr()]
+        )
+        monkeypatch.setattr(pcp_module, "get_pcp_group", lambda: group)
+        cache_slots = manager._convert_to_gathered_slot_mappings(
+            torch.stack((slots, tail_slots))
+        )
+        indexer._kpool_pcp_cache_update(
+            manager,
+            local_key,
+            local_score,
+            cache_slots[0],
+            cache_slots[1],
+            *write_args,
+        )
+        assert max(counts) < sum(lens)  # Every rank includes poisoned padding.
+    else:
+        # Padding is present in native graph batches but cannot write either cache.
+        key = torch.cat((key, key.new_full((2, HEAD_DIM), float("nan"))))
+        score = torch.cat((score, score.new_full((2, HEAD_DIM), float("nan"))))
+        slots = torch.cat((slots, slots.new_full((2,), -1)))
+        tail_slots = torch.cat((tail_slots, tail_slots.new_full((2,), -1)))
+        indexer._kpool_prefill_cache_update(
+            key[num_decode:],
+            score[num_decode:],
+            slots[num_decode:],
+            tail_slots[num_decode:],
+            *write_args,
+        )
+        indexer._kpool_decode_cache_update(
+            key,
+            score,
+            slots,
+            positions,
+            tail_slots,
+            *write_args,
+            num_requests=2,
+            num_decode_tokens=num_decode,
+            use_uniform=lens[0] == lens[1],
+            group_lens=torch.tensor(lens[:2], device="cuda", dtype=torch.int32),
+            lmax=max(lens[:2]),
+        )
+    return kv, tail
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA kpool PCP writer")
+@pytest.mark.parametrize("uniform", [False, True], ids=["ragged", "uniform"])
+@pytest.mark.parametrize("use_pcp", [False, True], ids=["native", "pcp"])
+def test_shared_cache_writer_matches_request_order(uniform, use_pcp, monkeypatch):
+    """Mixed native/PCP writes equal independent per-request cache updates.
+
+    The oracle runs the existing decode kernel directly on each unpartitioned
+    request. It does not use the new grouping, prefill, or PCP writer helpers.
+    """
+    case = _make_shared_cache_writer_case(uniform)
+    expected_kv, expected_tail = case["kv"].clone(), case["tail"].clone()
+    offset = 0
+    for length in case["lens"]:
+        span = slice(offset, offset + length)
+        kpool_decode_update_and_maybe_write_cache_batched(
+            expected_kv,
+            expected_tail,
+            case["tail_slots"][span].unsqueeze(0),
+            case["key"][span].unsqueeze(0),
+            case["score"][span].unsqueeze(0),
+            case["ape"],
+            case["slots"][span].unsqueeze(0),
+            case["positions"][span].to(torch.int32).unsqueeze(0),
+            POOL_SIZE,
+            HEAD_DIM,
+            round_scale=ROUND_SCALE,
+        )
+        offset += length
+    _assert_eq(
+        (expected_kv, expected_tail),
+        _run_shared_cache_writer(case, use_pcp, monkeypatch),
+    )
