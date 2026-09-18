@@ -424,8 +424,10 @@ def test_kcp_merge_preserves_partial_states_and_contiguous_output(
     assert initial.is_contiguous() and final.is_contiguous()
 
 
-@pytest.mark.parametrize("lengths", [[], [0, 0], [64, 97]])
-def test_kcp_summary_destination_coverage(lengths):
+@pytest.mark.parametrize(
+    ("heads", "lengths"), [(2, []), (2, [0, 0]), (2, [64, 97]), (64, [2048, 2048])]
+)
+def test_kcp_summary_destination_coverage(heads, lengths):
     from itertools import accumulate
 
     from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import (
@@ -433,14 +435,28 @@ def test_kcp_summary_destination_coverage(lengths):
     )
 
     torch.manual_seed(53173)
-    heads, dim, tokens = 2, 128, sum(lengths)
+    dim, tokens = 128, sum(lengths)
     shape = (1, tokens, heads, dim)
     kg = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.02
     u = torch.randn_like(kg)
     w = torch.randn_like(kg) * 0.02
     gate = torch.zeros(shape, device="cuda", dtype=torch.float32)
     cu = torch.tensor([0] + list(accumulate(lengths)), device="cuda", dtype=torch.int32)
-    expected = kcp_compute_summaries(kg, u, w, gate, cu, 64)
+    if heads == 64:
+        # Each one-segment call retains the combined reference launch.
+        ends = list(accumulate(lengths))
+        expected = torch.cat(
+            [
+                kcp_compute_summaries(
+                    *[tensor[:, start:end] for tensor in (kg, u, w, gate)],
+                    cu.new_tensor([0, end - start]),
+                    64,
+                )
+                for start, end in zip([0] + ends[:-1], ends)
+            ]
+        )
+    else:
+        expected = kcp_compute_summaries(kg, u, w, gate, cu, 64)
     out = torch.full((6, heads, dim, 2 * dim), 7.0, device="cuda")
     indices = torch.tensor([5, 1][: len(lengths)], device="cuda", dtype=torch.int64)
     # Poison all destinations so a missing producer store cannot pass.

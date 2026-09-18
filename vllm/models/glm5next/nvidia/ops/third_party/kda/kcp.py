@@ -36,6 +36,7 @@ import torch
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.op import exp2
 from vllm.triton_utils import tl, triton
 
@@ -65,6 +66,7 @@ def kcp_summary_fwd_kernel(
     BK1: tl.constexpr,
     output_indices=None,
     HAS_OUTPUT_INDICES: tl.constexpr = False,
+    SUMMARY_PART: tl.constexpr = 0,  # 0: combined, 1: S_ext, 2: M
 ):
     """Per-chunk affine transition summary with zero initial state.
 
@@ -72,6 +74,8 @@ def kcp_summary_fwd_kernel(
     S_ext [K, V] and columns [V, V + K) accumulate M [K, K], chained in fp32.
     """
     i_col, i_h = tl.program_id(0), tl.program_id(1)
+    if SUMMARY_PART == 2:
+        i_col += tl.cdiv(V, BLOCK_SIZE)
     i_n = tl.program_id(2).to(tl.int64)
     bos = tl.load(cu_seqlens + i_n).to(tl.int64)
     eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
@@ -87,7 +91,7 @@ def kcp_summary_fwd_kernel(
     gk += (bos * H + i_h) * K
     stride_k = H * K
 
-    if i_col * BLOCK_SIZE < V:
+    if SUMMARY_PART == 1 or (SUMMARY_PART == 0 and i_col * BLOCK_SIZE < V):
         # S_ext part: h += kg^T @ (u - w @ h), h decayed per inner chunk.
         v += (bos * H + i_h) * V
         stride_v = H * V
@@ -257,7 +261,7 @@ def kcp_compute_summaries(
     if N == 0:
         return hm
     grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), H, N)
-    kcp_summary_fwd_kernel[grid](
+    launch_args = dict(
         k=kg,
         v=u,
         w=w,
@@ -274,6 +278,21 @@ def kcp_compute_summaries(
         output_indices=output_indices,
         HAS_OUTPUT_INDICES=output_indices is not None,
     )
+    if (
+        H == 64
+        and K == V == 128
+        and BT == 64
+        and N == 2
+        and T >= 4096
+        and current_platform.is_device_capability(103, device_id=kg.device.index or 0)
+    ):
+        # Separate compilation avoids imposing the IEEE M resources on S_ext.
+        for part in (1, 2):
+            kcp_summary_fwd_kernel[(triton.cdiv(V, BLOCK_SIZE), H, N)](
+                **launch_args, SUMMARY_PART=part
+            )
+    else:
+        kcp_summary_fwd_kernel[grid](**launch_args)
     return hm
 
 
