@@ -389,3 +389,37 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("group_size", [128, 192])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_causal_conv1d_grouped_output_matches_packed(group_size, state_dtype):
+    """Split-QKV stores preserve ragged outputs and cached states exactly."""
+    set_random_seed(0)
+    channels, tokens = 3 * group_size, 14
+    projected = torch.randn(tokens, channels + 64, device=DEVICE, dtype=torch.bfloat16)
+    x = projected[:, :channels].transpose(0, 1)
+    weight = torch.randn(channels, 4, device=DEVICE, dtype=torch.float32)
+    bias = torch.randn(channels, device=DEVICE, dtype=torch.float32)
+    states = torch.randn(5, channels, 3, device=DEVICE, dtype=state_dtype)
+    split_states = states.clone()
+    kwargs = dict(
+        query_start_loc=torch.tensor(
+            [0, 3, 12, 12, 14], device=DEVICE, dtype=torch.int32
+        ),
+        cache_indices=torch.tensor([2, 4, 0, 0], device=DEVICE, dtype=torch.int32),
+        has_initial_state=torch.tensor([True, False, False, False], device=DEVICE),
+        activation="silu",
+    )
+    packed = causal_conv1d_fn(x, weight, bias, conv_states=states, **kwargs)
+    split = causal_conv1d_fn(
+        x, weight, bias, conv_states=split_states, output_groups=3, **kwargs
+    )
+    assert split.shape == (3, tokens, group_size)
+    assert all(part.is_contiguous() for part in split.unbind(0))
+    # The null-cache request's final two tokens are deliberately unwritten.
+    for actual, expected in zip(
+        split.unbind(0), packed.transpose(0, 1).split(group_size, -1)
+    ):
+        torch.testing.assert_close(actual[:12], expected[:12], rtol=0, atol=0)
+    torch.testing.assert_close(split_states, states, rtol=0, atol=0)

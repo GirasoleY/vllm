@@ -748,7 +748,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 has_initial_state=plan.conv_all_initial,
                 query_start_loc=plan.scan_cu_seqlens,
                 metadata=plan.conv_meta,
-            ).transpose(0, 1)
+                output_groups=3,
+            )
         else:
             # No local rows: still join the group collectives with empty
             # contributions so all ranks stay in lockstep.
@@ -770,10 +771,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         else:
             # WY representation of the local chunk rows (same kernels as the
             # scan).
-            q_loc, k_loc, v_loc = conv_out.split(self.local_projection_size, dim=-1)
-            q_loc = l2norm_fwd(q_loc.reshape(1, -1, H, D).contiguous())
-            k_loc = l2norm_fwd(k_loc.reshape(1, -1, H, D).contiguous())
-            v_loc = v_loc.reshape(1, -1, H, D).contiguous()
+            assert conv_out is not None
+            q_loc, k_loc, v_loc = conv_out.unbind(0)
+            q_loc = l2norm_fwd(q_loc.reshape(1, -1, H, D))
+            k_loc = l2norm_fwd(k_loc.reshape(1, -1, H, D))
+            v_loc = v_loc.reshape(1, -1, H, D)
             scale = D**-0.5
             g = fused_kda_gate_chunk_cumsum(
                 g1_scan,
@@ -987,8 +989,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+                output_groups=3,
+            )
+            q_ns, k_ns, v_ns = qkv_ns.unbind(0)
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
