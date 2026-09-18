@@ -795,7 +795,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 output_dtype=torch.float32,
             )
             A = solve_tril(
-                A=A, cu_seqlens=plan.scan_cu_seqlens, output_dtype=k_loc.dtype
+                A=A,
+                cu_seqlens=plan.scan_cu_seqlens,
+                chunk_indices=plan.scan_chunk_indices,
+                output_dtype=k_loc.dtype,
             )
             w, u, _, kg = recompute_w_u_fwd(
                 k=k_loc,
