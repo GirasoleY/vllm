@@ -550,6 +550,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 attn_metadata,
             )
 
+        prefill_out = None
+        if plan.prefill_src_range is not None and core_attn_out.is_contiguous():
+            prefill_out = plan.select_prefill_tokens(core_attn_out, dim=1)
+
         # Runs even when this rank owns no chunk rows: the collectives inside
         # are group-wide and the merge/cache seeding is replicated.
         o_loc = self._forward_kcp_prefill(
@@ -562,8 +566,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             recurrent_state,
             plan,
             attn_metadata,
+            out=prefill_out,
         )
-        if plan.num_scan_rows:
+        if plan.num_scan_rows and prefill_out is None:
             core_attn_out[0, plan.prefill_src_idx] = o_loc
 
     def _forward_kcp_block(
@@ -689,6 +694,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         recurrent_state: torch.Tensor,
         plan: "kcp.KcpPlan",
         attn_metadata: GDNAttentionMetadata,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Chunked KDA scan of this rank's prefill chunk slots with KCP state
         stitching (summaries -> all-gather -> merge -> seeded scan)."""
@@ -861,7 +867,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             g=g,
             A=Aqk,
             h=h,
-            o=v_loc.new_empty(1, plan.prefill_src_idx.shape[0], H, D),
+            o=(
+                out
+                if out is not None
+                else v_loc.new_empty(1, plan.prefill_src_idx.shape[0], H, D)
+            ),
             scale=scale,
             cu_seqlens=plan.scan_cu_seqlens,
             chunk_indices=plan.scan_chunk_indices,

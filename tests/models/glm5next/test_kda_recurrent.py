@@ -462,3 +462,63 @@ def test_kcp_summary_destination_coverage(lengths):
             atol=0,
             rtol=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("indices", "token_range", "strided"),
+    [
+        ([0, 1, 2], (0, 3), False),
+        ([2, 3, 4], (2, 5), False),
+        ([4, 2, 3], None, False),
+        ([2, 3, 4], (2, 5), True),
+        ([], (0, 0), False),
+    ],
+)
+def test_kcp_output_destination_preserves_other_tokens(indices, token_range, strided):
+    """Direct prefill writes preserve decode output, padding and strided storage."""
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
+    from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import KcpPlan
+
+    storage = torch.full((1, 7, 1, 4 if strided else 2), -777.0)
+    output = storage[..., ::2] if strided else storage
+    expected = storage.clone()
+    expected_output = expected[..., ::2] if strided else expected
+    values = torch.arange(len(indices) * 2).reshape(len(indices), 1, 2).float()
+    prefix = min(indices) if indices else 0
+    expected_output[:, :prefix] = 42
+    expected_output[0, indices] = values
+    plan = object.__new__(KcpPlan)
+    plan.prefill_src_idx = torch.tensor(indices, dtype=torch.int64)
+    plan.prefill_src_range = token_range
+    plan.num_scan_rows = int(bool(indices))
+    plan.num_block_tokens = prefix
+    destinations = []
+
+    def prefill(*args, out=None):
+        destinations.append(out)
+        if out is not None:
+            out[0].copy_(values)
+        return values
+
+    def block(*args):
+        args[5][:, :prefix] = 42
+
+    empty = torch.empty(0)
+    layer = SimpleNamespace(
+        kv_cache=(empty, empty),
+        _conv_state_dim_first=True,
+        _merged_conv_weight=empty,
+        q_conv1d=SimpleNamespace(bias=None),
+        _forward_kcp_prefill=prefill,
+        _forward_kcp_block=block,
+    )
+    forward = Glm5NextLinearAttention._forward_kcp
+    forward(layer, empty, empty, empty, empty, output, plan, None)
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+    assert len(destinations) == 1  # Empty ranks must still participate.
+    if token_range is not None and not strided:
+        assert destinations[0].untyped_storage().data_ptr() == storage.data_ptr()
+    else:
+        assert destinations[0] is None
