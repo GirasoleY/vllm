@@ -752,15 +752,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # No local rows: still join the group collectives with empty
             # contributions so all ranks stay in lockstep.
             qkv_scan = qkv_proj_states.new_empty(0, C)
-            scratch = conv_state.new_zeros(1, C, 3)
             conv_out = None
-            kcp.gather_conv_tail_rows(plan, qkv_scan)
-
-        # Seed every request's conv-state cache slot with its sequence-final
-        # window (identical on every rank, keeping the replicas coherent).
-        windows = kcp.gather_conv_windows(plan, scratch[1:])
-        final_windows = windows.reshape(-1, C, 3)[plan.final_win_idx]
-        conv_state[state_slots, :, : final_windows.size(-1)] = final_windows
+            tails = kcp.gather_conv_tail_rows(plan, qkv_scan)
 
         if not T_loc:
             # No local rows: no WY/summary compute, but the group collectives
@@ -824,8 +817,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         slots_hm = kcp.gather_slot_summaries(plan, hm)
         base = gather_initial_states(recurrent_state, state_slots, has_init)
         inits, final = kcp.kcp_merge_states(slots_hm, base.float(), plan.num_slots_dev)
-        # Every rank seeds the sequence-final state into the cache replica.
-        scatter_states(recurrent_state, final, state_slots)
+        # The first raw-tail gather also determines the final convolution
+        # window; publish both caches without exchanging that window again.
+        scatter_states(
+            recurrent_state,
+            final,
+            state_slots,
+            conv_state=conv_state,
+            conv_tail=tails.reshape(-1, C),
+            conv_tail_indices=plan.final_tail_idx,
+            has_initial_state=has_init,
+        )
 
         if not T_loc:
             return qkv_proj_states.new_empty(0, H, D)

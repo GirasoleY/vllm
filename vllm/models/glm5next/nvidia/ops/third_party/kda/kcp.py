@@ -432,7 +432,7 @@ class KcpPlan:
     halo_tail_idx: torch.Tensor  # [N_loc, 3] int64; -3..-1 address cached prefix
     num_slots_dev: torch.Tensor  # [N] int32, non-empty chunk slots per request
     prefill_entry_idx: torch.Tensor  # [N] int64, index into non-spec metadata rows
-    final_win_idx: torch.Tensor  # [N] int64, into slot-ordered [S * N] conv windows
+    final_tail_idx: torch.Tensor  # [N, 3] int64; -3..-1 address cached prefix
     # Non-KCP (block) rows: gathered and computed redundantly on every rank.
     num_block_tokens: int  # D_g
     block_cap: int  # per-rank padded block-token count used for the all-gather
@@ -651,6 +651,17 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
             else:
                 halo_tail[row_i, j] = w_col - 3
 
+    final_tail = np.empty((N_pf, 3), dtype=np.int64)
+    for n, g in enumerate(n_list):
+        for j in range(3):
+            pos = int(q_g[g]) - 3 + j
+            if pos < 0:
+                final_tail[n, j] = pos
+            else:
+                slot = pos // int(cs[n])
+                column = 3 + pos - slot * int(cs[n]) - int(slot_len[n, slot])
+                final_tail[n, j] = (slot * N_pf + n) * 3 + column
+
     prefill_start = scan_rows[0][2] if scan_rows else 0
     prefill_src_range = (
         (prefill_start, prefill_start + cu[-1])
@@ -723,9 +734,7 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
         halo_tail_idx=to_gpu_i64(halo_tail),
         num_slots_dev=torch.tensor(num_slots_np, dtype=torch.int32, device=device),
         prefill_entry_idx=to_gpu_i64(prefill_entry),
-        final_win_idx=to_gpu_i64(
-            (num_slots_np.astype(np.int64) - 1) * N_pf + np.arange(N_pf)
-        ),
+        final_tail_idx=to_gpu_i64(final_tail),
         num_block_tokens=D_g,
         block_cap=cap,
         block_src_idx=to_gpu_i64(block_src),

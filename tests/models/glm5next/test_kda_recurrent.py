@@ -189,7 +189,10 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
 @pytest.mark.parametrize(
     ("query_len", "prefix_kind"),
     [
+        (2, None),
         (3, None),
+        (17, None),
+        (32769, None),
         (32768, "fresh"),
         (32768, "continued"),
         (32768, "decode"),
@@ -259,6 +262,15 @@ def test_kcp_plan_preserves_short_continuation_halos_and_empty_ranks(
         assert plan is not None
         assert plan.num_block_tokens == prefix
         assert plan.prefill_src_range == (prefix, int(local_lens.sum()))
+        final_indices = plan.final_tail_idx[0]
+        final_window = torch.where(
+            final_indices >= 0,
+            tails.flatten()[final_indices.clamp(min=0)],
+            9 + final_indices,
+        )
+        torch.testing.assert_close(
+            final_window, torch.arange(9 + query_len - 3, 9 + query_len)
+        )
         if plan.num_scan_rows == 0:
             assert plan.scan_chunk_indices.shape == (0, 2)
             continue
@@ -270,6 +282,58 @@ def test_kcp_plan_preserves_short_continuation_halos_and_empty_ranks(
             )
             start = 9 + segment.global_batch_slice.start - prefix
             torch.testing.assert_close(actual, torch.arange(start - 3, start))
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dim_first", [True, False])
+def test_kcp_scatter_publishes_final_conv_window(cache_dtype, dim_first):
+    """Raw tails and old prefixes update only live cache columns on every rank."""
+    from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
+
+    torch.manual_seed(7)
+    device = "cuda"
+    channels = 3 * 2 * 128
+    shape = (6, channels, 5) if dim_first else (6, 5, channels)
+    conv = torch.randn(shape, dtype=cache_dtype, device=device)
+    if not dim_first:
+        conv = conv.transpose(1, 2)
+    expected_conv = conv.clone()
+    tails = torch.randn(9, channels + 5, dtype=torch.bfloat16, device=device)[
+        :, :channels
+    ]
+    indices = torch.tensor([4, 0, 2, 0, 1, 0], device=device)[::2]
+    tail_indices = torch.tensor([[-1, 2, 5], [6, 7, 8], [-1, 0, 3]], device=device)
+    has_initial = torch.tensor([True, True, False], device=device)
+    expected_conv[4, :, :3] = torch.stack(
+        (conv[4, :, 2], tails[2].to(cache_dtype), tails[5].to(cache_dtype)), dim=1
+    )
+    expected_conv[2, :, :3] = tails[6:9].transpose(0, 1).to(cache_dtype)
+    expected_conv[1, :, :3] = torch.stack(
+        (
+            torch.zeros_like(conv[1, :, 0]),
+            tails[0].to(cache_dtype),
+            tails[3].to(cache_dtype),
+        ),
+        dim=1,
+    )
+    state = torch.randn(6, 2, 128, 128, device=device)
+    src = torch.randn(6, 2, 128, 128, device=device)[::2]
+    expected_state = state.clone()
+    expected_state[indices] = src
+    default_state = state.clone()
+    scatter_states(default_state, src, indices)
+    scatter_states(
+        state,
+        src,
+        indices,
+        conv_state=conv,
+        conv_tail=tails,
+        conv_tail_indices=tail_indices,
+        has_initial_state=has_initial,
+    )
+    torch.testing.assert_close(default_state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
