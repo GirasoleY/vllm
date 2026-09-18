@@ -466,11 +466,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
         if kcp_plan is not None:
-            core_attn_out = torch.zeros(
+            core_attn_out = torch.empty(
                 (1, num_tokens, self.local_num_heads, self.head_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+            # The existing scan producer overwrites this entire dense span.
+            # Mixed, padded, or empty-rank buffers keep defined zero padding.
+            if kcp_plan.has_block or kcp_plan.prefill_src_range != (0, num_tokens):
+                core_attn_out.zero_()
             self._forward_kcp(
                 hidden_states=hidden_states,
                 qkv_proj_states=qkv,

@@ -522,3 +522,91 @@ def test_kcp_output_destination_preserves_other_tokens(indices, token_range, str
         assert destinations[0].untyped_storage().data_ptr() == storage.data_ptr()
     else:
         assert destinations[0] is None
+
+
+@pytest.mark.parametrize("chunk_size", [16, 32, 64])
+@pytest.mark.parametrize("use_tma", [False, True])
+@torch.inference_mode()
+def test_kda_matrices_overwrite_poisoned_storage(monkeypatch, chunk_size, use_tma):
+    """Upper triangles and ragged tails must not depend on reused storage."""
+    import importlib
+
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import kernels
+    from vllm.triton_utils import triton
+
+    solve = importlib.import_module(
+        "vllm.third_party.flash_linear_attention.ops.solve_tril"
+    )
+    if use_tma and (
+        torch.cuda.get_device_capability()[0] < 9
+        or not any(
+            hasattr(triton.language, name)
+            for name in (
+                "make_tensor_descriptor",
+                "_experimental_make_tensor_descriptor",
+            )
+        )
+    ):
+        pytest.skip("TMA descriptors require supported NVIDIA hardware and Triton")
+    if use_tma:
+        from vllm.triton_utils.allocation import set_triton_allocator
+
+        set_triton_allocator(torch.device("cuda"))
+    monkeypatch.setattr(solve, "is_tma_supported", use_tma)
+    torch.manual_seed(0)
+    lengths = [0, 1, chunk_size - 1, chunk_size + 1]
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    cu = torch.tensor(starts, device="cuda", dtype=torch.int32)
+    indices = torch.tensor(
+        [
+            [n, c]
+            for n, length in enumerate(lengths)
+            for c in range((length + chunk_size - 1) // chunk_size)
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    shape = (1, sum(lengths), 2, 128)
+    q, k = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.1 for _ in range(2)
+    ]
+    g = torch.zeros(shape, device="cuda", dtype=torch.float32)
+    beta = torch.full(shape[:-1], 0.1, device="cuda", dtype=torch.float32)
+
+    class OutputStorage:
+        def __init__(self, fill):
+            self.fill = fill
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+        def empty(self, *args, **kwargs):
+            return torch.empty(*args, **kwargs).fill_(self.fill)
+
+        def empty_like(self, *args, **kwargs):
+            return torch.empty_like(*args, **kwargs).fill_(self.fill)
+
+    outputs = []
+    for fill in (0.0, float("nan")):
+        storage = OutputStorage(fill)
+        monkeypatch.setattr(kernels, "torch", storage)
+        monkeypatch.setattr(solve, "torch", storage)
+        a, aqk = kernels.chunk_kda_scaled_dot_kkt_fwd(
+            q,
+            k,
+            g,
+            beta,
+            scale=128**-0.5,
+            cu_seqlens=cu,
+            chunk_indices=indices,
+            chunk_size=chunk_size,
+        )
+        inverse = solve.solve_tril(
+            a, cu_seqlens=cu, chunk_indices=indices, output_dtype=torch.bfloat16
+        )
+        outputs.append((a, aqk, inverse))
+    for expected, actual in zip(*outputs, strict=True):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

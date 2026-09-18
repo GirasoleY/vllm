@@ -225,6 +225,20 @@ def merge_16x16_to_32x32_inverse_kernel(
         )
 
 
+    # Match the defined triangular output contract in the existing producer.
+    b_zero = tl.full((16, 16), 0, tl.float32)
+    for i in tl.static_range(BT // 16):
+        for j in tl.static_range(i + 1, BT // 16):
+            if USE_TMA:
+                desc_o.store([i_t * BT + i * 16, j * 16], b_zero.to(desc_o.dtype))
+            else:
+                p_upper = tl.make_block_ptr(
+                    Ai, (T, BT), (H * BT, 1),
+                    (i_t * BT + i * 16, j * 16), (16, 16), (1, 0)
+                )
+                tl.store(p_upper, b_zero.to(Ai.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
@@ -503,6 +517,20 @@ def merge_16x16_to_64x64_inverse_kernel(
         )
 
 
+    # Match the defined triangular output contract in the existing producer.
+    b_zero = tl.full((16, 16), 0, tl.float32)
+    for i in tl.static_range(BT // 16):
+        for j in tl.static_range(i + 1, BT // 16):
+            if USE_TMA:
+                desc_o.store([i_t * BT + i * 16, j * 16], b_zero.to(desc_o.dtype))
+            else:
+                p_upper = tl.make_block_ptr(
+                    Ai, (T, BT), (H * BT, 1),
+                    (i_t * BT + i * 16, j * 16), (16, 16), (1, 0)
+                )
+                tl.store(p_upper, b_zero.to(Ai.dtype.element_ty), boundary_check=(0, 1))
+
+
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -536,7 +564,7 @@ def solve_tril(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    Ai = torch.zeros_like(A, dtype=output_dtype)
+    Ai = torch.empty_like(A, dtype=output_dtype)
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
