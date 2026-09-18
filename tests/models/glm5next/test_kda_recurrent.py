@@ -360,3 +360,43 @@ def test_kcp_prefill_selection_preserves_strided_values(indices, token_range):
                 == tensor.untyped_storage().data_ptr()
             )
             assert actual.stride() == tensor.stride()
+
+
+@pytest.mark.parametrize("counts", [[8], [8, 3, 0]])
+def test_kcp_merge_preserves_partial_states_and_contiguous_output(counts):
+    """The dense path and ragged path preserve state at every slot boundary."""
+    from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import (
+        kcp_merge_states_torch,
+    )
+
+    torch.manual_seed(7)
+    slots, heads, dim = 8, 2, 128
+    summaries = torch.randn(slots, len(counts), heads, dim, 2 * dim, device="cuda")
+    summaries *= 0.003
+    summaries[..., dim:] += 0.95 * torch.eye(dim, device="cuda")
+    original = summaries.clone()
+    base = torch.randn(len(counts), heads, dim, dim, device="cuda") * 0.2
+    expected_inits = base.new_empty(len(counts), slots, heads, dim, dim)
+    expected_final = torch.empty_like(base)
+    for request, count in enumerate(counts):
+        state = base[request]
+        for slot in range(slots):
+            expected_inits[request, slot] = state
+            if slot < count:
+                summary = original[slot, request]
+                state = state @ summary[..., dim:].transpose(-1, -2)
+                state = state + summary[..., :dim].transpose(-1, -2)
+        expected_final[request] = state
+
+    initial, final = kcp_merge_states_torch(
+        summaries,
+        base,
+        torch.tensor(counts, dtype=torch.int32, device="cuda"),
+        all_slots_full=all(count == slots for count in counts),
+    )
+    torch.testing.assert_close(initial, expected_inits, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(final, expected_final, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        summaries[..., dim:], original[..., dim:], atol=0, rtol=0
+    )
+    assert initial.is_contiguous() and final.is_contiguous()

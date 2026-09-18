@@ -816,7 +816,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
         slots_hm = kcp.gather_slot_summaries(plan, hm)
         base = gather_initial_states(recurrent_state, state_slots, has_init)
-        inits, final = kcp.kcp_merge_states(slots_hm, base.float(), plan.num_slots_dev)
+        inits, final = kcp.kcp_merge_states(
+            slots_hm,
+            base.float(),
+            plan.num_slots_dev,
+            all_slots_full=plan.all_slots_full,
+        )
         # The first raw-tail gather also determines the final convolution
         # window; publish both caches without exchanging that window again.
         scatter_states(

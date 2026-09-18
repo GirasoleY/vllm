@@ -321,10 +321,16 @@ def kcp_merge_states_torch(
     slots_hm: torch.Tensor,
     base_state: torch.Tensor,
     num_slots: torch.Tensor,
+    *,
+    all_slots_full: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chain-merge slot summaries via batched cuBLAS bmms (same math as the
     Triton kernel, but fully parallel across N*H per step instead of one
-    sequential dot per (v-block, request, head) block)."""
+    sequential dot per (v-block, request, head) block).
+
+    Consumes the S_ext portion of slots_hm as scratch. all_slots_full must
+    come from the CPU plan and certify that every request has all S slots.
+    """
     S, N, H, K, VK = slots_hm.shape
     V = VK - K
     init_states = slots_hm.new_empty(N, S, H, V, K)
@@ -333,30 +339,44 @@ def kcp_merge_states_torch(
         init_states[:, c] = h
         m_c = slots_hm[c, ..., V:]  # [N,H,K,K]
         se_c = slots_hm[c, ..., :V].transpose(-1, -2)  # [N,H,V,K]
-        h_new = torch.matmul(h, m_c.transpose(-1, -2)) + se_c
-        h = torch.where((c < num_slots).view(N, 1, 1, 1), h_new, h)
-    return init_states, h
+        se_c.view(N * H, V, K).baddbmm_(
+            h.reshape(N * H, V, K),
+            m_c.transpose(-1, -2).view(N * H, K, K),
+        )
+        h = (
+            se_c
+            if all_slots_full
+            else torch.where((c < num_slots).view(N, 1, 1, 1), se_c, h)
+        )
+    # The cache scatter consumes a contiguous state for each request.
+    return init_states, h.contiguous()
 
 
 def kcp_merge_states(
     slots_hm: torch.Tensor,
     base_state: torch.Tensor,
     num_slots: torch.Tensor,
+    *,
+    all_slots_full: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chain-merge slot-ordered [S_ext, M] summaries into initial/final states.
 
     Args:
         slots_hm: [S, N, H, K, V + K] fp32 summaries in global chunk order.
+            Owned scratch: the torch merge overwrites the S_ext portion.
         base_state: [N, H, V, K] fp32 per-request states at the step start
             (zeros for fresh prefills).
         num_slots: [N] int32 non-empty chunk count per request.
+        all_slots_full: CPU-planned guarantee that every request has all S slots.
 
     Returns:
         (initial states [N, S, H, V, K] fp32, final states [N, H, V, K] fp32).
 
     """
     if envs.VLLM_KDA_KCP_MERGE != "kernel":
-        return kcp_merge_states_torch(slots_hm, base_state, num_slots)
+        return kcp_merge_states_torch(
+            slots_hm, base_state, num_slots, all_slots_full=all_slots_full
+        )
     S, N, H, K, _ = slots_hm.shape
     V = slots_hm.shape[-1] - K
     init_states = slots_hm.new_empty(N, S, H, V, K, dtype=torch.float32)
@@ -413,6 +433,7 @@ class KcpPlan:
     rank: int
     num_prefill_reqs: int  # N_pf
     num_slots: int  # 2 * world
+    all_slots_full: bool  # Every prefill request has all 2 * world slots.
     global_prefill_tokens: int
     # This rank's scan rows (chunk slots of KCP-prefill requests).
     num_scan_rows: int
@@ -695,6 +716,7 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
         rank=rank,
         num_prefill_reqs=N_pf,
         num_slots=S,
+        all_slots_full=bool(np.all(num_slots_np == S)),
         global_prefill_tokens=prefill_tokens,
         num_scan_rows=len(scan_rows),
         prefill_src_range=prefill_src_range,
