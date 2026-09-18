@@ -13,15 +13,47 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+
+
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_mamba_group_lookup_without_prefix_caching(monkeypatch, cache_mode):
+    def init_base(self, *args):
+        self.max_num_reqs = 2
+        self.device = torch.device("cpu")
+
+    monkeypatch.setattr(mamba_hybrid.DefaultModelState, "__init__", init_base)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_cache_mode=cache_mode,
+            use_kda_recoverssm=False,
+        )
+    )
+    state = MambaHybridModelState(
+        config, torch.nn.Identity(), None, torch.device("cpu")
+    )
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((4, 4),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode=cache_mode,
+    )
+    cache = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["linear"], spec)],
+    )
+    assert state._get_mamba_group_info(cache) == ([0], spec)
 
 
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     state = object.__new__(MambaHybridModelState)
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
     state.max_model_len = 8192
+    state.pcp_manager = None
     state._align_mode = False
     state.recoverssm = None
 

@@ -246,7 +246,29 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
     if i_t * BT + i_i * BC >= T:
         return
-    if i_i <= i_j:
+    if i_i < i_j:
+        # These already-launched CTAs define the upper tiles without a fill.
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + i_i * BC, i_j * BC),
+            (BC, BC),
+            (1, 0),
+        )
+        p_Aqk = tl.make_block_ptr(
+            Aqk + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + i_i * BC, i_j * BC),
+            (BC, BC),
+            (1, 0),
+        )
+        b_zero = tl.full((BC, BC), 0, tl.float32)
+        tl.store(p_A, b_zero.to(A.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Aqk, b_zero.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+        return
+    if i_i == i_j:
         return
 
     q += (bos * H + i_h) * K
@@ -391,7 +413,8 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
     p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
 
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+    valid_columns = min(BC, T - i_t * BT - i_i * BC)
+    for j in range(0, valid_columns):
         b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
         b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
         b_ktg = b_kt[None, :] * exp2(b_g - b_gk[None, :])
@@ -403,6 +426,11 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         tl.store(Aqk + o_A + j, b_Aqk, mask=m_A)
         p_kt += H * K
         p_gk += H * K
+
+    # Valid tokens still own all BT columns, including a short final tile.
+    for j in range(valid_columns, BC):
+        tl.store(A + o_A + j, 0.0, mask=m_A)
+        tl.store(Aqk + o_A + j, 0.0, mask=m_A)
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
@@ -453,8 +481,8 @@ def chunk_kda_scaled_dot_kkt_fwd(
     BC = min(16, BT)
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
-    A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
-    Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
     grid = (NT, NC * NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
         q=q,
@@ -663,7 +691,7 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     BK = 64
