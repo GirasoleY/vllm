@@ -406,6 +406,11 @@ class PCPManager:
         assert self._input_buffers is not None
         return self._input_buffers
 
+    @property
+    def global_batch(self) -> InputBatch | None:
+        """The unpartitioned scheduled batch for the current step."""
+        return self._global_batch
+
     def partition_batch(
         self,
         input_batch: InputBatch,
@@ -656,6 +661,8 @@ class PCPManager:
 
     def prepare_inputs_to_capture(self, input_batch: InputBatch) -> InputBatch:
         """Stage a capture or dummy batch in persistent PCP input buffers."""
+        # Capture/dummy batches must not reuse the preceding global cache inputs.
+        self._global_batch = None
         input_buffers = self.input_buffers
         num_reqs = input_batch.num_reqs_after_padding
         num_tokens = input_batch.num_tokens_after_padding
@@ -742,10 +749,21 @@ class PCPManager:
         )
         return gathered_kv_slot_mappings
 
-    def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def restore_hidden_states(
+        self, hidden_states: torch.Tensor, *, require_partition: bool = False
+    ) -> torch.Tensor:
+        if require_partition:
+            assert self._global_batch is not None
+            assert self._hidden_restore_idx is not None
         if self._hidden_restore_idx is None:
             return hidden_states
         gathered = get_pcp_group().all_gather(hidden_states, dim=0)
+        return gathered[self._hidden_restore_idx]
+
+    def reorder_gathered_to_global(self, gathered: torch.Tensor) -> torch.Tensor:
+        """Restore global token order for a tensor already in the padded
+        gathered layout (PCP-group all-gather concat), without the gather."""
+        assert self._hidden_restore_idx is not None
         return gathered[self._hidden_restore_idx]
 
     def get_draft_input_buffers(
