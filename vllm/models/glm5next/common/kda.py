@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+from typing import cast
+
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
@@ -48,6 +51,7 @@ else:
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
+        kcp,
     )
 
 
@@ -335,13 +339,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             max_seqs = vllm_config.scheduler_config.max_num_seqs
+            if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                max_seqs *= 2
             workspace_size = torch.ops._flashkda_C.get_workspace_size(
                 max_tokens, self.local_num_heads, max_seqs
             )
             self._flashkda_buffer_specs = (
                 (
                     (max_seqs, self.local_num_heads, self.head_dim, self.head_dim),
-                    self.get_state_dtype()[1],
+                    torch.float32
+                    if vllm_config.parallel_config.prefill_context_parallel_size > 1
+                    else self.get_state_dtype()[1],
                 ),
                 ((workspace_size,), torch.uint8),
                 # Output buffer for steps that also carry spec-decode tokens:
@@ -402,6 +410,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # positions is unused (NoPE), so only hidden_states is gathered.
+        forward_context = get_forward_context()
+        mgr = getattr(forward_context, "pcp_manager", None)
+        # Under hybrid PCP, KDA runs replicated on the global batch: gather the
+        # full sequence across the PCP group, compute with the global GDN
+        # metadata, and slice the output back to this rank's local rows. Dummy
+        # runs without metadata for this layer keep the local shapes.
+        attn_metadata = forward_context.attn_metadata
+        layer_metadata = (
+            attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
+        )
+        gather_replicate = (
+            mgr is not None and mgr.hybrid_kda_replicated and layer_metadata is not None
+        )
+        kcp_plan = None
+        if gather_replicate and self.kda_prefill_backend == "flashkda":
+            assert mgr is not None
+            kcp_plan = kcp.maybe_get_kcp_plan(mgr, envs.VLLM_KDA_KCP_MIN_TOKENS)
+        if gather_replicate and kcp_plan is None:
+            assert mgr is not None
+            hidden_states = mgr.restore_hidden_states(
+                hidden_states, require_partition=True
+            )
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
@@ -428,22 +459,330 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
-        core_attn_out = torch.empty(
-            (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        # Call the decorated eager break directly so host-side prefill branches
-        # are not captured by PIECEWISE CUDA graphs.
-        self._forward(
-            qkv_proj_states=qkv,
-            g1=g1,
-            beta=beta,
-            core_attn_out=core_attn_out,
-        )
+        if kcp_plan is not None:
+            core_attn_out = torch.empty(
+                (1, num_tokens, self.local_num_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            # The existing scan producer overwrites this entire dense span.
+            # Mixed, padded, or empty-rank buffers keep defined zero padding.
+            if kcp_plan.has_block or kcp_plan.prefill_src_range != (0, num_tokens):
+                core_attn_out.zero_()
+            self._forward_kcp(
+                hidden_states=hidden_states,
+                qkv_proj_states=qkv,
+                beta_raw=beta_raw,
+                g1=g1,
+                core_attn_out=core_attn_out,
+                plan=kcp_plan,
+                attn_metadata=cast("GDNAttentionMetadata", layer_metadata),
+            )
+        else:
+            core_attn_out = torch.empty(
+                (1, num_tokens, self.local_num_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            # Call the decorated eager break directly so host-side prefill branches
+            # are not captured by PIECEWISE CUDA graphs.
+            self._forward(
+                qkv_proj_states=qkv,
+                g1=g1,
+                beta=beta,
+                core_attn_out=core_attn_out,
+            )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        out = self.o_proj(core_attn_out)[0]
+        if gather_replicate and kcp_plan is None:
+            assert mgr is not None
+            out = mgr.scatter_to_local(out)
+        return out
+
+    @eager_break_during_capture
+    def _forward_kcp(
+        self,
+        hidden_states: torch.Tensor,
+        qkv_proj_states: torch.Tensor,
+        beta_raw: torch.Tensor,
+        g1: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        plan: "kcp.KcpPlan",
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        """KCP (two-pass parallel scan) forward for large prefill steps.
+
+        No hidden-state gather: projections and the chunked scan run on
+        rank-local chunk rows; only the tiny per-chunk [S_ext, M] summaries and
+        the conv halo tails cross ranks. Non-KCP requests (plain decodes,
+        single-token extends) are restored to global batch
+        order and computed on every rank to keep replicated caches coherent.
+        """
+        (conv_state, recurrent_state) = self.kv_cache
+        # conv_state must be (..., dim, width-1) for the conv kernels.
+        # DS layout stores it that way directly; SD layout needs a transpose.
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+        if self._merged_conv_weight is None:
+
+            def _w(m):
+                return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+            self._merged_conv_weight = torch.cat(
+                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                dim=0,
+            ).contiguous()
+        conv_weights = self._merged_conv_weight
+        conv_bias = self.q_conv1d.bias
+
+        if plan.has_block:
+            self._forward_kcp_block(
+                hidden_states,
+                conv_weights,
+                conv_bias,
+                conv_state,
+                recurrent_state,
+                core_attn_out,
+                plan,
+                attn_metadata,
+            )
+
+        prefill_out = None
+        if plan.prefill_src_range is not None and core_attn_out.is_contiguous():
+            prefill_out = plan.select_prefill_tokens(core_attn_out, dim=1)
+
+        # Runs even when this rank owns no chunk rows: the collectives inside
+        # are group-wide and the merge/cache seeding is replicated.
+        o_loc = self._forward_kcp_prefill(
+            qkv_proj_states,
+            g1,
+            beta_raw,
+            conv_weights,
+            conv_bias,
+            conv_state,
+            recurrent_state,
+            plan,
+            attn_metadata,
+            out=prefill_out,
+        )
+        if plan.num_scan_rows and prefill_out is None:
+            core_attn_out[0, plan.prefill_src_idx] = o_loc
+
+    def _forward_kcp_block(
+        self,
+        hidden_states: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        plan: "kcp.KcpPlan",
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        """Redundant all-rank compute of the non-KCP (block) rows."""
+        H = self.local_num_heads
+        D = self.head_dim
+        block_hidden = kcp.gather_block_hidden(plan, hidden_states)
+        proj = self.in_proj_qkvbfg_a(block_hidden)[0]
+        qkv_blk, beta_blk_raw, f_a_blk, _ = proj.split(
+            [3 * self.local_projection_size, H, D, D], dim=-1
+        )
+        g1_blk = self.f_b_proj(f_a_blk)[0].reshape(1, -1, H, D)
+        beta_blk = beta_blk_raw.unsqueeze(0)
+        assert attn_metadata.num_spec_decodes == 0
+        state_indices = attn_metadata.non_spec_state_indices_tensor
+        assert state_indices is not None
+        state_indices = state_indices[: plan.block_num_dec_reqs]
+        qkv_blk = causal_conv1d_update(
+            qkv_blk,
+            conv_state,
+            conv_weights,
+            conv_bias,
+            activation="silu",
+            conv_state_indices=state_indices,
+        )
+        q, k, v = qkv_blk.split(self.local_projection_size, dim=-1)
+        block_out, _ = fused_recurrent_kda(
+            q=q.reshape(1, -1, H, D),
+            k=k.reshape(1, -1, H, D),
+            v=v.reshape(1, -1, H, D),
+            g=g1_blk,
+            beta=beta_blk,
+            initial_state=recurrent_state,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=plan.block_cu_seqlens,
+            ssm_state_indices=state_indices,
+            sigmoid_beta=True,
+            a_log=self.A_log,
+            g_bias=self.dt_bias,
+            compute_gate=True,
+            lower_bound=self.kda_lower_bound,
+        )
+        core_attn_out[0, plan.nonprefill_out_dst] = block_out[
+            0, plan.nonprefill_out_src
+        ]
+
+    def _forward_kcp_prefill(
+        self,
+        qkv_proj_states: torch.Tensor,
+        g1: torch.Tensor,
+        beta_raw: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        plan: "kcp.KcpPlan",
+        attn_metadata: GDNAttentionMetadata,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Chunked KDA scan of this rank's prefill chunk slots with KCP state
+        stitching (summaries -> all-gather -> merge -> seeded scan)."""
+        H = self.local_num_heads
+        D = self.head_dim
+        N_pf = plan.num_prefill_reqs
+        C = 3 * self.local_projection_size
+        T_loc = plan.prefill_src_idx.shape[0]
+
+        non_spec_state_idx = attn_metadata.non_spec_state_indices_tensor
+        has_initial_state = attn_metadata.has_initial_state
+        assert non_spec_state_idx is not None and has_initial_state is not None
+        state_slots = non_spec_state_idx[plan.prefill_entry_idx]
+        has_init = has_initial_state[plan.prefill_entry_idx]
+
+        if T_loc:
+            # Scan-order inputs (request-major, then chunk slot): real rows only.
+            qkv_scan = plan.select_prefill_tokens(qkv_proj_states)
+            g1_scan = plan.select_prefill_tokens(g1, dim=1)
+            beta_scan = plan.select_prefill_tokens(beta_raw).unsqueeze(0).contiguous()
+
+            # The conv needs the (kernel_size - 1)-token left halo of every
+            # chunk: the predecessor chunk's raw qkv tail (or the cached conv
+            # state for a continued prefill's first chunk).
+            tails = kcp.gather_conv_tail_rows(plan, qkv_scan)
+            tail_rows = tails.reshape(-1, C)[plan.halo_tail_idx.clamp(min=0)]
+            # The step-boundary window occupies the first kernel_size-1
+            # entries of each convolution channel.
+            w = conv_weights.size(-1) - 1
+            prefix_rows = conv_state[state_slots, :, :w].transpose(-1, -2)
+            prefix_rows = torch.where(
+                has_init[:, None, None], prefix_rows, prefix_rows.new_zeros(())
+            )
+            halo = torch.where(
+                (plan.halo_tail_idx >= 0)[..., None],
+                tail_rows,
+                prefix_rows[
+                    plan.scan_req_idx[:, None], (plan.halo_tail_idx + 3).clamp(max=2)
+                ],
+            )
+            # Conv-state layout is (dim, width-1) per row; the halo is the
+            # initial conv window, written back by the kernel as the final one.
+            # Scratch row 0 is unused: cache index 0 is the null block (the
+            # conv kernel skips it), so scan rows occupy rows 1..N_loc.
+            scratch = conv_state.new_zeros(plan.num_scan_rows + 1, C, 3)
+            scratch[1:] = halo.transpose(1, 2).to(conv_state.dtype)
+            conv_out = causal_conv1d_fn(
+                qkv_scan.transpose(0, 1),
+                conv_weights,
+                conv_bias,
+                activation="silu",
+                conv_states=scratch,
+                cache_indices=plan.conv_cache_indices,
+                has_initial_state=plan.conv_all_initial,
+                query_start_loc=plan.scan_cu_seqlens,
+                metadata=plan.conv_meta,
+                output_groups=3,
+            )
+        else:
+            # No local rows: still join the group collectives with empty
+            # contributions so all ranks stay in lockstep.
+            qkv_scan = qkv_proj_states.new_empty(0, C)
+            conv_out = None
+            tails = kcp.gather_conv_tail_rows(plan, qkv_scan)
+
+        # Write summaries directly into their [part, request] collective input.
+        hm = qkv_proj_states.new_empty(2 * N_pf, H, D, 2 * D, dtype=torch.float32)
+        if plan.num_scan_rows != 2 * N_pf:
+            # Ragged/empty ranks must contribute defined absent-slot values.
+            hm.zero_()
+        if T_loc:
+            assert conv_out is not None
+            q_loc, k_loc, v_loc = [
+                t.reshape(1, -1, H, D).contiguous() for t in conv_out.unbind(0)
+            ]
+            g1_scan = g1_scan.contiguous()
+            assert self._flashkda_buffer_specs is not None
+            zero_final, native_workspace, native_out = (
+                current_workspace_manager().get_simultaneous(
+                    *self._flashkda_buffer_specs
+                )
+            )
+            zero_final = zero_final[: plan.num_scan_rows]
+            native_out = native_out[:, :T_loc]
+            torch.ops._flashkda_C.fwd(
+                q_loc,
+                k_loc,
+                v_loc,
+                g1_scan,
+                beta_scan,
+                D**-0.5,
+                native_out,
+                native_workspace,
+                self.A_log.view(-1),
+                self.dt_bias.view(-1, D),
+                self.kda_lower_bound,
+                None,
+                zero_final,
+                plan.scan_cu_seqlens,
+                None,
+                None,
+            )
+            kcp.kcp_compute_summaries(
+                native_workspace,
+                beta_scan,
+                plan.scan_cu_seqlens,
+                plan.scan_chunk_offsets,
+                zero_final,
+                out=hm,
+                output_indices=plan.summary_rank_part_idx,
+            )
+        slots_hm = kcp.gather_slot_summaries(plan, hm, rank_part_order=True)
+        base = gather_initial_states(recurrent_state, state_slots, has_init)
+        inits, final = kcp.kcp_merge_states(
+            slots_hm,
+            base.float(),
+            plan.num_slots_dev,
+            all_slots_full=plan.all_slots_full,
+            rank_part_order=True,
+        )
+        # The first raw-tail gather also determines the final convolution
+        # window; publish both caches without exchanging that window again.
+        scatter_states(
+            recurrent_state,
+            final,
+            state_slots,
+            conv_state=conv_state,
+            conv_tail=tails.reshape(-1, C),
+            conv_tail_indices=plan.final_tail_idx,
+            has_initial_state=has_init,
+        )
+
+        if not T_loc:
+            return qkv_proj_states.new_empty(0, H, D)
+
+        init_local = inits.view(N_pf * plan.num_slots, H, D, D)[plan.init_gather_idx]
+
+        o_loc = out if out is not None else native_out
+        torch.ops._flashkda_C.kcp_scan(
+            v_loc,
+            beta_scan,
+            native_workspace,
+            init_local,
+            plan.scan_cu_seqlens,
+            o_loc,
+            zero_final,
+        )
+        return o_loc[0]
 
     @eager_break_during_capture
     def _forward(

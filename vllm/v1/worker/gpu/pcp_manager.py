@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, ModelConfig, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -55,6 +55,7 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        model_config: ModelConfig | None = None,
     ) -> None:
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
@@ -62,15 +63,20 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self._model_config = model_config
+        self._hybrid_kda_replicated: bool | None = None
 
         self._global_batch: InputBatch | None = None
         self._local_batch: InputBatch | None = None
         self._local_gather_idx: torch.Tensor | None = None
         self.draft_prefill_batch: InputBatch | None = None
+        # Per-partition KCP layout plan cache (built lazily by the KDA layers).
+        self._kcp_plan_cache: tuple[Any, Any] | None = None
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._global_block_tables: tuple[torch.Tensor, ...] | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
@@ -411,6 +417,42 @@ class PCPManager:
         """The unpartitioned scheduled batch for the current step."""
         return self._global_batch
 
+    @property
+    def local_batch(self) -> InputBatch | None:
+        """This rank's partitioned batch for the current step."""
+        return self._local_batch
+
+    @property
+    def global_block_tables(self) -> tuple[torch.Tensor, ...]:
+        """Per-kv-cache-group block tables in global batch order."""
+        assert self._global_block_tables is not None
+        return self._global_block_tables
+
+    @property
+    def hybrid_kda_replicated(self) -> bool:
+        """Whether linear-attention layers run replicated on the global batch.
+
+        True when the model class opts in via ``supports_hybrid_pcp``: its KDA
+        layers all-gather hidden states across the PCP group and compute on the
+        full sequence instead of this rank's context shard.
+        """
+        if self._hybrid_kda_replicated is None:
+            self._hybrid_kda_replicated = self._detect_hybrid_pcp()
+        return self._hybrid_kda_replicated
+
+    def _detect_hybrid_pcp(self) -> bool:
+        if self.pcp_world_size <= 1 or self._model_config is None:
+            return False
+        try:
+            model_config = self._model_config
+            architectures = getattr(model_config.hf_config, "architectures", None) or []
+            model_cls, _ = model_config.registry.resolve_model_cls(
+                architectures, model_config=model_config
+            )
+            return bool(getattr(model_cls, "supports_hybrid_pcp", False))
+        except Exception:
+            return False
+
     def partition_batch(
         self,
         input_batch: InputBatch,
@@ -422,6 +464,7 @@ class PCPManager:
 
         global_batch = input_batch
         self._global_batch = global_batch
+        self._kcp_plan_cache = None
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
@@ -661,7 +704,8 @@ class PCPManager:
 
     def prepare_inputs_to_capture(self, input_batch: InputBatch) -> InputBatch:
         """Stage a capture or dummy batch in persistent PCP input buffers."""
-        # Capture/dummy batches must not reuse the preceding global cache inputs.
+        # Dummy/capture batches are not partitioned; drop the previous step's
+        # global batch so hybrid-PCP consumers cannot observe a stale one.
         self._global_batch = None
         input_buffers = self.input_buffers
         num_reqs = input_batch.num_reqs_after_padding
@@ -699,6 +743,15 @@ class PCPManager:
             out_ptrs=self._local_block_table_ptrs,
         )
         slot_mappings = self.prepare_slot_mappings()
+        if self.hybrid_kda_replicated:
+            # KDA layers run replicated on the global batch; stage the block
+            # tables in global batch order for their attention metadata and
+            # for the mamba align pre-copy kernels.
+            assert self._global_batch is not None
+            self._global_block_tables = self._block_tables.gather_block_tables(
+                self._global_batch.idx_mapping,
+                self._global_batch.num_reqs,
+            )
         return block_tables, slot_mappings
 
     def prepare_slot_mappings(self) -> torch.Tensor:
@@ -765,6 +818,41 @@ class PCPManager:
         gathered layout (PCP-group all-gather concat), without the gather."""
         assert self._hidden_restore_idx is not None
         return gathered[self._hidden_restore_idx]
+
+    def scatter_to_local(self, full: torch.Tensor) -> torch.Tensor:
+        """Slice a global-order full tensor back to this rank's local padded rows."""
+        assert self._local_batch is not None
+        assert self._padded_gather_idx is not None
+        num_local_padded = self._local_batch.num_tokens_after_padding
+        start = self.pcp_rank * num_local_padded
+        local_idx = self._padded_gather_idx[start : start + num_local_padded]
+        return torch.index_select(full, 0, local_idx)
+
+    def global_gdn_inputs(self) -> dict[str, Any]:
+        """Global-batch inputs for the mamba groups' CommonAttentionMetadata.
+
+        Under hybrid PCP the KDA groups run replicated on the global
+        (unpartitioned) batch, so their attention metadata must be built from
+        the global batch rather than this rank's local shard. ``block_tables``
+        holds the per-kv-cache-group block tables in global batch order; the
+        caller indexes it per mamba group into ``block_table_tensor``.
+        """
+        global_batch = self._global_batch
+        assert global_batch is not None
+        assert self._global_block_tables is not None
+        num_reqs = global_batch.num_reqs
+        return {
+            "num_reqs": num_reqs,
+            "num_actual_tokens": global_batch.num_tokens,
+            "max_query_len": int(global_batch.num_scheduled_tokens.max()),
+            "max_seq_len": int(global_batch.seq_lens_cpu_upper_bound[:num_reqs].max()),
+            "query_start_loc": global_batch.query_start_loc,
+            "query_start_loc_cpu": torch.from_numpy(global_batch.query_start_loc_np),
+            "seq_lens": global_batch.seq_lens,
+            "seq_lens_cpu_upper_bound": global_batch.seq_lens_cpu_upper_bound,
+            "positions": global_batch.positions,
+            "block_tables": self._global_block_tables,
+        }
 
     def get_draft_input_buffers(
         self, input_buffers: InputBuffers
@@ -875,7 +963,7 @@ def maybe_build_pcp_manager(
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
-    return cls(
+    manager = cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
         device=device,
@@ -885,4 +973,17 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+        model_config=vllm_config.model_config,
     )
+    if manager.hybrid_kda_replicated and vllm_config.speculative_config is not None:
+        raise NotImplementedError(
+            "Hybrid PCP KDA does not support speculative decoding."
+        )
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    if manager.hybrid_kda_replicated and cudagraph_mode.has_full_cudagraphs():
+        raise NotImplementedError(
+            "Hybrid-PCP gather-replicate does not support full CUDA graphs "
+            "(FULL, FULL_AND_PIECEWISE, FULL_DECODE_ONLY): the per-step gather "
+            "indices are re-staged outside the graph. Use cudagraph_mode=NONE."
+        )
+    return manager

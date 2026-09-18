@@ -40,6 +40,7 @@ if(FLASH_KDA_ARCHS)
 
   set(FLASH_KDA_SOURCES
     csrc/flashkda_registration.cpp
+    csrc/flashkda_kcp.cu
     ${flashkda_SOURCE_DIR}/csrc/flash_kda.cpp
     ${flashkda_SOURCE_DIR}/csrc/smxx/fwd_launch.cu)
   set(FLASH_KDA_INCLUDES

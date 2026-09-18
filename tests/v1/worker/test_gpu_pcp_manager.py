@@ -515,3 +515,33 @@ def test_restore_hidden_states_can_require_partition(monkeypatch):
     with pytest.raises(AssertionError):
         manager.restore_hidden_states(hidden, require_partition=True)
     group.all_gather.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "hybrid,speculative", [(True, True), (True, False), (False, True)]
+)
+def test_hybrid_pcp_rejects_speculative_decoding(monkeypatch, hybrid, speculative):
+    """Reject unsupported KDA verification without changing ordinary MLA PCP."""
+    config = _make_config(CUDAGraphMode.NONE)
+    config.parallel_config.cp_kv_cache_interleave_size = 1
+    config.scheduler_config = SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=8)
+    if speculative:
+        config.speculative_config = SimpleNamespace(
+            method="mtp", use_dspark=lambda: False, use_multi_module_mtp=lambda: False
+        )
+    _, block_tables = _make_capture_manager(torch.ones((4, 2), dtype=torch.int32))
+    monkeypatch.setattr(PCPManager, "_detect_hybrid_pcp", lambda self: hybrid)
+    monkeypatch.setattr(
+        pcp_manager_module, "get_pcp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+
+    def build():
+        return pcp_manager_module.maybe_build_pcp_manager(
+            config, torch.device("cpu"), False, block_tables
+        )
+
+    if hybrid and speculative:
+        with pytest.raises(NotImplementedError, match="does not support speculative"):
+            build()
+    else:
+        assert build() is not None
