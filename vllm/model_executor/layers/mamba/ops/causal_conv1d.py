@@ -46,6 +46,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_cache_indices: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
+    stride_o_group: tl.int64,
     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
     # others
     pad_slot_id: tl.constexpr,
@@ -57,6 +58,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     IS_APC_ENABLED: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
+    OUTPUT_GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
@@ -469,10 +471,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
+        if OUTPUT_GROUP_SIZE:
+            output_features = (idx_feats // OUTPUT_GROUP_SIZE).to(
+                tl.int64
+            ) * stride_o_group + idx_feats % OUTPUT_GROUP_SIZE
+        else:
+            output_features = idx_feats * stride_o_dim
         o_ptrs = (
             o_ptr
             + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + output_features
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
@@ -496,6 +504,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    output_groups: int = 1,
 ):
     """Support varlen + continuous batching when x is 2D tensor.
 
@@ -546,7 +555,10 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
-    out: same shape as `x`
+    output_groups: when greater than 1, split channels into equal groups and
+        write contiguous (group, token, channel-within-group) output.
+    out: same shape as `x` by default; otherwise
+        (output_groups, cu_seq_len, dim // output_groups).
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -555,7 +567,12 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if output_groups == 1:
+        out = torch.empty_like(x)
+    else:
+        if output_groups < 1 or x.shape[0] % output_groups:
+            raise ValueError("output_groups must evenly divide the channel count")
+        out = x.new_empty((output_groups, x.shape[1], x.shape[0] // output_groups))
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -604,7 +621,10 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-    if out.dim() == 2:
+    stride_o_group = 0
+    if output_groups > 1:
+        stride_o_group, stride_o_token, stride_o_dim = out.stride()
+    elif out.dim() == 2:
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
     else:
@@ -739,6 +759,7 @@ def causal_conv1d_fn(
         stride_cache_indices,
         stride_o_dim,
         stride_o_token,
+        stride_o_group,
         block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
@@ -750,6 +771,7 @@ def causal_conv1d_fn(
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
         HAS_NULL_BLOCK=null_block_id is not None,
         NP2_STATELEN=np2_statelen,
+        OUTPUT_GROUP_SIZE=dim // output_groups if output_groups > 1 else 0,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
         BLOCK_N=256,
