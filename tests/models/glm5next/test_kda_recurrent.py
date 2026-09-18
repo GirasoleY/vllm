@@ -374,10 +374,10 @@ def test_kcp_prefill_selection_preserves_strided_values(indices, token_range):
             assert actual.stride() == tensor.stride()
 
 
-@pytest.mark.parametrize("counts", [[8], [8, 8, 8], [8, 3, 0]])
+@pytest.mark.parametrize("counts", [[8], [8, 8, 8], [3, 3], [0, 0], [8, 3, 0]])
 @pytest.mark.parametrize("rank_part_order", [False, True])
 def test_kcp_merge_preserves_partial_states_and_contiguous_output(
-    counts, rank_part_order
+    counts, rank_part_order, monkeypatch
 ):
     """The dense path and ragged path preserve state at every slot boundary."""
     from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import (
@@ -409,6 +409,7 @@ def test_kcp_merge_preserves_partial_states_and_contiguous_output(
         ]
         summaries = summaries[order].contiguous()
     original_transition = summaries[..., dim:].clone()
+    local_input = summaries.clone()
     initial, final = kcp_merge_states_torch(
         summaries,
         base,
@@ -422,6 +423,44 @@ def test_kcp_merge_preserves_partial_states_and_contiguous_output(
         summaries[..., dim:], original_transition, atol=0, rtol=0
     )
     assert initial.is_contiguous() and final.is_contiguous()
+
+    if rank_part_order:
+        from types import SimpleNamespace
+
+        from vllm.models.glm5next.nvidia.ops.third_party.kda import kcp
+
+        monkeypatch.setattr(kcp.envs, "VLLM_KDA_KCP_MERGE", "torch")
+        for rank in range(slots // 2):
+            selected = [
+                (n, c)
+                for n, count in enumerate(counts)
+                for c in (rank, slots - 1 - rank)
+                if c < count
+            ]
+            local_slots = tuple(c for n, c in selected if n == 0)
+            uniform_slots = (
+                local_slots
+                if selected == [(n, c) for n in range(len(counts)) for c in local_slots]
+                else None
+            )
+            plan = SimpleNamespace(
+                local_init_slots=uniform_slots,
+                num_slots_dev=torch.tensor(counts, device="cuda", dtype=torch.int32),
+                all_slots_full=all(count == slots for count in counts),
+                init_gather_idx=torch.tensor(
+                    [n * slots + c for n, c in selected],
+                    device="cuda",
+                    dtype=torch.int64,
+                ),
+            )
+            local, final_local = kcp.kcp_merge_local_states(
+                local_input.clone(), base, plan
+            )
+            torch.testing.assert_close(
+                local, initial.flatten(0, 1)[plan.init_gather_idx], atol=0, rtol=0
+            )
+            torch.testing.assert_close(final_local, final, atol=0, rtol=0)
+            assert local.is_contiguous() and final_local.is_contiguous()
 
 
 @pytest.mark.parametrize("lengths", [[], [0, 0], [64, 97]])

@@ -356,6 +356,7 @@ def kcp_merge_states_torch(
     *,
     all_slots_full: bool = False,
     rank_part_order: bool = False,
+    init_slots: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chain-merge slot summaries via batched cuBLAS bmms (same math as the
     Triton kernel, but fully parallel across N*H per step instead of one
@@ -363,13 +364,18 @@ def kcp_merge_states_torch(
 
     Consumes the S_ext portion of slots_hm as scratch. all_slots_full must
     come from the CPU plan and certify that every request has all S slots.
+    init_slots optionally selects the same ordered slots for every request.
+    Its indices must be unique and in [0, S), as certified by the CPU plan.
+    The default preserves the full [N, S, H, V, K] initial-state output.
     """
     S, N, H, K, VK = slots_hm.shape
     V = VK - K
-    init_states = slots_hm.new_empty(N, S, H, V, K)
+    selected_slots = tuple(range(S)) if init_slots is None else init_slots
+    init_states = slots_hm.new_empty(N, len(selected_slots), H, V, K)
     h = base_state
     for c in range(S):
-        init_states[:, c] = h
+        if c in selected_slots:
+            init_states[:, selected_slots.index(c)] = h
         physical_c = c
         if rank_part_order:
             physical_c = 2 * c if c < S // 2 else 2 * (S - 1 - c) + 1
@@ -445,6 +451,32 @@ def kcp_merge_states(
     return init_states, final_states
 
 
+def kcp_merge_local_states(
+    slots_hm: torch.Tensor,
+    base_state: torch.Tensor,
+    plan: "KcpPlan",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return this rank's scan-order initial states and replicated final states."""
+    if plan.local_init_slots is not None and envs.VLLM_KDA_KCP_MERGE != "kernel":
+        inits, final = kcp_merge_states_torch(
+            slots_hm,
+            base_state,
+            plan.num_slots_dev,
+            all_slots_full=plan.all_slots_full,
+            rank_part_order=True,
+            init_slots=plan.local_init_slots,
+        )
+        return inits.flatten(0, 1), final
+    inits, final = kcp_merge_states(
+        slots_hm,
+        base_state,
+        plan.num_slots_dev,
+        all_slots_full=plan.all_slots_full,
+        rank_part_order=True,
+    )
+    return inits.flatten(0, 1)[plan.init_gather_idx], final
+
+
 def kcp_zigzag_slot_order(ag: torch.Tensor) -> torch.Tensor:
     """Reorder an all-gathered [world, ..., 2, ...] contribution to slot order.
 
@@ -478,6 +510,7 @@ class KcpPlan:
     num_prefill_reqs: int  # N_pf
     num_slots: int  # 2 * world
     all_slots_full: bool  # Every prefill request has all 2 * world slots.
+    local_init_slots: tuple[int, ...] | None  # Same local slots for every request.
     global_prefill_tokens: int
     # This rank's scan rows (chunk slots of KCP-prefill requests).
     num_scan_rows: int
@@ -737,6 +770,13 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
         )
         else None
     )
+    rank_init_slots = tuple(c for n, c, _, _ in scan_rows if n == 0)
+    local_init_slots = (
+        rank_init_slots
+        if [(n, c) for n, c, _, _ in scan_rows]
+        == [(n, c) for n in range(N_pf) for c in rank_init_slots]
+        else None
+    )
     scan_cu_cpu = torch.tensor(cu, dtype=torch.int32)
     from vllm.third_party.flash_linear_attention.ops.index import (
         prepare_chunk_indices,
@@ -762,6 +802,7 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
         num_prefill_reqs=N_pf,
         num_slots=S,
         all_slots_full=bool(np.all(num_slots_np == S)),
+        local_init_slots=local_init_slots,
         global_prefill_tokens=prefill_tokens,
         num_scan_rows=len(scan_rows),
         prefill_src_range=prefill_src_range,
