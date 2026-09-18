@@ -417,6 +417,7 @@ class KcpPlan:
     global_prefill_tokens: int
     # This rank's scan rows (chunk slots of KCP-prefill requests).
     num_scan_rows: int
+    prefill_src_range: tuple[int, int] | None
     prefill_src_idx: torch.Tensor  # [T_loc] int64, local token idx in scan order
     scan_cu_seqlens: torch.Tensor  # [N_loc + 1] int32
     scan_chunk_indices: torch.Tensor  # [NT, 2] int32, FLA chunking of the scan
@@ -444,6 +445,13 @@ class KcpPlan:
     block_num_dec_reqs: int  # plain decodes + single-token extends
     nonprefill_out_src: torch.Tensor  # int64, block rows to copy out
     nonprefill_out_dst: torch.Tensor  # int64, their local token positions
+
+    def select_prefill_tokens(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        """Select scan-order tokens, using a view for a CPU-certified range."""
+        if self.prefill_src_range is not None:
+            start, stop = self.prefill_src_range
+            return tensor.narrow(dim, start, stop - start)
+        return tensor.index_select(dim, self.prefill_src_idx)
 
     @property
     def has_block(self) -> bool:
@@ -644,6 +652,15 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
             else:
                 halo_tail[row_i, j] = w_col - 3
 
+    prefill_start = scan_rows[0][2] if scan_rows else 0
+    prefill_src_range = (
+        (prefill_start, prefill_start + cu[-1])
+        if all(
+            token_start == prefill_start + cu[i]
+            for i, (_, _, token_start, _) in enumerate(scan_rows)
+        )
+        else None
+    )
     scan_cu_cpu = torch.tensor(cu, dtype=torch.int32)
     from vllm.third_party.flash_linear_attention.ops.index import (
         prepare_chunk_indices,
@@ -670,6 +687,7 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
         num_slots=S,
         global_prefill_tokens=prefill_tokens,
         num_scan_rows=len(scan_rows),
+        prefill_src_range=prefill_src_range,
         prefill_src_idx=to_gpu_i64(prefill_src),
         scan_cu_seqlens=scan_cu_cpu.to(device, non_blocking=True),
         scan_chunk_indices=(

@@ -706,11 +706,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         if T_loc:
             # Scan-order inputs (request-major, then chunk slot): real rows only.
-            qkv_scan = qkv_proj_states.index_select(0, plan.prefill_src_idx)
-            g1_scan = g1.index_select(1, plan.prefill_src_idx)
-            beta_scan = _cast_sigmoid(
-                beta_raw.index_select(0, plan.prefill_src_idx)
-            ).unsqueeze(0)
+            qkv_scan = plan.select_prefill_tokens(qkv_proj_states)
+            g1_scan = plan.select_prefill_tokens(g1, dim=1)
+            beta_scan = _cast_sigmoid(plan.select_prefill_tokens(beta_raw)).unsqueeze(0)
 
             # The conv needs the (kernel_size - 1)-token left halo of every
             # chunk: the predecessor chunk's raw qkv tail (or the cached conv

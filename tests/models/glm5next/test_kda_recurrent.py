@@ -258,6 +258,7 @@ def test_kcp_plan_preserves_short_continuation_halos_and_empty_ranks(
             continue
         assert plan is not None
         assert plan.num_block_tokens == prefix
+        assert plan.prefill_src_range == (prefix, int(local_lens.sum()))
         if plan.num_scan_rows == 0:
             assert plan.scan_chunk_indices.shape == (0, 2)
             continue
@@ -269,3 +270,29 @@ def test_kcp_plan_preserves_short_continuation_halos_and_empty_ranks(
             )
             start = 9 + segment.global_batch_slice.start - prefix
             torch.testing.assert_close(actual, torch.arange(start - 3, start))
+
+
+@pytest.mark.parametrize(
+    ("indices", "token_range"),
+    [([1, 2, 3], (1, 4)), ([], (0, 0)), ([3, 1], None)],
+)
+def test_kcp_prefill_selection_preserves_strided_values(indices, token_range):
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import KcpPlan
+
+    plan = SimpleNamespace(
+        prefill_src_idx=torch.tensor(indices, dtype=torch.int64),
+        prefill_src_range=token_range,
+    )
+    packed = torch.arange(6 * 8).reshape(6, 8)[:, :4]
+    for dim, tensor in [(0, packed), (1, packed.unsqueeze(0))]:
+        actual = KcpPlan.select_prefill_tokens(plan, tensor, dim)
+        expected = tensor.index_select(dim, plan.prefill_src_idx)
+        torch.testing.assert_close(actual, expected)
+        if token_range is not None:
+            assert (
+                actual.untyped_storage().data_ptr()
+                == tensor.untyped_storage().data_ptr()
+            )
+            assert actual.stride() == tensor.stride()
