@@ -52,6 +52,40 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA FP8 query path")
+@pytest.mark.parametrize("num_tokens", [0, 1, 31, 32, 33, 257])
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+def test_indexer_query_preparation_matches_unfused(num_tokens, num_heads):
+    """Fusing scale/padding preserves FP8 bytes and writes every padded head."""
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        fwht128_quant_fp8,
+        fwht128_quant_fp8_with_weights,
+    )
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        num_tokens, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    q[:, 0] = 0
+    weights = torch.randn(num_tokens, num_heads, device="cuda", dtype=torch.float32)
+    factor = HEAD_DIM**-0.5 * num_heads**-0.5
+    q_ref, scales = fwht128_quant_fp8(q.view(-1, HEAD_DIM))
+    weights_ref = (weights * scales.view(num_tokens, num_heads)) * factor
+
+    q_out, weights_out = fwht128_quant_fp8_with_weights(q, weights, factor)
+    torch.testing.assert_close(
+        q_out[:, :num_heads].view(torch.uint8),
+        q_ref.view(num_tokens, num_heads, HEAD_DIM).view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(weights_out[:, :num_heads], weights_ref, rtol=0, atol=0)
+    assert q_out.shape == (num_tokens, max(32, num_heads), HEAD_DIM)
+    assert weights_out.shape == (num_tokens, max(32, num_heads))
+    assert torch.count_nonzero(q_out[:, num_heads:].view(torch.uint8)) == 0
+    assert torch.count_nonzero(weights_out[:, num_heads:]) == 0
+
+
 def _make_caches():
     kv = torch.zeros(
         NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device="cuda"

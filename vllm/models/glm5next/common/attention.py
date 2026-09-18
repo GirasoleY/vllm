@@ -29,7 +29,9 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
-from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
+from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    fwht128_quant_fp8_with_weights,
+)
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
@@ -56,23 +58,6 @@ def _fused_indexer_k_norm(
 ) -> torch.Tensor:
     # Fuse fp32 cast + layer_norm + cast-back (was 3 kernels) into one.
     return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
-
-
-@torch.compile(**_INDEXER_COMPILE)
-def _fused_indexer_weight_scale(
-    weights: torch.Tensor, q_scale: torch.Tensor, scale: float
-) -> torch.Tensor:
-    # Fuse the weight-scaling muls (was 2 kernels) into one. `scale` folds
-    # softmax_scale (head_dim**-0.5) and n_head**-0.5 into a single constant.
-    return (weights.unsqueeze(-1) * q_scale * scale).squeeze(-1)
-
-
-@torch.compile(**_INDEXER_COMPILE)
-def _pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
-    # DeepGEMM MQA-logits needs num_heads in {32,64}; zero-pad the head dim.
-    # Fuse new_zeros + cat (was 2 kernels) into one. Pad values are zero (exact
-    # in fp8 e4m3 and zero-weight in the logits sum), so numerically a no-op.
-    return torch.cat([x, x.new_zeros(x.shape[0], pad, *x.shape[2:])], dim=1)
 
 
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
@@ -268,7 +253,7 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
 
         # Hadamard-128 rotation of the indexer query is fused with the FP8
-        # quant (see forward: fwht128_quant_fp8) -- no precomputed matrix.
+        # quant (see forward: fwht128_quant_fp8_with_weights).
 
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
@@ -365,29 +350,14 @@ class Indexer(nn.Module):
         # round-trip and bf16 matrix-rounding bias.
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
+        q_fp8, weights = fwht128_quant_fp8_with_weights(
+            q, weights, self.softmax_scale * self.n_head**-0.5
         )
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
         gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
-
-        # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
-        # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
-        # checkpoint uses index_n_heads=16. Zero-pad q and the per-head
-        # weights: logits are a weights-weighted sum over heads, so
-        # zero-weight padded heads contribute exactly nothing.
-        if self.n_head < 32:
-            pad = 32 - self.n_head
-            q_fp8 = _pad_indexer_heads(q_fp8, pad)
-            weights = _pad_indexer_heads(weights, pad)
 
         return self.indexer_op(
             hidden_states,

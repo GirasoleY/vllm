@@ -58,12 +58,17 @@ def _fwht_stage(x, N: tl.constexpr, GROUPS: tl.constexpr, STRIDE: tl.constexpr):
     return tl.reshape(x3, (N,))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_rows"])
 def _fwht_quant_kernel(
     q_ptr,
     qout_ptr,
     sout_ptr,
     n_rows,
+    weights_ptr,
+    WEIGHT_SCALE: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    PADDED_HEADS: tl.constexpr,
+    FUSE_WEIGHTS: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
     """Fused Hadamard-128 rotation + per-row absmax FP8 (ue8m0) quant.
@@ -101,8 +106,27 @@ def _fwht_quant_kernel(
     scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
 
-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
-    tl.store(sout_ptr + rows, scale, mask=rmask)
+    if FUSE_WEIGHTS:
+        tokens = rows // NUM_HEADS
+        heads = rows % NUM_HEADS
+        out_heads = tokens.to(tl.int64) * PADDED_HEADS + heads
+        weights = tl.load(weights_ptr + rows, mask=rmask, other=0.0)
+        tl.store(sout_ptr + out_heads, (weights * scale) * WEIGHT_SCALE, mask=rmask)
+        for offset in tl.static_range(NUM_HEADS, PADDED_HEADS, NUM_HEADS):
+            pad_heads = out_heads + offset
+            pad_mask = rmask & (heads + offset < PADDED_HEADS)
+            tl.store(
+                qout_ptr + pad_heads[:, None] * 128 + offs[None, :],
+                0.0,
+                mask=pad_mask[:, None],
+            )
+            tl.store(sout_ptr + pad_heads, 0.0, mask=pad_mask)
+    else:
+        out_heads = rows
+        tl.store(sout_ptr + rows, scale, mask=rmask)
+    tl.store(
+        qout_ptr + out_heads[:, None] * 128 + offs[None, :], y, mask=rmask[:, None]
+    )
 
 
 def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -128,8 +152,66 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    _fwht_quant_kernel[grid](
+        q,
+        q_fp8,
+        q_scale,
+        n_rows,
+        weights_ptr=None,
+        WEIGHT_SCALE=1.0,
+        NUM_HEADS=1,
+        PADDED_HEADS=1,
+        FUSE_WEIGHTS=False,
+        BLOCK_R=BLOCK_R,
+        num_warps=2,
+    )
     return q_fp8, q_scale
+
+
+def fwht128_quant_fp8_with_weights(
+    q: torch.Tensor, weights: torch.Tensor, weight_scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate/quantize indexer queries and write scaled, padded head weights.
+
+    Args:
+        q: Contiguous ``[tokens, heads, 128]`` BF16 queries.
+        weights: Contiguous ``[tokens, heads]`` FP32 head weights.
+        weight_scale: Combined softmax and head scaling factor.
+
+    Returns:
+        FP8 queries and FP32 weights, with heads zero-padded to at least 32.
+
+    """
+    assert q.ndim == 3 and q.shape[-1] == 128, q.shape
+    assert q.dtype == torch.bfloat16 and q.is_contiguous()
+    assert weights.shape == q.shape[:2] and weights.dtype == torch.float32
+    assert weights.is_contiguous() and weights.device == q.device
+    num_tokens, num_heads, _ = q.shape
+    assert num_heads > 0
+    padded_heads = max(32, num_heads)
+    q_fp8 = torch.empty(
+        (num_tokens, padded_heads, 128), dtype=torch.float8_e4m3fn, device=q.device
+    )
+    scaled_weights = torch.empty(
+        (num_tokens, padded_heads), dtype=torch.float32, device=q.device
+    )
+    n_rows = num_tokens * num_heads
+    if n_rows:
+        BLOCK_R = 16
+        _fwht_quant_kernel[(triton.cdiv(n_rows, BLOCK_R),)](
+            q,
+            q_fp8,
+            scaled_weights,
+            n_rows,
+            weights_ptr=weights,
+            WEIGHT_SCALE=weight_scale,
+            NUM_HEADS=num_heads,
+            PADDED_HEADS=padded_heads,
+            FUSE_WEIGHTS=True,
+            BLOCK_R=BLOCK_R,
+            num_warps=1,
+        )
+    return q_fp8, scaled_weights
 
 
 # Fused pool compression and cache write.
