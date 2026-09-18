@@ -755,11 +755,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             conv_out = None
             tails = kcp.gather_conv_tail_rows(plan, qkv_scan)
 
-        if not T_loc:
-            # No local rows: no WY/summary compute, but the group collectives
-            # and the replicated cache writes below must still run.
-            hm = qkv_proj_states.new_zeros(0, H, D, 2 * D, dtype=torch.float32)
-        else:
+        # Write summaries directly into their [part, request] collective input.
+        hm = qkv_proj_states.new_empty(2 * N_pf, H, D, 2 * D, dtype=torch.float32)
+        if plan.num_scan_rows != 2 * N_pf:
+            # Ragged/empty ranks must contribute defined absent-slot values.
+            hm.zero_()
+        if T_loc:
             # WY representation of the local chunk rows (same kernels as the
             # scan).
             assert conv_out is not None
@@ -813,14 +814,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 gk=g,
                 cu_seqlens=plan.scan_cu_seqlens,
                 chunk_size=FLA_CHUNK_SIZE,
+                out=hm,
+                output_indices=plan.summary_rank_part_idx,
             )
-        slots_hm = kcp.gather_slot_summaries(plan, hm)
+        slots_hm = kcp.gather_slot_summaries(plan, hm, rank_part_order=True)
         base = gather_initial_states(recurrent_state, state_slots, has_init)
         inits, final = kcp.kcp_merge_states(
             slots_hm,
             base.float(),
             plan.num_slots_dev,
             all_slots_full=plan.all_slots_full,
+            rank_part_order=True,
         )
         # The first raw-tail gather also determines the final convolution
         # window; publish both caches without exchanging that window again.

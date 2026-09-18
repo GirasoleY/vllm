@@ -63,6 +63,8 @@ def kcp_summary_fwd_kernel(
     BT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BK1: tl.constexpr,
+    output_indices=None,
+    HAS_OUTPUT_INDICES: tl.constexpr = False,
 ):
     """Per-chunk affine transition summary with zero initial state.
 
@@ -76,7 +78,10 @@ def kcp_summary_fwd_kernel(
     T = (eos - bos).to(tl.int32)
     NT = tl.cdiv(T, BT)
 
-    hm += i_n * H * K * (K + V) + i_h * K * (K + V)
+    out_n = i_n
+    if HAS_OUTPUT_INDICES:
+        out_n = tl.load(output_indices + i_n).to(tl.int64)
+    hm += out_n * H * K * (K + V) + i_h * K * (K + V)
     k += (bos * H + i_h) * K
     w += (bos * H + i_h) * K
     gk += (bos * H + i_h) * K
@@ -222,8 +227,15 @@ def kcp_compute_summaries(
     gk: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_size: int,
+    *,
+    out: torch.Tensor | None = None,
+    output_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Affine transition summary per cu_seqlens row, zero initial state."""
+    """Affine summary per sequence segment, optionally stored at mapped destinations.
+
+    Mapped destinations must be unique and in bounds. Only those destinations
+    are written; the caller initializes absent slots.
+    """
     B, T, H, K = kg.shape
     V = u.shape[-1]
     assert B == 1 and K <= 256
@@ -231,7 +243,17 @@ def kcp_compute_summaries(
     BT = chunk_size
     BK1 = triton.next_power_of_2(K)
     BLOCK_SIZE = 32 if K <= 64 else 64
-    hm = kg.new_zeros(N, H, K, V + K, dtype=torch.float32)
+    if out is None:
+        assert output_indices is None
+        # Every valid element is written, including zero-token segments.
+        hm = kg.new_empty(N, H, K, V + K, dtype=torch.float32)
+    else:
+        assert out.shape[1:] == (H, K, V + K) and out.is_contiguous()
+        assert out.device == kg.device and out.dtype == torch.float32
+        assert output_indices is not None and output_indices.shape == (N,)
+        assert output_indices.is_contiguous() and output_indices.device == kg.device
+        assert output_indices.dtype == torch.int64
+        hm = out
     if N == 0:
         return hm
     grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), H, N)
@@ -249,6 +271,8 @@ def kcp_compute_summaries(
         BT=BT,
         BLOCK_SIZE=BLOCK_SIZE,
         BK1=BK1,
+        output_indices=output_indices,
+        HAS_OUTPUT_INDICES=output_indices is not None,
     )
     return hm
 
@@ -272,6 +296,7 @@ def kcp_merge_fwd_kernel(
     V: tl.constexpr,
     BV: tl.constexpr,
     BK: tl.constexpr,
+    RANK_PART_ORDER: tl.constexpr = False,
 ):
     """Chain-merge chunk summaries into initial/final states (v-first states).
 
@@ -303,7 +328,14 @@ def kcp_merge_fwd_kernel(
         )
         m_init = m_v[:, None] & m_k[None, :]
         tl.store(p_init, b_h.to(p_init.dtype.element_ty), mask=m_init)
-        base = c * stride_hm_s + i_n * H * K * (V + K) + i_h * stride_hm_h
+        physical_c = c
+        if RANK_PART_ORDER:
+            physical_c = tl.where(c < S // 2, 2 * c, 2 * (S - 1 - c) + 1)
+        base = (
+            tl.cast(physical_c, tl.int64) * stride_hm_s
+            + i_n * H * K * (V + K)
+            + i_h * stride_hm_h
+        )
         p_he = hm + base + o_k[:, None] * (V + K) + o_v[None, :]
         b_he = tl.load(p_he, mask=m_k[:, None] & m_v[None, :], other=0.0)
         p_m = hm + base + V + o_k[:, None] * (V + K) + o_k[None, :]
@@ -323,6 +355,7 @@ def kcp_merge_states_torch(
     num_slots: torch.Tensor,
     *,
     all_slots_full: bool = False,
+    rank_part_order: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chain-merge slot summaries via batched cuBLAS bmms (same math as the
     Triton kernel, but fully parallel across N*H per step instead of one
@@ -337,8 +370,11 @@ def kcp_merge_states_torch(
     h = base_state
     for c in range(S):
         init_states[:, c] = h
-        m_c = slots_hm[c, ..., V:]  # [N,H,K,K]
-        se_c = slots_hm[c, ..., :V].transpose(-1, -2)  # [N,H,V,K]
+        physical_c = c
+        if rank_part_order:
+            physical_c = 2 * c if c < S // 2 else 2 * (S - 1 - c) + 1
+        m_c = slots_hm[physical_c, ..., V:]  # [N,H,K,K]
+        se_c = slots_hm[physical_c, ..., :V].transpose(-1, -2)  # [N,H,V,K]
         se_c.view(N * H, V, K).baddbmm_(
             h.reshape(N * H, V, K),
             m_c.transpose(-1, -2).view(N * H, K, K),
@@ -358,6 +394,7 @@ def kcp_merge_states(
     num_slots: torch.Tensor,
     *,
     all_slots_full: bool = False,
+    rank_part_order: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chain-merge slot-ordered [S_ext, M] summaries into initial/final states.
 
@@ -368,6 +405,8 @@ def kcp_merge_states(
             (zeros for fresh prefills).
         num_slots: [N] int32 non-empty chunk count per request.
         all_slots_full: CPU-planned guarantee that every request has all S slots.
+        rank_part_order: Summaries are in [rank, front/back part, request] order;
+            initial-state outputs remain in global chunk order.
 
     Returns:
         (initial states [N, S, H, V, K] fp32, final states [N, H, V, K] fp32).
@@ -375,7 +414,11 @@ def kcp_merge_states(
     """
     if envs.VLLM_KDA_KCP_MERGE != "kernel":
         return kcp_merge_states_torch(
-            slots_hm, base_state, num_slots, all_slots_full=all_slots_full
+            slots_hm,
+            base_state,
+            num_slots,
+            all_slots_full=all_slots_full,
+            rank_part_order=rank_part_order,
         )
     S, N, H, K, _ = slots_hm.shape
     V = slots_hm.shape[-1] - K
@@ -397,6 +440,7 @@ def kcp_merge_states(
         K=K,
         V=V,
         BK=triton.next_power_of_2(K),
+        RANK_PART_ORDER=rank_part_order,
     )
     return init_states, final_states
 
@@ -447,6 +491,7 @@ class KcpPlan:
     conv_all_initial: torch.Tensor  # [N_loc] bool, all True (halo always given)
     scan_req_idx: torch.Tensor  # [N_loc] int64, KCP-prefill request ordinal
     summary_dst_idx: torch.Tensor  # [N_loc] int64, position in the [N, 2] contribution
+    summary_rank_part_idx: torch.Tensor  # [N_loc] int64, position in [2, N]
     init_gather_idx: torch.Tensor  # [N_loc] int64, position in the [N, 2P] inits
     tail_dst_idx: torch.Tensor  # [M] int64, into [N * 2 * 3] tail contribution
     tail_src_idx: torch.Tensor  # [M] int64, scan-order qkv row of each tail row
@@ -750,6 +795,9 @@ def build_kcp_plan(mgr, device: torch.device) -> KcpPlan | None:
         summary_dst_idx=to_gpu_i64(
             [n * 2 + (0 if c == rank else 1) for n, c, _, _ in scan_rows]
         ),
+        summary_rank_part_idx=to_gpu_i64(
+            [(0 if c == rank else N_pf) + n for n, c, _, _ in scan_rows]
+        ),
         init_gather_idx=to_gpu_i64([n * S + c for n, c, _, _ in scan_rows]),
         tail_dst_idx=to_gpu_i64(tail_dst),
         tail_src_idx=to_gpu_i64(tail_src),
@@ -796,12 +844,21 @@ def gather_block_hidden(plan: KcpPlan, hidden_states: torch.Tensor) -> torch.Ten
     return gathered.index_select(0, plan.block_restore_idx)
 
 
-def gather_slot_summaries(plan: KcpPlan, hm_local: torch.Tensor) -> torch.Tensor:
+def gather_slot_summaries(
+    plan: KcpPlan, hm_local: torch.Tensor, *, rank_part_order: bool = False
+) -> torch.Tensor:
     """All-gather per-slot [S_ext, M] summaries into global slot order.
 
     Returns [2P, N, H, K, V + K] fp32, with zeros in slots no rank owns.
+    With rank_part_order, input is already packed [2 * N, ...] and the result
+    retains rank/part order for a matching merge consumer, without reordering.
     """
     N = plan.num_prefill_reqs
+    if rank_part_order:
+        # The producer has already populated [part, request] contributions.
+        assert hm_local.shape[0] == 2 * N
+        ag = get_pcp_group().all_gather(hm_local, dim=0)
+        return ag.view(plan.num_slots, N, *hm_local.shape[1:])
     contrib = hm_local.new_zeros(N * 2, *hm_local.shape[1:])
     if plan.num_scan_rows:
         contrib[plan.summary_dst_idx] = hm_local

@@ -262,6 +262,18 @@ def test_kcp_plan_preserves_short_continuation_halos_and_empty_ranks(
         assert plan is not None
         assert plan.num_block_tokens == prefix
         assert plan.prefill_src_range == (prefix, int(local_lens.sum()))
+        expected_summary_indices = torch.tensor(
+            [
+                (0 if slot == rank else plan.num_prefill_reqs) + request
+                for request, slot in zip(
+                    plan.scan_req_idx.tolist(),
+                    (plan.init_gather_idx % plan.num_slots).tolist(),
+                )
+            ],
+            dtype=torch.int64,
+        )
+        torch.testing.assert_close(plan.summary_rank_part_idx, expected_summary_indices)
+        assert plan.summary_rank_part_idx.unique().numel() == plan.num_scan_rows
         final_indices = plan.final_tail_idx[0]
         final_window = torch.where(
             final_indices >= 0,
@@ -362,8 +374,11 @@ def test_kcp_prefill_selection_preserves_strided_values(indices, token_range):
             assert actual.stride() == tensor.stride()
 
 
-@pytest.mark.parametrize("counts", [[8], [8, 3, 0]])
-def test_kcp_merge_preserves_partial_states_and_contiguous_output(counts):
+@pytest.mark.parametrize("counts", [[8], [8, 8, 8], [8, 3, 0]])
+@pytest.mark.parametrize("rank_part_order", [False, True])
+def test_kcp_merge_preserves_partial_states_and_contiguous_output(
+    counts, rank_part_order
+):
     """The dense path and ragged path preserve state at every slot boundary."""
     from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import (
         kcp_merge_states_torch,
@@ -388,15 +403,62 @@ def test_kcp_merge_preserves_partial_states_and_contiguous_output(counts):
                 state = state + summary[..., :dim].transpose(-1, -2)
         expected_final[request] = state
 
+    if rank_part_order:
+        order = [
+            slot for rank in range(slots // 2) for slot in (rank, slots - 1 - rank)
+        ]
+        summaries = summaries[order].contiguous()
+    original_transition = summaries[..., dim:].clone()
     initial, final = kcp_merge_states_torch(
         summaries,
         base,
         torch.tensor(counts, dtype=torch.int32, device="cuda"),
         all_slots_full=all(count == slots for count in counts),
+        rank_part_order=rank_part_order,
     )
     torch.testing.assert_close(initial, expected_inits, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(final, expected_final, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(
-        summaries[..., dim:], original[..., dim:], atol=0, rtol=0
+        summaries[..., dim:], original_transition, atol=0, rtol=0
     )
     assert initial.is_contiguous() and final.is_contiguous()
+
+
+@pytest.mark.parametrize("lengths", [[], [0, 0], [64, 97]])
+def test_kcp_summary_destination_coverage(lengths):
+    from itertools import accumulate
+
+    from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import (
+        kcp_compute_summaries,
+    )
+
+    torch.manual_seed(53173)
+    heads, dim, tokens = 2, 128, sum(lengths)
+    shape = (1, tokens, heads, dim)
+    kg = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.02
+    u = torch.randn_like(kg)
+    w = torch.randn_like(kg) * 0.02
+    gate = torch.zeros(shape, device="cuda", dtype=torch.float32)
+    cu = torch.tensor([0] + list(accumulate(lengths)), device="cuda", dtype=torch.int32)
+    expected = kcp_compute_summaries(kg, u, w, gate, cu, 64)
+    out = torch.full((6, heads, dim, 2 * dim), 7.0, device="cuda")
+    indices = torch.tensor([5, 1][: len(lengths)], device="cuda", dtype=torch.int64)
+    # Poison all destinations so a missing producer store cannot pass.
+    out[indices] = float("nan")
+    reference = out.clone()
+    reference[indices] = expected
+    actual = kcp_compute_summaries(
+        kg, u, w, gate, cu, 64, out=out, output_indices=indices
+    )
+    assert actual is out
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    if lengths == [0, 0]:
+        torch.testing.assert_close(
+            expected[..., :dim], torch.zeros_like(expected[..., :dim]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            expected[..., dim:],
+            torch.eye(dim, device="cuda").expand_as(expected[..., dim:]),
+            atol=0,
+            rtol=0,
+        )
