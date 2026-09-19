@@ -62,7 +62,6 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
-        self.num_gathered_tokens: int = 0
 
         self._global_batch: InputBatch | None = None
         self._local_batch: InputBatch | None = None
@@ -750,21 +749,15 @@ class PCPManager:
         )
         return gathered_kv_slot_mappings
 
-    def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def restore_hidden_states(
+        self, hidden_states: torch.Tensor, *, require_partition: bool = False
+    ) -> torch.Tensor:
+        if require_partition:
+            assert self._global_batch is not None
+            assert self._hidden_restore_idx is not None
         if self._hidden_restore_idx is None:
             return hidden_states
         gathered = get_pcp_group().all_gather(hidden_states, dim=0)
-        return gathered[self._hidden_restore_idx]
-
-    def gather_to_global(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """All-gather rank-local hidden states and restore global token order.
-
-        Returns the full tensor over the global batch's real tokens and records
-        its token count in ``num_gathered_tokens``.
-        """
-        assert self._hidden_restore_idx is not None
-        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
-        self.num_gathered_tokens = self._hidden_restore_idx.shape[0]
         return gathered[self._hidden_restore_idx]
 
     def reorder_gathered_to_global(self, gathered: torch.Tensor) -> torch.Tensor:

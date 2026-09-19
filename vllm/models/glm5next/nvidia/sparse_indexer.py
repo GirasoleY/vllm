@@ -95,6 +95,106 @@ def _kpool_compress_insert(
     )
 
 
+def _kpool_prefill_cache_update(
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    tail_slot_mapping: torch.Tensor | None,
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor | None,
+    compress_ape: torch.Tensor,
+    index_kpool: int,
+    head_dim: int,
+    round_scale: bool,
+) -> None:
+    """Write complete pools and persist every request's incomplete tail."""
+    _kpool_compress_insert(
+        k,
+        gate_score,
+        compress_ape,
+        kv_cache,
+        slot_mapping,
+        index_kpool,
+        head_dim,
+        round_scale=round_scale,
+    )
+    if tail_slot_mapping is not None and tail_kv_cache is not None:
+        kpool_ops.kpool_seed_tail_cache(
+            tail_kv_cache,
+            k,
+            gate_score,
+            tail_slot_mapping,
+            index_kpool,
+            head_dim,
+        )
+
+
+def _kpool_decode_cache_update(
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    tail_slot_mapping: torch.Tensor | None,
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor | None,
+    compress_ape: torch.Tensor,
+    index_kpool: int,
+    head_dim: int,
+    round_scale: bool,
+    *,
+    num_requests: int,
+    num_decode_tokens: int,
+    use_uniform: bool,
+    group_lens: torch.Tensor | None,
+    lmax: int,
+) -> None:
+    """Group request tokens in position order before updating the raw cache."""
+    if tail_slot_mapping is None or tail_kv_cache is None:
+        return
+    dec_k = k[:num_decode_tokens]
+    dec_gate = gate_score[:num_decode_tokens]
+    dec_slot = slot_mapping[:num_decode_tokens]
+    dec_pos = positions[:num_decode_tokens].to(torch.int32)
+    dec_tail = tail_slot_mapping[:num_decode_tokens]
+    if use_uniform:
+        shape2 = (num_requests, num_decode_tokens // num_requests)
+        dec_k = dec_k.view(*shape2, head_dim)
+        dec_gate = dec_gate.view(*shape2, head_dim)
+        dec_slot = dec_slot.view(shape2)
+        dec_pos = dec_pos.view(shape2)
+        dec_tail = dec_tail.view(shape2)
+    else:
+        assert group_lens is not None
+        scatter_idx = _build_decode_scatter_indices(
+            group_lens, num_requests, num_decode_tokens
+        )
+        dec_k, dec_gate, dec_slot, dec_pos, dec_tail = (
+            _scatter_decode_tokens_by_request(
+                tensor, pad, num_requests, lmax, scatter_idx
+            )
+            for tensor, pad in (
+                (dec_k, 0),
+                (dec_gate, 0),
+                (dec_slot, -1),
+                (dec_pos, -1),
+                (dec_tail, -1),
+            )
+        )
+    kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+        kv_cache,
+        tail_kv_cache,
+        dec_tail,
+        dec_k,
+        dec_gate,
+        compress_ape,
+        dec_slot,
+        dec_pos,
+        index_kpool,
+        head_dim,
+        round_scale=round_scale,
+    )
+
+
 def _kpool_pcp_cache_update(
     pcp_mgr: "PCPManager",
     k: torch.Tensor,
@@ -108,15 +208,7 @@ def _kpool_pcp_cache_update(
     head_dim: int,
     round_scale: bool,
 ) -> None:
-    """Replicated kpool cache update under PCP.
-
-    Each rank computed only its own rows (zig-zag prefill chunks, owned decode
-    rows), and pooling needs sequence-consecutive tokens, so the per-token
-    K/gate are all-gathered and reordered to the global (unpartitioned) batch
-    order; every rank then applies the full batch's pool-compression and tail
-    writes, keeping the caches coherent replicas. The slot mappings arrive in
-    the padded gathered layout and are reordered with the same index.
-    """
+    """Restore sequence order before writing the replicated kpool caches."""
     global_batch = pcp_mgr.global_batch
     assert global_batch is not None
     assert slot_mapping.shape[0] == pcp_mgr.pcp_world_size * k.shape[0], (
@@ -124,98 +216,60 @@ def _kpool_pcp_cache_update(
         f"the local batch: {slot_mapping.shape[0]} != "
         f"{pcp_mgr.pcp_world_size} * {k.shape[0]}"
     )
-    k_global = pcp_mgr.gather_to_global(k)
-    gate_global = pcp_mgr.gather_to_global(gate_score)
+    k_global = pcp_mgr.restore_hidden_states(k, require_partition=True)
+    gate_global = pcp_mgr.restore_hidden_states(gate_score, require_partition=True)
     slot_global = pcp_mgr.reorder_gathered_to_global(slot_mapping)
     num_tokens = slot_global.shape[0]
     assert k_global.shape[0] == num_tokens
 
-    # The global batch is decode-first (the invariant the indexer metadata
-    # builder assumes). For cache writes, still-prefilling rows (including
-    # short final chunks) are prefill rows: their K is pool-compressed here,
-    # while decode rows go through the tail-buffer kernel.
+    # Cache writes follow global request state, including short prefill chunks,
+    # rather than the local query classification used for indexer scoring.
     is_prefilling = global_batch.is_prefilling_np
     num_decode_reqs = int((~is_prefilling).sum())
     assert not is_prefilling[:num_decode_reqs].any()
     decode_lens_np = global_batch.num_scheduled_tokens[:num_decode_reqs]
     num_decode_tokens = int(decode_lens_np.sum())
-
     tail_global = None
     if tail_slot_mapping is not None and tail_kv_cache is not None:
         tail_global = pcp_mgr.reorder_gathered_to_global(tail_slot_mapping)
 
     if num_tokens > num_decode_tokens:
         prefill_slice = slice(num_decode_tokens, num_tokens)
-        _kpool_compress_insert(
+        _kpool_prefill_cache_update(
             k_global[prefill_slice],
             gate_global[prefill_slice],
-            compress_ape,
-            kv_cache,
             slot_global[prefill_slice],
+            tail_global[prefill_slice] if tail_global is not None else None,
+            kv_cache,
+            tail_kv_cache,
+            compress_ape,
             index_kpool,
             head_dim,
             round_scale=round_scale,
         )
-        # Persist each request's incomplete prefill pool so decode can finish
-        # it, including after PD transfer (same as the non-PCP path).
-        if tail_global is not None:
-            kpool_ops.kpool_seed_tail_cache(
-                tail_kv_cache,
-                k_global[prefill_slice],
-                gate_global[prefill_slice],
-                tail_global[prefill_slice],
-                index_kpool,
-                head_dim,
-            )
-
     if num_decode_tokens > 0 and tail_global is not None:
-        dec_k = k_global[:num_decode_tokens]
-        dec_gate = gate_global[:num_decode_tokens]
-        dec_slot = slot_global[:num_decode_tokens]
-        dec_tail = tail_global[:num_decode_tokens]
-        dec_pos = global_batch.positions[:num_decode_tokens].to(torch.int32)
         lmax = int(decode_lens_np.max())
-        if int(decode_lens_np.min()) == lmax:
-            next_n = num_decode_tokens // num_decode_reqs
-            shape2 = (num_decode_reqs, next_n)
-            dec_k = dec_k.view(*shape2, head_dim)
-            dec_gate = dec_gate.view(*shape2, head_dim)
-            dec_slot = dec_slot.view(shape2)
-            dec_pos = dec_pos.view(shape2)
-            dec_tail = dec_tail.view(shape2)
-        else:
-            scatter_idx = _build_decode_scatter_indices(
-                torch.from_numpy(decode_lens_np).to(k.device),
-                num_decode_reqs,
-                num_decode_tokens,
-            )
-            dec_k = _scatter_decode_tokens_by_request(
-                dec_k, 0, num_decode_reqs, lmax, scatter_idx
-            )
-            dec_gate = _scatter_decode_tokens_by_request(
-                dec_gate, 0, num_decode_reqs, lmax, scatter_idx
-            )
-            dec_slot = _scatter_decode_tokens_by_request(
-                dec_slot, -1, num_decode_reqs, lmax, scatter_idx
-            )
-            dec_pos = _scatter_decode_tokens_by_request(
-                dec_pos, -1, num_decode_reqs, lmax, scatter_idx
-            )
-            dec_tail = _scatter_decode_tokens_by_request(
-                dec_tail, -1, num_decode_reqs, lmax, scatter_idx
-            )
-        kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+        use_uniform = int(decode_lens_np.min()) == lmax
+        group_lens = (
+            None if use_uniform else torch.from_numpy(decode_lens_np).to(k.device)
+        )
+        _kpool_decode_cache_update(
+            k_global,
+            gate_global,
+            slot_global,
+            global_batch.positions,
+            tail_global,
             kv_cache,
             tail_kv_cache,
-            dec_tail,
-            dec_k,
-            dec_gate,
             compress_ape,
-            dec_slot,
-            dec_pos,
             index_kpool,
             head_dim,
             round_scale=round_scale,
+            num_requests=num_decode_reqs,
+            num_decode_tokens=num_decode_tokens,
+            use_uniform=use_uniform,
+            group_lens=group_lens,
+            lmax=lmax,
         )
 
 
@@ -343,43 +397,27 @@ def sparse_attn_indexer_kpool(
                         round_scale=(scale_fmt is not None),
                     )
             else:
-                # kpool prefill write: pool kpool consecutive prefill tokens via
-                # softmax(gate+ape)-weighted sum -> Hadamard -> fp8 -> pool slots.
-                # Decode tokens (the first num_decode_tokens in the batch) cannot be
-                # pooled here — their pool's earlier tokens are not in this batch —
-                # so they are deferred to the tail-buffer kernel in has_decode.
-                # compress_ratio == index_kpool makes slot_mapping pool-granular.
                 n_prefill = num_tokens - num_decode_tokens
                 if n_prefill > 0:
-                    # decode tokens are batched first; prefill tokens follow.
                     prefill_slice = slice(num_decode_tokens, num_tokens)
-                    _kpool_compress_insert(
-                        k[prefill_slice],
-                        gate_score[prefill_slice],
-                        compress_ape,
-                        kv_cache,
-                        slot_mapping[prefill_slice],
-                        index_kpool,
-                        head_dim,
-                        round_scale=(scale_fmt is not None),
-                    )
-                    # Persist each request's incomplete prefill pool so decode can
-                    # finish it, including after PD transfer. Tail slots use
-                    # ``pos % kpool`` within the request's tail block. Processing
-                    # only the batch's trailing tokens would miss all but the last
-                    # request in a multi-request prefill.
+                    tail_slot_mapping = None
                     if tail_kv_cache is not None and tail_prefix is not None:
                         tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
                         if tail_meta is not None:
                             assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-                            kpool_ops.kpool_seed_tail_cache(
-                                tail_kv_cache,
-                                k[prefill_slice],
-                                gate_score[prefill_slice],
-                                tail_meta.slot_mapping[prefill_slice],
-                                index_kpool,
-                                head_dim,
-                            )
+                            tail_slot_mapping = tail_meta.slot_mapping[prefill_slice]
+                    _kpool_prefill_cache_update(
+                        k[prefill_slice],
+                        gate_score[prefill_slice],
+                        slot_mapping[prefill_slice],
+                        tail_slot_mapping,
+                        kv_cache,
+                        tail_kv_cache,
+                        compress_ape,
+                        index_kpool,
+                        head_dim,
+                        round_scale=(scale_fmt is not None),
+                    )
         else:
             # standard: per-token fp8 quant + scatter (all tokens).
             assert scale_fmt is not None
@@ -569,92 +607,31 @@ def sparse_attn_indexer_kpool(
                 use_uniform = not decode_metadata.requires_padding
                 group_lens = decode_metadata.decode_lens
                 lmax = int(decode_metadata.decode_lens.max().item())
-            if not use_uniform:
-                # Non-uniform decode_lens (mixed plain-decode + spec-verify, or
-                # a variable MTP-verify batch): scatter actual tokens into a
-                # padded [B, lmax] layout. int32 tensors can't go through
-                # pack_seq_triton (float/uint8 only). The scatter indices are
-                # shared by all five scatters below (and the tail slot one).
-                scatter_idx = _build_decode_scatter_indices(
-                    group_lens, num_requests, num_decode_tokens
-                )
-                dec_k = _scatter_decode_tokens_by_request(
-                    k[:num_decode_tokens], 0, num_requests, lmax, scatter_idx
-                )
-                dec_gate = _scatter_decode_tokens_by_request(
-                    gate_score[:num_decode_tokens],
-                    0,
-                    num_requests,
-                    lmax,
-                    scatter_idx,
-                )
-                dec_slot = _scatter_decode_tokens_by_request(
-                    slot_mapping[:num_decode_tokens],
-                    -1,
-                    num_requests,
-                    lmax,
-                    scatter_idx,
-                )
-                dec_pos = _scatter_decode_tokens_by_request(
-                    positions[:num_decode_tokens].to(torch.int32),
-                    -1,
-                    num_requests,
-                    lmax,
-                    scatter_idx,
-                )
-            else:
-                next_n = num_decode_tokens // num_requests
-                shape2 = (num_requests, next_n)
-                dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
-                dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
-                dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
                 else None
             )
-            # Paged tail cache replaces the transient _DECODE_TAIL ring. Group
-            # the tail group's token-granular slot_mapping per-request, mirroring
-            # dec_slot / dec_pos, so the kernel gets each request's current-token
-            # tail slot (block * kpool + pos % kpool).
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
-            if tail_meta is None or tail_kv_cache is None:
-                dec_tail_slot = None
-            elif not use_uniform:
-                dec_tail_slot = _scatter_decode_tokens_by_request(
-                    tail_meta.slot_mapping[:num_decode_tokens],
-                    -1,
-                    num_requests,
-                    lmax,
-                    scatter_idx,
-                )
-            else:
-                dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(shape2)
-            # The compress kernel writes the raw fp8 cache (not the quant view);
-            # pass the underlying kv_cache, not kv_cache_quant_view.
-            if dec_tail_slot is not None:
-                # Single batched launch over [num_requests, next_n] replaces the
-                # per-token sequential loop. The kernel iterates each request's
-                # tokens in position order internally, preserving the
-                # pool-completion read-after-stash dependency that the loop
-                # provided. Inputs are already grouped per request (uniform:
-                # view; non-uniform: _scatter_decode_tokens_by_request padded to
-                # [B, lmax]) — no per-token .contiguous() copies needed.
-                kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
-                    kv_cache_raw,
-                    tail_kv_cache,
-                    dec_tail_slot,
-                    dec_k,
-                    dec_gate,
-                    compress_ape,
-                    dec_slot,
-                    dec_pos,
-                    index_kpool,
-                    head_dim,
-                    round_scale=(scale_fmt is not None),
-                )
+            _kpool_decode_cache_update(
+                k,
+                gate_score,
+                slot_mapping,
+                positions,
+                tail_meta.slot_mapping if tail_meta is not None else None,
+                kv_cache_raw,
+                tail_kv_cache,
+                compress_ape,
+                index_kpool,
+                head_dim,
+                round_scale=(scale_fmt is not None),
+                num_requests=num_requests,
+                num_decode_tokens=num_decode_tokens,
+                use_uniform=use_uniform,
+                group_lens=group_lens,
+                lmax=lmax,
+            )
         if current_platform.is_cuda_alike() and _fill_short_decode_causal_indices(
             topk_indices_buffer,
             positions,

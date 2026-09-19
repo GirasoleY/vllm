@@ -503,3 +503,15 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     )
     assert local_batch.dcp_local_seq_lens is not None
     assert torch.equal(local_batch.dcp_local_seq_lens.cpu(), expected)
+
+
+def test_restore_hidden_states_can_require_partition(monkeypatch):
+    manager, _ = _make_capture_manager(torch.ones((4, 2), dtype=torch.int32))
+    hidden = torch.arange(2)
+    group = MagicMock()
+    monkeypatch.setattr(pcp_manager_module, "get_pcp_group", lambda: group)
+
+    assert manager.restore_hidden_states(hidden) is hidden
+    with pytest.raises(AssertionError):
+        manager.restore_hidden_states(hidden, require_partition=True)
+    group.all_gather.assert_not_called()
