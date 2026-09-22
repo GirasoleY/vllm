@@ -92,6 +92,9 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+# Preserve the HPC binaries shipped in HY4 preview on both amd64 and arm64.
+FROM vllm/vllm-openai:hy4-preview@sha256:dc3f5fbe373b74141605a1e7843ae305faa648e584cac73a201395cc259522f6 AS hpc-ops-preview
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -1062,6 +1065,20 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         && uv pip install --system dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
+
+# Repack the installed preview distribution so uv installs it into the selected
+# Python environment without replacing the upstream image's torch dependency.
+RUN --mount=type=bind,from=hpc-ops-preview,source=/usr/local/lib/python3.12/dist-packages,target=/tmp/hpc-preview \
+    --mount=type=cache,target=/opt/uv/cache \
+    mkdir -p /tmp/hpc-repack /tmp/hpc-wheels && \
+    cp -a /tmp/hpc-preview/hpc \
+        /tmp/hpc-preview/hpc_ops-0.0.1.dev0+g35241cc.sm90.100.103.dist-info \
+        /tmp/hpc-repack/ && \
+    find /tmp/hpc-repack -type d -name __pycache__ -exec rm -rf {} + && \
+    rm -f /tmp/hpc-repack/*.dist-info/direct_url.json && \
+    uv tool run --from wheel==0.45.1 wheel pack /tmp/hpc-repack -d /tmp/hpc-wheels && \
+    uv pip install --system --no-deps /tmp/hpc-wheels/*.whl && \
+    rm -rf /tmp/hpc-repack /tmp/hpc-wheels
 
 # Expose the Rust frontend bundled in the wheel on the container's PATH.
 RUN ln -s "$(python3 -c 'import sysconfig; print(sysconfig.get_path("platlib"))')/vllm/vllm-rs" /usr/local/bin/vllm-rs \
