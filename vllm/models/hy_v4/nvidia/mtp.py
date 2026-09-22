@@ -126,13 +126,29 @@ def _prepare_mtp_fp8_expert_scale(
     name: str,
     loaded_weight: torch.Tensor,
 ) -> tuple[str, torch.Tensor]:
-    """Normalize block-wise FP8 expert scale names and dtypes."""
+    """Normalize block-wise FP8 expert, shared-expert and attention scales."""
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     if (
         isinstance(quant_config, Fp8Config)
         and quant_config.weight_block_size is not None
-        and ".mlp.experts." in name
+        and (
+            ".mlp.experts." in name
+            or ".mlp.shared_experts." in name
+            or any(
+                name.endswith("." + projection + ".scale")
+                for projection in (
+                    "q_a_proj",
+                    "kv_a_proj_with_mqa",
+                    "q_b_proj",
+                    "kv_b_proj",
+                    "linear_gate",
+                    "o_proj",
+                    "indexer.wq_b",
+                    "indexer.wk",
+                )
+            )
+        )
         and name.endswith(".scale")
     ):
         name = name[: -len(".scale")] + ".weight_scale_inv"
@@ -909,6 +925,11 @@ class HYV4MTP(nn.Module):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        if pending_wk_fp8:
+            raise RuntimeError(
+                "Incomplete MTP indexer WK weight/scale pairs: "
+                + ", ".join(pending_wk_fp8)
+            )
         logger.info_once("HYV4 MTP draft model loaded: %d params", len(loaded_params))
         unassigned_all = sorted(set(params_dict) - loaded_params)
         # KVCacheScaleParameter (``k_scale`` / ``v_scale`` / ``q_scale`` /
@@ -919,7 +940,7 @@ class HYV4MTP(nn.Module):
         # HY V4 checkpoints intentionally omit these (``kv_cache_quant_algo:
         # null``); silence them only when the parameter is actually the
         # sentinel type so a genuine mismatch on a same-named tensor still
-        # reaches the warning.
+        # reaches the completeness check.
         from vllm.model_executor.layers.quantization.kv_cache import (
             KVCacheScaleParameter,
         )
@@ -933,9 +954,7 @@ class HYV4MTP(nn.Module):
             # A draft parameter with no checkpoint source keeps its sentinel
             # init value (FP8 scales start at finfo(float32).min), which
             # silently destroys draft quality instead of failing the load.
-            logger.warning(
-                "HYV4 MTP draft model: %d parameters received no checkpoint value: %s",
-                len(unassigned),
-                ", ".join(unassigned),
+            raise RuntimeError(
+                "HYV4 MTP incomplete checkpoint load: " + ", ".join(unassigned)
             )
         return loaded_params

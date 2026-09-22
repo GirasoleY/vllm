@@ -420,7 +420,9 @@ class HYV4Model(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FP8 indexer wk dequant buffer (weight and scale arrive separately).
-        pending_wk_fp8: dict[str, dict[str, torch.Tensor]] = {}
+        if not hasattr(self, "_pending_wk_fp8"):
+            self._pending_wk_fp8: dict[str, dict[str, torch.Tensor]] = {}
+        pending_wk_fp8 = self._pending_wk_fp8
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         skip_topk_layers = compute_skip_topk_layers(self.config)
 
@@ -470,6 +472,17 @@ class HYV4Model(nn.Module):
             )
 
         for name, loaded_weight in weights:
+            # Hybrid checkpoints store dense FP8 scales as raw UE8M0 bytes.
+            # Routed MXFP4 expert scales have a different layout.
+            if name.endswith(".scale") and ".experts." not in name:
+                mapped = name[: -len(".scale")] + ".weight_scale_inv"
+                if mapped in params_dict or ".indexer.wk." in name:
+                    name = mapped
+                    if loaded_weight.dtype == torch.uint8:
+                        shard_id = getattr(loaded_weight, "shard_id", None)
+                        loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
+                        if shard_id is not None:
+                            loaded_weight.shard_id = shard_id
             if is_skip_topk_indexer_weight(name, skip_topk_layers):
                 continue
             if _try_load_fp8_indexer_wk(
@@ -710,7 +723,26 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             drop_prefixes["lm_head."] = None
         drop_mapper = WeightsMapper(orig_to_new_prefix=drop_prefixes)
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper | drop_mapper)
+        loaded = loader.load_weights(
+            weights, mapper=self.hf_to_vllm_mapper | drop_mapper
+        )
+        # AutoWeightsLoader may call the inner loader with separate chunks.
+        # Check completeness only after the entire checkpoint has been consumed.
+        pending = getattr(self.model, "_pending_wk_fp8", {})
+        if pending:
+            raise RuntimeError(
+                "Incomplete backbone indexer WK pairs: " + ", ".join(pending)
+            )
+        missing = [
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith("weight_scale_inv")
+            and name not in loaded
+            and not is_pp_missing_parameter(name, self)
+        ]
+        if missing:
+            raise RuntimeError("Unloaded backbone FP8 scales: " + ", ".join(missing))
+        return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
