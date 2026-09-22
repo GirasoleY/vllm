@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -34,6 +34,9 @@ from vllm.v1.worker.mamba_utils import (
     validate_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 
 @dataclass
@@ -86,6 +89,7 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        self.pcp_manager: PCPManager | None = None
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -97,6 +101,8 @@ class MambaHybridModelState(DefaultModelState):
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        self._mamba_group_ids: list[int] = []
+        self._mamba_spec: MambaSpec | None = None
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -108,8 +114,6 @@ class MambaHybridModelState(DefaultModelState):
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
-            self._mamba_group_ids: list[int] = []
-            self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
@@ -195,6 +199,14 @@ class MambaHybridModelState(DefaultModelState):
         """
         if not self._align_mode:
             return
+        pcp = self.pcp_manager
+        if pcp is not None and pcp.uses_global_kda_metadata:
+            global_batch = pcp.global_batch
+            if global_batch is not None:
+                # Mamba state slots use global request order on every PCP
+                # rank, including when KCP partitions token computation.
+                input_batch = global_batch
+                block_tables = pcp.global_block_tables
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
             return
@@ -241,6 +253,33 @@ class MambaHybridModelState(DefaultModelState):
         ubatch_idx: int = 0,
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
+        local_attn_metadata: dict[str, Any] = {}
+        pcp = self.pcp_manager
+        if (
+            pcp is not None
+            and pcp.uses_global_kda_metadata
+            and not for_capture
+            and pcp.global_batch is not None
+        ):
+            # Attention consumes local token segments; Mamba state is indexed
+            # by the original requests. Build each group on its own batch.
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            local_attn_metadata = super().prepare_attn(
+                input_batch,
+                cudagraph_mode,
+                block_tables,
+                slot_mappings,
+                [
+                    g if i not in mamba_group_ids else []
+                    for i, g in enumerate(attn_groups)
+                ],
+                kv_cache_config,
+            )
+            attn_groups = [
+                g if i in mamba_group_ids else [] for i, g in enumerate(attn_groups)
+            ]
+            input_batch = pcp.global_batch
+            block_tables = pcp.global_block_tables
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -329,6 +368,7 @@ class MambaHybridModelState(DefaultModelState):
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
+        attn_metadata.update(local_attn_metadata)
         if self.recoverssm is not None:
             self.recoverssm.record_step(
                 attn_metadata,

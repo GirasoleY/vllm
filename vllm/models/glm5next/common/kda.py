@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+from functools import partial
+
 import torch
 from torch import nn
 
@@ -45,6 +47,7 @@ if current_platform.is_rocm():
         fused_recurrent_kda,
     )
 else:
+    from vllm.models.glm5next.nvidia.ops import kcp
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
@@ -433,8 +436,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        # Call the decorated eager break directly so host-side prefill branches
-        # are not captured by PIECEWISE CUDA graphs.
+        # Keep host-side prefill dispatch inside the eager graph break.
         self._forward(
             qkv_proj_states=qkv,
             g1=g1,
@@ -443,7 +445,65 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        out = self.o_proj(core_attn_out)[0]
+        return out
+
+    def _conv_state_and_weights(self):
+        conv_state = self.kv_cache[0]
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+        if self._merged_conv_weight is None:
+            self._merged_conv_weight = torch.cat(
+                [
+                    m.weight.view(m.weight.size(0), m.weight.size(2))
+                    for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
+                ],
+                dim=0,
+            ).contiguous()
+        return conv_state, self._merged_conv_weight, self.q_conv1d.bias
+
+    def _forward_decode(
+        self,
+        qkv: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        qkv = causal_conv1d_update(
+            qkv,
+            conv_state,
+            conv_weights,
+            conv_bias,
+            activation="silu",
+            conv_state_indices=state_indices,
+        )
+        q, k, v = (
+            x.reshape(1, -1, self.local_num_heads, self.head_dim)
+            for x in qkv.split(self.local_projection_size, dim=-1)
+        )
+        fused_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=state_indices,
+            out=out,
+            sigmoid_beta=True,
+            a_log=self.A_log,
+            g_bias=self.dt_bias,
+            compute_gate=True,
+            lower_bound=self.kda_lower_bound,
+        )
 
     @eager_break_during_capture
     def _forward(
@@ -465,6 +525,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Profile/warmup dummy runs may omit mamba-family metadata.
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
+        recurrent_state = self.kv_cache[1]
+        conv_state, conv_weights, conv_bias = self._conv_state_and_weights()
+        state_indices = attn_metadata_narrowed.non_spec_state_indices_tensor
+        mgr = forward_context.additional_kwargs.get("pcp_manager")
+        plan = (
+            kcp.maybe_get_kcp_plan(forward_context, self.conv_size - 1)
+            if mgr is not None and mgr.uses_global_kda_metadata
+            else None
+        )
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = (
@@ -483,36 +552,93 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Safe-gate checkpoints use the bounded sigmoid variant.
         safe_gate = self.kda_safe_gate
         lower_bound = self.kda_lower_bound
-        constant_caches = self.kv_cache
 
-        qkv_proj_states = qkv_proj_states[:num_actual_tokens]
-        g1 = g1[:, :num_actual_tokens]
-        beta = beta[:, :num_actual_tokens]
+        num_prefills = attn_metadata_narrowed.num_prefills
+        conv_metadata: object = attn_metadata_narrowed
+        cp_halo = None
+        prefill_kwargs = {}
+        scatter_kwargs = {}
+        prefill_out = None
+        if plan is not None:
+            # Metadata/cache slots are global; projections and outputs are local.
+            assert not use_spec
+            assert state_indices is not None
+            if plan.has_decode or plan.prefill_src_range != (0, core_attn_out.size(1)):
+                core_attn_out.zero_()
+            if plan.has_decode:
+                count = plan.num_decode_reqs
+                self._forward_decode(
+                    qkv_proj_states[:count],
+                    g1[:, :count],
+                    beta[:, :count],
+                    conv_weights,
+                    conv_bias,
+                    conv_state,
+                    recurrent_state,
+                    state_indices[plan.decode_entry_idx],
+                    plan.decode_cu_seqlens,
+                    core_attn_out[:, :count],
+                )
+            if plan.num_prefill_reqs == 0:
+                return
+            qkv_proj_states = plan.select_prefill_tokens(qkv_proj_states)
+            g1 = plan.select_prefill_tokens(g1, dim=1)
+            beta = plan.select_prefill_tokens(beta, dim=1)
+            num_actual_tokens = plan.num_prefill_tokens
+            num_prefills = plan.num_prefill_reqs
+            has_initial_state = plan.prefill_has_initial_state
+            non_spec_state_indices_tensor = state_indices[plan.prefill_entry_idx]
+            non_spec_query_start_loc = plan.scan_cu_seqlens
+            conv_metadata = plan.conv_meta
+            # Empty ranks must also join both halo and summary collectives.
+            tails = kcp.gather_conv_tail_rows(plan, qkv_proj_states)
+            cp_halo = (
+                tails,
+                plan.halo_tail_idx,
+                plan.scan_req_idx,
+            )
+            if plan.prefill_src_range is not None and core_attn_out.is_contiguous():
+                prefill_out = plan.select_prefill_tokens(core_attn_out, dim=1)
+            prefill_kwargs = dict(
+                chunk_indices=plan.scan_chunk_indices,
+                chunk_offsets=plan.scan_chunk_offsets,
+                out=prefill_out,
+                sigmoid_beta=True,
+                use_fused_prepare=True,
+                state_preparer=partial(
+                    kcp.prepare_kcp_states,
+                    plan=plan,
+                    recurrent_state=recurrent_state,
+                    state_indices=non_spec_state_indices_tensor,
+                ),
+            )
+            scatter_kwargs = dict(
+                conv_state=conv_state,
+                conv_tail=tails.reshape(-1, qkv_proj_states.shape[-1]),
+                conv_tail_indices=plan.final_tail_idx,
+                has_initial_state=has_initial_state,
+            )
+        else:
+            qkv_proj_states = qkv_proj_states[:num_actual_tokens]
+            g1 = g1[:, :num_actual_tokens]
+            beta = beta[:, :num_actual_tokens]
 
-        (conv_state, recurrent_state) = constant_caches
-        # conv_state must be (..., dim, width-1) for the conv kernels.
-        # DS layout stores it that way directly; SD layout needs a transpose.
-        # Layout is process-global and resolved once at init (see __init__).
-        if not self._conv_state_dim_first:
-            conv_state = conv_state.transpose(-1, -2)
-
-        # One merged short-conv over q|k|v instead of three separate calls. The
-        # 1D conv is independent per channel, so concatenating q/k/v along the
-        # channel dim and running a single causal_conv1d is bit-identical to
-        # three calls. The merged weight is q|k|v conv weights concatenated;
-        # built once and cached (params are fixed after load). conv_state is
-        # already stored as the merged q|k|v state, so it is used directly.
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
-        conv_weights = self._merged_conv_weight
-        conv_bias = self.q_conv1d.bias
+        if not use_spec and num_prefills == 0:
+            assert non_spec_state_indices_tensor is not None
+            assert non_spec_query_start_loc is not None
+            self._forward_decode(
+                qkv_proj_states,
+                g1,
+                beta,
+                conv_weights,
+                conv_bias,
+                conv_state,
+                recurrent_state,
+                non_spec_state_indices_tensor[: attn_metadata_narrowed.num_decodes],
+                non_spec_query_start_loc[: attn_metadata_narrowed.num_decodes + 1],
+                core_attn_out[:, :num_actual_tokens],
+            )
+            return
 
         # Split projections / gating into spec (draft-verify) and non-spec token
         # groups when speculative decoding is active. Spec tokens carry
@@ -566,21 +692,26 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         q_ns = k_ns = v_ns = None
-        if attn_metadata_narrowed.num_prefills > 0:
+        if num_prefills > 0:
             assert qkv_ns is not None
-            qkv_ns = causal_conv1d_fn(
-                qkv_ns.transpose(0, 1),
-                conv_weights,
-                conv_bias,
-                activation="silu",
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-                output_groups=3,
-            )
-            q_ns, k_ns, v_ns = qkv_ns.unbind(0)
+            if qkv_ns.shape[0] == 0:
+                # No conv launch on empty ranks; the shared forward still merges states.
+                q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+            else:
+                qkv_ns = causal_conv1d_fn(
+                    qkv_ns.transpose(0, 1),
+                    conv_weights,
+                    conv_bias,
+                    activation="silu",
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    metadata=conv_metadata,
+                    output_groups=3,
+                    context_parallel_halo=cp_halo,
+                )
+                q_ns, k_ns, v_ns = qkv_ns.unbind(0)
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
@@ -638,18 +769,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         # --- core attention: non-spec path (prefill or plain decode) ---
         core_attn_out_non_spec = None
-        # Only the plain-decode recurrent kernel can write straight into the
-        # layer output buffer; the chunked prefill kernel cannot, so this
-        # stays None there and the merge copy below runs as before.
-        ns_out = None
-        if attn_metadata_narrowed.num_prefills > 0:
+        ns_out = prefill_out
+        if num_prefills > 0:
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
-            initial_state = gather_initial_states(
-                recurrent_state, non_spec_state_indices_tensor, has_initial_state
+            initial_state = (
+                gather_initial_states(
+                    recurrent_state, non_spec_state_indices_tensor, has_initial_state
+                )
+                if plan is None
+                else None  # Prepared from the shared scan's WY representation.
             )
-            if self.kda_prefill_backend == "flashkda":
+            if self.kda_prefill_backend == "flashkda" and plan is None:
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
                 # tokens: write to the workspace buffer and scatter below.
@@ -673,9 +805,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     k=_rearr(k_ns),
                     v=_rearr(v_ns),
                     raw_g=g1_ns,
-                    # Chunk path wants the pre-sigmoided fp32 beta (its
-                    # kernels don't sigmoid); beta_ns is raw bf16 from forward.
-                    beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+                    # Native preparation fuses beta sigmoid with q/k and gate.
+                    beta=(
+                        beta_ns
+                        if plan is not None
+                        else _cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0)
+                    ),
                     A_log=self.A_log,
                     g_bias=self.dt_bias,
                     initial_state=initial_state,
@@ -684,12 +819,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     cu_seqlens=non_spec_query_start_loc,
                     safe_gate=safe_gate,
                     lower_bound=lower_bound,
+                    **prefill_kwargs,
                 )
-            # Init cache
+            # Publish request-final states (not local segment-final states).
             scatter_states(
                 recurrent_state,
                 last_recurrent_state,
                 non_spec_state_indices_tensor,
+                **scatter_kwargs,
             )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
@@ -721,7 +858,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
 
         # --- merge spec / non-spec outputs back into token order ---
-        if use_spec and core_attn_out_non_spec is not None:
+        if plan is not None:
+            assert core_attn_out_non_spec is not None
+            if ns_out is None:
+                if plan.prefill_src_range is not None:
+                    plan.select_prefill_tokens(core_attn_out, dim=1).copy_(
+                        core_attn_out_non_spec
+                    )
+                else:
+                    core_attn_out[0, plan.prefill_src_idx] = core_attn_out_non_spec[0]
+        elif use_spec and core_attn_out_non_spec is not None:
             assert core_attn_out_spec is not None
             core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
             core_attn_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)

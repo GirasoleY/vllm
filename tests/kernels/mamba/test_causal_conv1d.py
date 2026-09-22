@@ -423,3 +423,99 @@ def test_causal_conv1d_grouped_output_matches_packed(group_size, state_dtype):
     ):
         torch.testing.assert_close(actual[:12], expected[:12], rtol=0, atol=0)
     torch.testing.assert_close(split_states, states, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 9, 17])
+def test_causal_conv1d_context_parallel_halo_preserves_output_and_cache(
+    state_dtype, weight_dtype, width
+):
+    """Read remote/continued halos directly, with no writes to the live cache."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+    set_random_seed(17)
+    halo_size = width - 1
+    channels, tokens = 3 * 192, 25
+    projected = torch.randn(tokens, channels + 64, device=DEVICE, dtype=torch.bfloat16)
+    x = projected[:, :channels].T
+    weight = torch.randn(channels, width, device=DEVICE, dtype=weight_dtype)
+    bias = torch.randn(channels, device=DEVICE, dtype=torch.float32)
+    states = torch.randn(
+        5, halo_size + 2, channels, device=DEVICE, dtype=state_dtype
+    ).transpose(1, 2)
+    states[0].fill_(float("nan"))
+    before = states.contiguous().view(torch.uint8).clone()
+    slots = torch.tensor([0, 3], device=DEVICE, dtype=torch.int32)
+    continued = torch.tensor([False, True], device=DEVICE)
+    requests = torch.tensor([0, 1, 0, 1, 1, 1], device=DEVICE)
+    prefix_positions = torch.arange(-halo_size, 0, device=DEVICE)
+    selectors = torch.stack(
+        [
+            prefix_positions,
+            torch.arange(-1, halo_size - 1, device=DEVICE),
+            torch.arange(halo_size, 2 * halo_size, device=DEVICE),
+            prefix_positions,
+            prefix_positions,
+            torch.arange(2 * halo_size, 3 * halo_size, device=DEVICE),
+        ]
+    )
+    tails = torch.randn(3 * max(halo_size, 1), channels, device=DEVICE, dtype=x.dtype)
+    prefix = torch.where(
+        continued[:, None, None], states[slots.long(), :, :halo_size].transpose(1, 2), 0
+    )
+    halo = torch.where(
+        (selectors >= 0)[..., None],
+        tails[selectors.clamp(min=0)],
+        prefix[requests[:, None], (selectors + halo_size).clamp(max=halo_size - 1)],
+    )
+    boundaries = [0, 1, 3, 22, 22, 23, 25]
+    expected = []
+    for i, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        if start == end:
+            continue
+        # Mirror the public API's dtype conversions, but compute convolution
+        # independently so missing taps cannot cancel between two kernel calls.
+        out, _ = causal_conv1d_ref(
+            x[:, start:end].to(state_dtype).float().unsqueeze(0),
+            weight.float(),
+            bias.float(),
+            initial_states=halo[i].to(state_dtype).float().T.unsqueeze(0),
+        )
+        expected.append(out)
+    expected = (
+        torch.cat(expected, dim=-1)
+        .squeeze(0)
+        .T.reshape(tokens, 3, channels // 3)
+        .permute(1, 0, 2)
+        .to(state_dtype)
+        .to(x.dtype)
+    )
+    cu_cpu = torch.tensor(boundaries, dtype=torch.int32)
+    nums, batch, offsets = compute_causal_conv1d_metadata(cu_cpu, device=DEVICE)
+    actual = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=states,
+        cache_indices=slots,
+        has_initial_state=continued,
+        context_parallel_halo=(tails, selectors, requests),
+        query_start_loc=cu_cpu.to(DEVICE),
+        output_groups=3,
+        metadata=SimpleNamespace(
+            nums_dict=nums, batch_ptr=batch, token_chunk_offset_ptr=offsets
+        ),
+        validate_data=True,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-5)
+    assert torch.equal(states.contiguous().view(torch.uint8), before)
+
+
+def test_causal_conv1d_context_parallel_wide_halo_matches_reference():
+    """A wide remote halo spans four BLOCK_M chunks without truncating taps."""
+    test_causal_conv1d_context_parallel_halo_preserves_output_and_cache(
+        state_dtype=torch.bfloat16, weight_dtype=torch.float32, width=33
+    )

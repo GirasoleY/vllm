@@ -7,11 +7,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, ModelConfig, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
+from vllm.v1.worker.cp_utils import model_supports_hybrid_pcp
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -55,6 +56,7 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        model_config: ModelConfig | None = None,
     ) -> None:
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
@@ -62,15 +64,20 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self._uses_global_kda_metadata = (
+            pcp_world_size > 1 and model_supports_hybrid_pcp(model_config)
+        )
 
         self._global_batch: InputBatch | None = None
         self._local_batch: InputBatch | None = None
         self._local_gather_idx: torch.Tensor | None = None
         self.draft_prefill_batch: InputBatch | None = None
+        self._local_segments: tuple[RankSegment, ...] = ()
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._global_block_tables: tuple[torch.Tensor, ...] | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
@@ -143,6 +150,10 @@ class PCPManager:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
+            if model_supports_hybrid_pcp(model_config):
+                raise NotImplementedError(
+                    "GLM KCP does not support speculative decoding yet."
+                )
             if speculative_config.use_dspark():
                 dcp_size = parallel_config.decode_context_parallel_size
                 if dcp_size not in (1, pcp_size):
@@ -159,6 +170,14 @@ class PCPManager:
                     "speculative decoding."
                 )
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if (
+            model_supports_hybrid_pcp(model_config)
+            and cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            # KCP dispatch and global request metadata are not capture-safe yet.
+            raise NotImplementedError(
+                "Hybrid PCP does not support CUDA graphs yet. Use cudagraph_mode=NONE."
+            )
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if parallel_config.decode_context_parallel_size > 1 and not is_sparse_mla:
             # Dense MLA prefill sizes its DCP KV gather from each rank's own
@@ -411,6 +430,27 @@ class PCPManager:
         """The unpartitioned scheduled batch for the current step."""
         return self._global_batch
 
+    @property
+    def local_batch(self) -> InputBatch | None:
+        """This rank's partitioned batch for the current step."""
+        return self._local_batch
+
+    @property
+    def global_block_tables(self) -> tuple[torch.Tensor, ...]:
+        """Per-kv-cache-group block tables in global batch order."""
+        assert self._global_block_tables is not None
+        return self._global_block_tables
+
+    @property
+    def local_segments(self) -> tuple[RankSegment, ...]:
+        """The actual request segments assigned by the current partition."""
+        return self._local_segments
+
+    @property
+    def uses_global_kda_metadata(self) -> bool:
+        """Whether KDA caches/metadata use global request order under PCP."""
+        return self._uses_global_kda_metadata
+
     def partition_batch(
         self,
         input_batch: InputBatch,
@@ -436,6 +476,7 @@ class PCPManager:
         )
 
         local_segments = segments_by_rank[self.pcp_rank]
+        self._local_segments = tuple(local_segments)
         if not local_segments:
             local_segments = [
                 RankSegment(
@@ -661,8 +702,10 @@ class PCPManager:
 
     def prepare_inputs_to_capture(self, input_batch: InputBatch) -> InputBatch:
         """Stage a capture or dummy batch in persistent PCP input buffers."""
-        # Capture/dummy batches must not reuse the preceding global cache inputs.
+        # Dummy/capture batches are not partitioned; drop the previous step's
+        # global batch so hybrid-PCP consumers cannot observe a stale one.
         self._global_batch = None
+        self._local_segments = ()
         input_buffers = self.input_buffers
         num_reqs = input_batch.num_reqs_after_padding
         num_tokens = input_batch.num_tokens_after_padding
@@ -699,6 +742,14 @@ class PCPManager:
             out_ptrs=self._local_block_table_ptrs,
         )
         slot_mappings = self.prepare_slot_mappings()
+        if self.uses_global_kda_metadata:
+            # State caches remain indexed by global requests while KCP splits
+            # their token computation into rank-local segments.
+            assert self._global_batch is not None
+            self._global_block_tables = self._block_tables.gather_block_tables(
+                self._global_batch.idx_mapping,
+                self._global_batch.num_reqs,
+            )
         return block_tables, slot_mappings
 
     def prepare_slot_mappings(self) -> torch.Tensor:
@@ -875,7 +926,7 @@ def maybe_build_pcp_manager(
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
-    return cls(
+    manager = cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
         device=device,
@@ -885,4 +936,6 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+        model_config=vllm_config.model_config,
     )
+    return manager

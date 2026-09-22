@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import ModelConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_prefills_and_extends
 
@@ -18,6 +19,17 @@ else:
 logger = init_logger(__name__)
 
 
+def model_supports_hybrid_pcp(model_config: ModelConfig | None) -> bool:
+    """Resolve the model's explicit opt-in; resolution failures remain errors."""
+    if model_config is None:
+        return False
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
+    model_cls, _ = model_config.registry.resolve_model_cls(
+        architectures, model_config=model_config
+    )
+    return bool(getattr(model_cls, "supports_hybrid_pcp", False))
+
+
 def check_attention_cp_compatibility(
     vllm_config: VllmConfig,
     target_layer_names: set[str] | None = None,
@@ -25,7 +37,16 @@ def check_attention_cp_compatibility(
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+    hybrid_pcp = pcp_size > 1 and model_supports_hybrid_pcp(vllm_config.model_config)
+    # The current KCP summary backend uses SM10x tcgen05/TMEM operations.
+    # A Hopper summary backend can extend support to SM90 later.
+    if hybrid_pcp and not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    ):
+        raise ValueError("The current GLM KCP summary backend requires CUDA SM10x.")
     if pcp_size * dcp_size > 1:
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
         for layer_name, layer in layers.items():
@@ -33,6 +54,8 @@ def check_attention_cp_compatibility(
             get_attn_backend = getattr(layer, "get_attn_backend", None)
             if pcp_size > 1 and check_pcp and get_attn_backend is not None:
                 backend = get_attn_backend()
+                if hybrid_pcp and isinstance(layer, MambaBase):
+                    continue
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "
                     f"but {backend.get_name()} does not support PCP."

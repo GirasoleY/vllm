@@ -36,6 +36,8 @@ def _make_config(cudagraph_mode: CUDAGraphMode):
             use_mla=True,
             is_encoder_decoder=False,
             hf_text_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(architectures=[]),
+            registry=SimpleNamespace(resolve_model_cls=lambda *a, **kw: (object, None)),
         ),
         lora_config=None,
         speculative_config=None,
@@ -74,6 +76,43 @@ def test_validate_config_rejects_full_graph_for_prefills():
         PCPManager.validate_config(
             _make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+@pytest.mark.parametrize("mode", list(CUDAGraphMode))
+@pytest.mark.parametrize("dcp", [1, 2])
+@pytest.mark.parametrize("pcp", [1, 2])
+def test_hybrid_pcp_rejects_graph_capture(monkeypatch, mode, dcp, pcp):
+    """PIECEWISE must not freeze ordinary dispatch while KCP metadata is absent."""
+    config = _make_config(mode)
+    config.parallel_config.prefill_context_parallel_size = pcp
+    config.parallel_config.decode_context_parallel_size = dcp
+    config.model_config.hf_text_config.index_topk = 2048
+    monkeypatch.setattr(pcp_manager_module, "model_supports_hybrid_pcp", lambda _: True)
+    if pcp > 1 and mode != CUDAGraphMode.NONE:
+        with pytest.raises(NotImplementedError, match="Hybrid PCP.*CUDA graphs"):
+            PCPManager.validate_config(config, supports_mm_inputs=False)
+    else:
+        PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_validate_config_rejects_speculation_only_for_hybrid_pcp(
+    monkeypatch, hybrid, pcp_size
+):
+    config = _make_config(CUDAGraphMode.NONE)
+    config.parallel_config.prefill_context_parallel_size = pcp_size
+    config.speculative_config = SimpleNamespace(
+        method="mtp", use_dspark=lambda: False, use_multi_module_mtp=lambda: False
+    )
+    monkeypatch.setattr(
+        pcp_manager_module, "model_supports_hybrid_pcp", lambda _: hybrid
+    )
+    if hybrid and pcp_size > 1:
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            PCPManager.validate_config(config, supports_mm_inputs=False)
+    else:
+        PCPManager.validate_config(config, supports_mm_inputs=False)
 
 
 def test_replicated_decode_piecewise_graph_padding(monkeypatch):

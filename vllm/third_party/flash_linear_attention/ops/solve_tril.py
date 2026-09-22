@@ -32,7 +32,7 @@ assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
-    key=["BT"],
+    key=["BT", "DIAGONAL_INVERTED"],
 )
 @triton.jit(do_not_specialize=["T"])
 def solve_tril_16x16_kernel(
@@ -46,6 +46,7 @@ def solve_tril_16x16_kernel(
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    DIAGONAL_INVERTED: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -79,14 +80,16 @@ def solve_tril_16x16_kernel(
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, 16], [H * 16, 1], [16, 16])
         b_A = desc.load([i_t * 16, offset]).to(tl.float32)
-    b_A = -tl.where(m_A, b_A, 0)
+    if not DIAGONAL_INVERTED:
+        b_A = -tl.where(m_A, b_A, 0)
 
-    for i in range(2, min(16, T - i_t * 16)):
-        # [16]
-        b_a = -tl.load(A + (i_t * 16 + i) * H * BT + o_i + offset)
-        b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
-        b_A = tl.where((o_i == i)[:, None], b_a, b_A)
-    b_A += m_I
+        for i in range(2, min(16, T - i_t * 16)):
+            # [16]
+            b_a = -tl.load(A + (i_t * 16 + i) * H * BT + o_i + offset)
+            b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
+            b_A = tl.where((o_i == i)[:, None], b_a, b_A)
+        b_A += m_I
+
     if not USE_TMA:
         p_Ai = tl.make_block_ptr(
             Ai, (T, 16), (H * 16, 1), (i_t * 16, 0), (16, 16), (1, 0)
@@ -107,7 +110,7 @@ def solve_tril_16x16_kernel(
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
-    key=["H", "BT", "IS_VARLEN"],
+    key=["H", "BT", "IS_VARLEN", "DIAGONAL_INVERTED"],
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_32x32_inverse_kernel(
@@ -121,6 +124,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    DIAGONAL_INVERTED: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -159,20 +163,21 @@ def merge_16x16_to_32x32_inverse_kernel(
         b_Ai_22 = desc.load([i_t * BT + 16, 16]).to(tl.float32)
 
     # [16, 16]
-    b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
-    b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
+    if not DIAGONAL_INVERTED:
+        b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
+        b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
 
-    for i in range(2, min(16, T - i_t * BT)):
-        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
-        b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
-        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
-    for i in range(16 + 2, min(32, T - i_t * BT)):
-        b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
-        b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
-        b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
+        for i in range(2, min(16, T - i_t * BT)):
+            b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
+            b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+            b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+        for i in range(16 + 2, min(32, T - i_t * BT)):
+            b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
+            b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
+            b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
 
-    b_Ai_11 += m_I
-    b_Ai_22 += m_I
+        b_Ai_11 += m_I
+        b_Ai_22 += m_I
 
     if not USE_TMA:
         p_A_21 = tl.make_block_ptr(
@@ -225,6 +230,20 @@ def merge_16x16_to_32x32_inverse_kernel(
         )
 
 
+    # Match the defined triangular output contract in the existing producer.
+    b_zero = tl.full((16, 16), 0, tl.float32)
+    for i in tl.static_range(BT // 16):
+        for j in tl.static_range(i + 1, BT // 16):
+            if USE_TMA:
+                desc_o.store([i_t * BT + i * 16, j * 16], b_zero.to(desc_o.dtype))
+            else:
+                p_upper = tl.make_block_ptr(
+                    Ai, (T, BT), (H * BT, 1),
+                    (i_t * BT + i * 16, j * 16), (16, 16), (1, 0)
+                )
+                tl.store(p_upper, b_zero.to(Ai.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
@@ -232,7 +251,7 @@ def merge_16x16_to_32x32_inverse_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
-    key=["H", "BT", "IS_VARLEN"],
+    key=["H", "BT", "IS_VARLEN", "DIAGONAL_INVERTED"],
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_64x64_inverse_kernel(
@@ -246,6 +265,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    DIAGONAL_INVERTED: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -294,31 +314,32 @@ def merge_16x16_to_64x64_inverse_kernel(
         b_Ai_44 = desc.load([i_t * BT + 48, 48]).to(tl.float32)
 
     # [16, 16]
-    b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
-    b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
-    b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
-    b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
+    if not DIAGONAL_INVERTED:
+        b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
+        b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
+        b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
+        b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
 
-    for i in range(2, min(16, T - i_t * BT)):
-        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
-        b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
-        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
-    for i in range(16 + 2, min(32, T - i_t * BT)):
-        b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
-        b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
-        b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
-    for i in range(32 + 2, min(48, T - i_t * BT)):
-        b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
-        b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
-        b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
-    for i in range(48 + 2, min(64, T - i_t * BT)):
-        b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
-        b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
-        b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
-    b_Ai_11 += m_I
-    b_Ai_22 += m_I
-    b_Ai_33 += m_I
-    b_Ai_44 += m_I
+        for i in range(2, min(16, T - i_t * BT)):
+            b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
+            b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
+            b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
+        for i in range(16 + 2, min(32, T - i_t * BT)):
+            b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
+            b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
+            b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
+        for i in range(32 + 2, min(48, T - i_t * BT)):
+            b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
+            b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
+            b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
+        for i in range(48 + 2, min(64, T - i_t * BT)):
+            b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
+            b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
+            b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
+        b_Ai_11 += m_I
+        b_Ai_22 += m_I
+        b_Ai_33 += m_I
+        b_Ai_44 += m_I
 
     if not USE_TMA:
         p_A_21 = tl.make_block_ptr(
@@ -503,16 +524,32 @@ def merge_16x16_to_64x64_inverse_kernel(
         )
 
 
+    # Match the defined triangular output contract in the existing producer.
+    b_zero = tl.full((16, 16), 0, tl.float32)
+    for i in tl.static_range(BT // 16):
+        for j in tl.static_range(i + 1, BT // 16):
+            if USE_TMA:
+                desc_o.store([i_t * BT + i * 16, j * 16], b_zero.to(desc_o.dtype))
+            else:
+                p_upper = tl.make_block_ptr(
+                    Ai, (T, BT), (H * BT, 1),
+                    (i_t * BT + i * 16, j * 16), (16, 16), (1, 0)
+                )
+                tl.store(p_upper, b_zero.to(Ai.dtype.element_ty), boundary_check=(0, 1))
+
+
 @input_guard
 def solve_tril(
     A: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.float,
+    diagonal_inverted: bool = False,
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A
-    A should be strictly lower triangular, i.e., A.triu() == 0.
+    A should be strictly lower triangular, i.e., A.triu() == 0, unless its
+    16x16 diagonal blocks have already been inverted.
 
     Args:
         A (torch.Tensor):
@@ -524,6 +561,8 @@ def solve_tril(
         output_dtype (torch.dtype):
             The dtype of the output tensor. Default: `torch.float`.
             If `None`, the output dtype will be the same as the input dtype.
+        diagonal_inverted (bool):
+            Whether the 16x16 diagonal blocks already contain their inverses.
 
     Returns:
         (I + A)^-1 with the same shape as A
@@ -536,7 +575,7 @@ def solve_tril(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    Ai = torch.zeros_like(A, dtype=output_dtype)
+    Ai = torch.empty_like(A, dtype=output_dtype)
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
@@ -554,5 +593,6 @@ def solve_tril(
         BT=BT,
         USE_TMA=is_tma_supported,
         DOT_PRECISION=FLA_TRIL_PRECISION,
+        DIAGONAL_INVERTED=diagonal_inverted,
     )
     return Ai

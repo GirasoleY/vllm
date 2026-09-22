@@ -13,6 +13,146 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
+@triton.jit
+def _causal_conv1d_context_parallel_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    states,
+    cache_indices,
+    has_initial_states,
+    tails,
+    halo_indices,
+    request_indices,
+    o_ptr,
+    query_start_loc,
+    batch_ptr,
+    token_chunk_offset_ptr,
+    dim: tl.constexpr,
+    width: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_x_token,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_state_seq: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    stride_cache_indices: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token,
+    stride_o_group,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    OUTPUT_GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    program = tl.program_id(0)
+    idx_seq = tl.load(batch_ptr + program).to(tl.int64)
+    if idx_seq == pad_slot_id:
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+        return
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    chunk_offset = tl.load(token_chunk_offset_ptr + program)
+    sequence_start = tl.load(query_start_loc + idx_seq)
+    seqlen = tl.load(query_start_loc + idx_seq + 1) - sequence_start
+
+    # Group token chunks so only the first program needs the remote halo.
+    CHUNKS_PER_PROGRAM: tl.constexpr = max(1, tl.cdiv(width - 1, BLOCK_M))
+    if chunk_offset % CHUNKS_PER_PROGRAM != 0:
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+        return
+    token_offset = BLOCK_M * chunk_offset
+    segment_len = min(BLOCK_M * CHUNKS_PER_PROGRAM, seqlen - token_offset)
+    x_base = x_ptr + sequence_start * stride_x_token + idx_feats * stride_x_dim
+    if width > 1:
+        if chunk_offset == 0:
+            history = ()  # type: tuple
+            request = tl.load(request_indices + idx_seq).to(tl.int64)
+            slot = tl.load(cache_indices + request * stride_cache_indices).to(tl.int64)
+            state_base = states + slot * stride_state_seq + idx_feats * stride_state_dim
+            continued = tl.load(has_initial_states + request).to(tl.int1)
+            for position in tl.static_range(width - 1):
+                source = tl.load(halo_indices + idx_seq * (width - 1) + position).to(
+                    tl.int64
+                )
+                from_tail = tl.load(
+                    tails + tl.maximum(source, 0) * dim + idx_feats,
+                    (source >= 0) & (idx_feats < dim),
+                    other=0.0,
+                ).to(x_ptr.dtype.element_ty)
+                from_cache = tl.load(
+                    state_base + (source + width - 1) * stride_state_token,
+                    (source < 0) & continued & (idx_feats < dim),
+                    other=0.0,
+                ).to(x_ptr.dtype.element_ty)
+                value = tl.where(source >= 0, from_tail, from_cache)
+                history += (value,)
+        else:
+            history = ()
+            for position in tl.static_range(width - 1):
+                value = tl.load(
+                    x_base + (token_offset - width + 1 + position) * stride_x_token,
+                    idx_feats < dim,
+                    other=0.0,
+                    cache_modifier=".ca",
+                )
+                history += (value,)
+    else:
+        history = ()
+
+    weights = ()  # type: tuple
+    for position in tl.static_range(width):
+        value = tl.load(
+            w_ptr + idx_feats * stride_w_dim + position * stride_w_width,
+            idx_feats < dim,
+            other=0.0,
+        )
+        weights += (value,)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + idx_feats, idx_feats < dim, other=0.0).to(tl.float32)
+    else:
+        bias = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    if OUTPUT_GROUP_SIZE:
+        output_features = (idx_feats // OUTPUT_GROUP_SIZE).to(
+            tl.int64
+        ) * stride_o_group + idx_feats % OUTPUT_GROUP_SIZE
+    else:
+        output_features = idx_feats * stride_o_dim
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+    for token in range(segment_len):
+        acc = bias
+        next_history = ()  # type: tuple
+        for position in tl.static_range(width):
+            if position == width - 1:
+                tap = tl.load(
+                    x_base + (token_offset + token) * stride_x_token, idx_feats < dim
+                )
+            else:
+                tap = history[position]
+            acc += tap.to(tl.float32) * weights[position].to(tl.float32)
+            if position > 0:
+                next_history += (tap,)
+        history = next_history
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+        tl.store(
+            o_ptr
+            + (sequence_start + token_offset + token) * stride_o_token
+            + output_features,
+            acc,
+            idx_feats < dim,
+        )
+
+
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -505,6 +645,8 @@ def causal_conv1d_fn(
     metadata=None,
     validate_data=False,
     output_groups: int = 1,
+    context_parallel_halo: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None = None,
 ):
     """Support varlen + continuous batching when x is 2D tensor.
 
@@ -557,9 +699,27 @@ def causal_conv1d_fn(
         The block size to align the cached states to
     output_groups: when greater than 1, split channels into equal groups and
         write contiguous (group, token, channel-within-group) output.
+    context_parallel_halo: optional (gathered tails, halo selectors, request indices).
+        Selectors address flattened gathered tokens, or -(width - 1)..-1 for
+        cached prefix. cache_indices and has_initial_state address requests,
+        not segments. No APC; the real conv_states cache is read-only.
     out: same shape as `x` by default; otherwise
         (output_groups, cu_seq_len, dim // output_groups).
     """
+    cp_tails = cp_halo_indices = cp_request_indices = None
+    if context_parallel_halo is not None:
+        cp_tails, cp_halo_indices, cp_request_indices = context_parallel_halo
+        assert block_idx_last_scheduled_token is None
+        assert metadata is not None and cache_indices is not None
+        assert has_initial_state is not None and cp_tails.is_contiguous()
+        assert cp_tails.shape[-1] == x.shape[0]
+        assert cp_halo_indices.shape == (
+            query_start_loc.numel() - 1,
+            weight.shape[1] - 1,
+        )
+        assert cp_request_indices.shape == (query_start_loc.numel() - 1,)
+        assert cp_halo_indices.is_contiguous() and cp_request_indices.is_contiguous()
+
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
@@ -593,8 +753,10 @@ def causal_conv1d_fn(
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
+    if width < 1:
+        raise ValueError("weight must have a positive convolution width")
     state_len = width - 1
-    np2_statelen = triton.next_power_of_2(state_len)
+    np2_statelen = triton.next_power_of_2(max(1, state_len))
 
     padded_batch = query_start_loc.size(0) - 1
     stride_x_dim = x.stride(0)
@@ -642,9 +804,14 @@ def causal_conv1d_fn(
             assert dim == bias.size(0)
         if cache_indices is not None:
             assert cache_indices.dim() == 1
-            assert padded_batch == cache_indices.size(0)
+            if context_parallel_halo is None:
+                assert padded_batch == cache_indices.size(0)
         if has_initial_state is not None:
-            assert has_initial_state.size() == (padded_batch,)
+            if context_parallel_halo is None:
+                assert has_initial_state.size() == (padded_batch,)
+            else:
+                assert cache_indices is not None
+                assert has_initial_state.shape == cache_indices.shape
             assert conv_states is not None, (
                 "ERROR: `has_initial_state` is used, which needs also `conv_states`"
             )
@@ -728,6 +895,45 @@ def causal_conv1d_fn(
     if batch_ptr.device != x.device:
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
+
+    if context_parallel_halo is not None:
+        _causal_conv1d_context_parallel_kernel[grid](
+            x,
+            weight,
+            bias,
+            conv_states,
+            cache_indices,
+            has_initial_state,
+            cp_tails,
+            cp_halo_indices,
+            cp_request_indices,
+            out,
+            query_start_loc,
+            batch_ptr,
+            token_chunk_offset_ptr,
+            dim,
+            width,
+            stride_x_dim,
+            stride_x_token,
+            stride_w_dim,
+            stride_w_width,
+            stride_istate_seq,
+            stride_istate_dim,
+            stride_istate_token,
+            stride_cache_indices,
+            stride_o_dim,
+            stride_o_token,
+            stride_o_group,
+            pad_slot_id,
+            HAS_BIAS=bias is not None,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            OUTPUT_GROUP_SIZE=dim // output_groups if output_groups > 1 else 0,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=256,
+            num_stages=2,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+        )
+        return out.to(original_x_dtype)
 
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
