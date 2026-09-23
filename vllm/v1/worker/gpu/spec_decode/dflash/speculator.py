@@ -298,11 +298,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs, self.num_speculative_steps
         )
 
-    def _get_graph_dispatch_shape(
-        self, num_reqs: int, num_query_tokens: int
-    ) -> tuple[int, int]:
-        return num_reqs, num_query_tokens
-
     @torch.inference_mode()
     def materialize_context_kv(
         self,
@@ -464,22 +459,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             else (None, num_query_tokens)
         )
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        dispatch_num_reqs, dispatch_num_tokens = self._get_graph_dispatch_shape(
-            num_reqs, num_batch_tokens
-        )
-        if batch_sync is not None and dispatch_num_tokens != num_batch_tokens:
-            # The dispatch shape was re-pinned (fixed DSpark graph batch): keep
-            # the reused DP agreement consistent with the dispatched count.
-            batch_sync = replace(
-                batch_sync,
-                num_tokens_across_dp=torch.full_like(
-                    batch_sync.num_tokens_across_dp, dispatch_num_tokens
-                ),
-            )
         batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
-            dispatch_num_reqs,
-            dispatch_num_tokens,
+            num_reqs,
+            num_batch_tokens,
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
