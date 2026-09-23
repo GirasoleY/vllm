@@ -45,10 +45,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         super().__init__(vllm_config, device)
 
-        self.hidden_states = torch.zeros(
-            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
-        )
-
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
@@ -315,22 +311,18 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
-        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
-        self.draft_max_seq_len = min(
-            max_seq_len + self.num_query_per_req, self.max_model_len
-        )
-
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+                torch.cat(
+                    [states[:num_target_tokens] for states in aux_hidden_states], dim=-1
+                )
             )
         else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+            hidden_states = last_hidden_states[:num_target_tokens]
 
         if dummy_run and skip_attn_for_dummy_run:
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
+                hidden_states,
                 self.context_positions[:num_target_tokens],
             )
             return
@@ -373,6 +365,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                context_only=self.speculative_config.is_dspark_prefill_only(),
             )
 
         if dummy_run:
@@ -385,7 +378,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
+            hidden_states,
             self.context_positions[:num_target_tokens],
             context_slots,
         )
@@ -420,6 +413,10 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_query_tokens = num_reqs * self.num_query_per_req
+        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        self.draft_max_seq_len = min(
+            max_seq_len + self.num_query_per_req, self.max_model_len
+        )
         self.materialize_context_kv(
             input_batch,
             last_hidden_states,
@@ -553,6 +550,7 @@ def _prepare_dflash_inputs_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    CONTEXT_ONLY: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -567,21 +565,9 @@ def _prepare_dflash_inputs_kernel(
     valid_ctx_end = ctx_end - num_rejected
     num_valid_ctx = valid_ctx_end - ctx_start
 
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    if num_sampled > 0:
-        bonus_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
-    else:
-        # Chunked prefilling: splice in the next prefill token.
-        bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
-
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
-    query_base = req_idx * num_query_per_req
-
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_ctx = j < num_ctx
     is_valid_ctx = j < num_valid_ctx
-    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
-    query_off = j - num_valid_ctx
 
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
@@ -612,6 +598,21 @@ def _prepare_dflash_inputs_kernel(
     # a replayed graph cannot observe a stale value from an earlier batch.
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+
+    if CONTEXT_ONLY:
+        return
+
+    num_sampled = tl.load(num_sampled_ptr + req_idx)
+    if num_sampled > 0:
+        bonus_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
+    else:
+        # Chunked prefilling: splice in the next prefill token.
+        bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
+
+    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    query_base = req_idx * num_query_per_req
+    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
+    query_off = j - num_valid_ctx
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
@@ -749,13 +750,17 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    *,
+    context_only: bool = False,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
-    max_tokens_per_req = max_target_query_len + num_query_per_req
+    max_tokens_per_req = max_target_query_len + (
+        0 if context_only else num_query_per_req
+    )
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
@@ -796,4 +801,5 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        CONTEXT_ONLY=context_only,
     )

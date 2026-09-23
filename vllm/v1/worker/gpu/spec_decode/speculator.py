@@ -186,6 +186,7 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
+            and not self.speculative_config.is_dspark_prefill_only()
         )
         self.use_acceptance_estimator = self.enable_adaptive_verification
         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
