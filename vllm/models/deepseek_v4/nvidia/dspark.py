@@ -337,18 +337,65 @@ def _insert_context_kv(
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """RoPE + quant + paged-cache insert of (already kv_norm'd) context KV."""
+    """RoPE + quant + paged-cache insert of (already kv_norm'd) context KV.
+
+    Reuses the DSV4 fused insert ops (which also process a query; we pass a dummy
+    query and discard it, since context tokens have no query). Mirrors
+    ``DeepseekV4Attention._fused_qnorm_rope_kv_insert``.
+    """
     swa_cache = attn.swa_cache_layer.kv_cache
     block_size = attn.swa_cache_layer.block_size
-    torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-        kv,
-        swa_cache.view(swa_cache.shape[0], block_size, -1),
-        slot_mapping,
-        positions,
-        attn.rotary_emb.cos_sin_cache,
-        block_size,
-        getattr(attn, "_flashinfer_fp8_kv_scale", None),
+    cos_sin_cache = attn.rotary_emb.cos_sin_cache
+    cache_dtype = swa_cache.dtype
+    n_ctx = kv.shape[0]
+    dummy_q = torch.zeros(
+        (n_ctx, attn.n_local_heads, attn.head_dim),
+        dtype=kv.dtype,
+        device=kv.device,
     )
+    if cache_dtype == torch.uint8:
+        # fp8_ds_mla UE8M0 paged layout
+        swa_2d = swa_cache.view(swa_cache.shape[0], -1)
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            dummy_q,
+            kv,
+            swa_2d,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            attn.padded_heads,
+            attn.eps,
+            block_size,
+        )
+    elif cache_dtype == torch.bfloat16:
+        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            dummy_q,
+            kv,
+            swa_3d,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            attn.eps,
+            block_size,
+        )
+    else:  # per-tensor fp8 (torch.float8_e4m3fn)
+        # TODO(ben): double-check if this is being dispatched correctly for FI backend
+        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
+        dummy_q_fp8 = torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn)
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+            dummy_q,
+            kv,
+            dummy_q_fp8,
+            swa_3d,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            attn._flashinfer_fp8_kv_scale,
+            attn._flashinfer_fp8_q_scale_inv,
+            attn.eps,
+            block_size,
+        )
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
@@ -584,18 +631,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             name = self._remap_dspark_name(checkpoint_name)
             if name is None:
                 continue
-            is_context_param = name.startswith(
-                ("model.main_proj.", "model.main_norm.", "model.context_wkv_proj.")
-            ) or (name.startswith("model.layers.") and ".attn.kv_norm." in name)
-            if not is_context_param:
-                continue
             if name.endswith(".scale"):
                 name = name.removesuffix(".scale") + ".weight_scale_inv"
+            # The context-KV-only model owns exactly the parameters to load.
+            param = params_dict.get(name)
+            if param is None:
+                continue
             if name.startswith("model.context_wkv_proj."):
-                param = params_dict[name]
                 param.weight_loader(param, loaded_weight, loaded_weight.shard_id)
             else:
-                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)

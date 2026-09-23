@@ -1820,16 +1820,6 @@ class SpeculativeConfig:
             and kv_transfer_config.kv_role == "kv_producer"
         )
 
-    def use_dspark_last_stage_drafter(self) -> bool:
-        # A DSpark drafter under a pipeline-parallel target runs wholly on the
-        # last pipeline stage, so the draft model always uses PP=1. Holds for
-        # both the PD prefill-only producer and aggregated (IFB) serving.
-        return (
-            self.method == "dspark"
-            and self.target_parallel_config is not None
-            and self.target_parallel_config.pipeline_parallel_size > 1
-        )
-
     @field_validator("attention_backend", mode="before")
     @classmethod
     def _parse_attention_backend(cls, value: Any) -> Any:

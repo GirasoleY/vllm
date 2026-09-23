@@ -665,11 +665,7 @@ class VllmConfig:
         their own per-method lookahead, so those components cannot drift apart.
         """
         speculative_config = self.speculative_config
-        if (
-            speculative_config is None
-            or not speculative_config.use_eagle()
-            or speculative_config.is_dspark_prefill_only()
-        ):
+        if speculative_config is None or not speculative_config.use_eagle():
             return 0
         if speculative_config.use_multi_module_mtp():
             # Each MTP module reads one token further ahead than the one before
