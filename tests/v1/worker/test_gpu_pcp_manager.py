@@ -36,6 +36,8 @@ def _make_config(cudagraph_mode: CUDAGraphMode):
             use_mla=True,
             is_encoder_decoder=False,
             hf_text_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(architectures=[]),
+            registry=SimpleNamespace(resolve_model_cls=lambda *a, **kw: (object, None)),
         ),
         lora_config=None,
         speculative_config=None,
@@ -74,6 +76,53 @@ def test_validate_config_rejects_full_graph_for_prefills():
         PCPManager.validate_config(
             _make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+@pytest.mark.parametrize("mode", list(CUDAGraphMode))
+@pytest.mark.parametrize("dcp", [1, 2])
+@pytest.mark.parametrize("pcp", [1, 2])
+def test_hybrid_pcp_rejects_graph_capture(monkeypatch, mode, dcp, pcp):
+    """PIECEWISE must not freeze ordinary dispatch while KCP metadata is absent."""
+    config = _make_config(mode)
+    config.parallel_config.prefill_context_parallel_size = pcp
+    config.parallel_config.decode_context_parallel_size = dcp
+    config.model_config.hf_text_config.index_topk = 2048
+    monkeypatch.setattr(pcp_manager_module, "model_supports_hybrid_pcp", lambda _: True)
+    monkeypatch.setattr(
+        pcp_manager_module.current_platform,
+        "is_device_capability_family",
+        lambda _: True,
+    )
+    if pcp > 1 and mode != CUDAGraphMode.NONE:
+        with pytest.raises(NotImplementedError, match="Hybrid PCP.*CUDA graphs"):
+            PCPManager.validate_config(config, supports_mm_inputs=False)
+    else:
+        PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_validate_config_rejects_speculation_only_for_hybrid_pcp(
+    monkeypatch, hybrid, pcp_size
+):
+    config = _make_config(CUDAGraphMode.NONE)
+    config.parallel_config.prefill_context_parallel_size = pcp_size
+    config.speculative_config = SimpleNamespace(
+        method="mtp", use_dspark=lambda: False, use_multi_module_mtp=lambda: False
+    )
+    monkeypatch.setattr(
+        pcp_manager_module, "model_supports_hybrid_pcp", lambda _: hybrid
+    )
+    monkeypatch.setattr(
+        pcp_manager_module.current_platform,
+        "is_device_capability_family",
+        lambda _: True,
+    )
+    if hybrid and pcp_size > 1:
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            PCPManager.validate_config(config, supports_mm_inputs=False)
+    else:
+        PCPManager.validate_config(config, supports_mm_inputs=False)
 
 
 def test_replicated_decode_piecewise_graph_padding(monkeypatch):
@@ -503,3 +552,108 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     )
     assert local_batch.dcp_local_seq_lens is not None
     assert torch.equal(local_batch.dcp_local_seq_lens.cpu(), expected)
+
+
+def _make_hybrid_manager(world, rank, lengths, prefilling, computed):
+    qsl = np.r_[0, np.cumsum(lengths)].astype(np.int32)
+    manager = PCPManager(world, rank, torch.device("cpu"))
+    manager._global_batch = SimpleNamespace(
+        num_reqs=len(lengths),
+        num_scheduled_tokens=np.asarray(lengths, dtype=np.int32),
+        is_prefilling_np=np.asarray(prefilling),
+        num_computed_tokens_np=np.asarray(computed, dtype=np.int32),
+        query_start_loc_np=qsl,
+        num_draft_tokens_per_req=None,
+    )
+    segments = manager._get_rank_segments(rank, lengths, np.asarray(prefilling), qsl)
+    manager._local_segments = tuple(segments)
+    return manager, segments, qsl
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("halo", [1, 3, 4])
+@pytest.mark.parametrize(
+    "lengths,prefilling",
+    [
+        ([1, 2, 1, 3], [False, True, False, True]),  # empty slots and parts
+        ([1, 1, 37, 150], [False, False, True, True]),
+        ([3], [True]),  # ranks without prefill tokens
+        ([64, 1, 17], [True, True, True]),  # one-token prefill
+    ],
+)
+def test_plan_maps_local_tokens_and_halos_to_global_positions(
+    world, halo, lengths, prefilling
+):
+    computed = [0, 9, 0, 7][: len(lengths)]
+    prefill_rows = np.flatnonzero(prefilling)
+    decode_rows = np.flatnonzero(~np.asarray(prefilling))
+
+    def position(request, offset):
+        """A value naming one token of one request, including cached prefixes."""
+        return 1000 * request + computed[request] + offset
+
+    plans, tails = [], []
+    for rank in range(world):
+        manager, segments, qsl = _make_hybrid_manager(
+            world, rank, lengths, prefilling, computed
+        )
+        plan = manager.build_hybrid_plan(halo)
+        assert plan is not None
+        assert plan.decode_rows.tolist() == decode_rows.tolist()
+        assert plan.prefill_rows.tolist() == prefill_rows.tolist()
+        assert plan.prefill_has_initial_state.tolist() == [
+            computed[g] > 0 for g in prefill_rows
+        ]
+        assert plan.num_decode_tokens == len(decode_rows)
+        prefill_segments = segments[len(decode_rows) :]
+        local = [
+            position(s.global_batch_req_idx, i - qsl[s.global_batch_req_idx])
+            for s in prefill_segments
+            for i in range(s.global_batch_slice.start, s.global_batch_slice.stop)
+        ]
+        assert plan.num_prefill_tokens == len(local)
+        assert plan.scan_cu_seqlens.tolist() == [0] + list(
+            np.cumsum([s.num_tokens for s in prefill_segments])
+        )
+        assert plan.summary_idx.unique().numel() == plan.num_segments
+        slots = 2 * world
+        for segment, summary, init in zip(
+            prefill_segments, plan.summary_idx.tolist(), plan.init_idx.tolist()
+        ):
+            g = segment.global_batch_req_idx
+            n = int(np.searchsorted(prefill_rows, g))
+            chunk = -(-lengths[g] // slots)
+            slot = (segment.global_batch_slice.start - qsl[g]) // chunk
+            assert init == n * slots + slot
+            part = int(slot != rank)
+            assert slot == (rank if part == 0 else slots - 1 - rank)
+            assert summary == part * len(prefill_rows) + n
+        tail = torch.full(plan.tail_src_idx.shape, -1)
+        valid = plan.tail_src_idx >= 0
+        tail[valid] = torch.tensor(local, dtype=torch.int64)[plan.tail_src_idx[valid]]
+        tails.append(tail)
+        plans.append((plan, prefill_segments, qsl))
+
+    # The pool is [cached prefix of each request, gathered tails].
+    gathered = torch.cat(tails)
+    for plan, prefill_segments, qsl in plans:
+        prefix = torch.tensor(
+            [position(g, j - halo) for g in prefill_rows for j in range(halo)]
+        )
+        pool = torch.cat((prefix, gathered))
+        for segment, rows in zip(prefill_segments, plan.halo_idx):
+            g = segment.global_batch_req_idx
+            start = segment.global_batch_slice.start - qsl[g]
+            expected = [position(g, start - halo + j) for j in range(halo)]
+            assert pool[rows].tolist() == expected
+        for n, (g, rows) in enumerate(zip(prefill_rows, plan.final_halo_idx)):
+            expected = [position(g, lengths[g] - halo + j) for j in range(halo)]
+            assert pool[rows].tolist() == expected
+
+
+def test_plan_rejects_drafts_and_skips_decode_only_batches():
+    manager, _, _ = _make_hybrid_manager(2, 0, [1, 1], [False, False], [4, 5])
+    assert manager.build_hybrid_plan(3) is None
+    manager._global_batch.num_draft_tokens_per_req = np.array([1, 0])
+    with pytest.raises(NotImplementedError, match="speculative decoding"):
+        manager.build_hybrid_plan(3)

@@ -10,6 +10,8 @@
 # ruff: noqa: E501
 
 
+from dataclasses import dataclass
+
 import torch
 
 from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
@@ -1012,19 +1014,33 @@ def fused_kda_gate_chunk_cumsum(
     return y
 
 
-def _chunk_kda_fwd_with_cumulative_g(
+@dataclass
+class ChunkKdaPrepared:
+    """WY representation of a packed chunked-KDA prefill, before the scan."""
+
+    q: torch.Tensor
+    kg: torch.Tensor
+    w: torch.Tensor
+    u: torch.Tensor
+    g: torch.Tensor
+    Aqk: torch.Tensor
+    scale: float
+    cu_seqlens: torch.Tensor | None
+    chunk_indices: torch.Tensor | None
+    chunk_size: int
+
+
+def _chunk_kda_prepare_with_cumulative_g(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
-):
+) -> ChunkKdaPrepared:
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
     # Use `chunk_kda_fwd` or `chunk_kda_with_fused_gate_fwd` instead of
@@ -1052,33 +1068,84 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    del A
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=kg,
+    return ChunkKdaPrepared(
+        q=q,
+        kg=kg,
         w=w,
         u=u,
-        gk=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-    del w, u, kg
-    o = chunk_gla_fwd_o_gk(
-        q=q,
-        v=v_new,
         g=g,
-        A=Aqk,
-        h=h,
-        o=v,
+        Aqk=Aqk,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
     )
-    del Aqk, v_new, h
+
+
+def chunk_kda_scan(
+    prepared: ChunkKdaPrepared,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    out: torch.Tensor,
+    chunk_offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Scan prepared chunks from ``initial_state`` into ``out``.
+
+    Consumes the WY tensors of ``prepared`` to bound peak memory.
+    """
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=prepared.kg,
+        w=prepared.w,
+        u=prepared.u,
+        gk=prepared.g,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=prepared.cu_seqlens,
+        chunk_indices=prepared.chunk_indices,
+        chunk_offsets=chunk_offsets,
+        use_exp2=True,
+    )
+    del prepared.kg, prepared.w, prepared.u
+    o = chunk_gla_fwd_o_gk(
+        q=prepared.q,
+        v=v_new,
+        g=prepared.g,
+        A=prepared.Aqk,
+        h=h,
+        o=out,
+        scale=prepared.scale,
+        cu_seqlens=prepared.cu_seqlens,
+        chunk_indices=prepared.chunk_indices,
+        chunk_size=prepared.chunk_size,
+    )
     return o, final_state
+
+
+def _chunk_kda_fwd_with_cumulative_g(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+):
+    prepared = _chunk_kda_prepare_with_cumulative_g(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+    )
+    return chunk_kda_scan(prepared, initial_state, output_final_state, out=v)
 
 
 def chunk_kda_fwd(
@@ -1243,6 +1310,51 @@ def chunk_kda_with_fused_gate(
         lower_bound=lower_bound,
     )
     return o, final_state
+
+
+def chunk_kda_with_fused_gate_prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = False,
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
+) -> ChunkKdaPrepared:
+    """Prepare chunk KDA from raw gates, leaving initial states to the scan.
+
+    ``chunk_kda_with_fused_gate`` equals this preparation followed by
+    ``chunk_kda_scan``. Splitting them lets context parallelism derive each
+    segment's initial state from the prepared chunks.
+    """
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+    g = fused_kda_gate_chunk_cumsum(
+        raw_g.contiguous(),
+        A_log=A_log,
+        g_bias=g_bias,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=FLA_CHUNK_SIZE,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
+    return _chunk_kda_prepare_with_cumulative_g(
+        q=q,
+        k=k,
+        v=v.contiguous(),
+        g=g,
+        beta=beta.contiguous(),
+        scale=k.shape[-1] ** -0.5,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
 
 
 @triton.autotune(

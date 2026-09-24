@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
@@ -39,14 +41,21 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.worker.workspace import current_workspace_manager
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import HybridPCPPlan
+
 if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
     )
 else:
+    from vllm.distributed.parallel_state import get_pcp_group
+    from vllm.models.glm5next.nvidia.ops import kcp
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
+        chunk_kda_scan,
         chunk_kda_with_fused_gate,
+        chunk_kda_with_fused_gate_prepare,
         fused_recurrent_kda,
     )
 
@@ -445,6 +454,130 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
 
+    def _conv_state_and_weights(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        (conv_state, _) = self.kv_cache
+        # conv_state must be (..., dim, width-1) for the conv kernels.
+        # DS layout stores it that way directly; SD layout needs a transpose.
+        # Layout is process-global and resolved once at init (see __init__).
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+
+        # One merged short-conv over q|k|v instead of three separate calls. The
+        # 1D conv is independent per channel, so concatenating q/k/v along the
+        # channel dim and running a single causal_conv1d is bit-identical to
+        # three calls. The merged weight is q|k|v conv weights concatenated;
+        # built once and cached (params are fixed after load). conv_state is
+        # already stored as the merged q|k|v state, so it is used directly.
+        if self._merged_conv_weight is None:
+
+            def _w(m):
+                return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+            self._merged_conv_weight = torch.cat(
+                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                dim=0,
+            ).contiguous()
+        return conv_state, self._merged_conv_weight, self.q_conv1d.bias
+
+    def _forward_kcp(
+        self,
+        qkv: torch.Tensor,
+        g1: torch.Tensor,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        state_indices: torch.Tensor,
+        plan: "HybridPCPPlan",
+    ) -> None:
+        """Hybrid-PCP step: local tokens, global state slots (see ``kcp``)."""
+        conv_state, conv_weights, conv_bias = self._conv_state_and_weights()
+        recurrent_state = self.kv_cache[1]
+        num_decodes, num_prefills = plan.num_decode_tokens, plan.num_prefill_tokens
+        core_attn_out[:, num_decodes + num_prefills :].zero_()
+
+        def _rearr(x):
+            return x.reshape(1, -1, self.local_num_heads, self.head_dim)
+
+        if num_decodes:
+            decode_slots = state_indices[plan.decode_rows]
+            decode_qkv = causal_conv1d_update(
+                qkv[:num_decodes],
+                conv_state,
+                conv_weights,
+                conv_bias,
+                activation="silu",
+                conv_state_indices=decode_slots,
+            )
+            q, k, v = (
+                _rearr(x) for x in decode_qkv.split(self.local_projection_size, -1)
+            )
+            fused_recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g1[:, :num_decodes],
+                beta=beta[:, :num_decodes],
+                initial_state=recurrent_state,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=plan.decode_cu_seqlens,
+                ssm_state_indices=decode_slots,
+                out=core_attn_out[:, :num_decodes],
+                sigmoid_beta=True,
+                a_log=self.A_log,
+                g_bias=self.dt_bias,
+                compute_gate=True,
+                lower_bound=self.kda_lower_bound,
+            )
+
+        # Every rank joins both collectives, even without local prefill tokens.
+        prefill = slice(num_decodes, num_decodes + num_prefills)
+        slots = state_indices[plan.prefill_rows]
+        tails = get_pcp_group().all_gather(kcp.pack_conv_tails(plan, qkv[prefill]), 0)
+        windows, final_windows = kcp.conv_windows(plan, tails, conv_state, slots)
+        prepared = None
+        if num_prefills:
+            q, k, v = causal_conv1d_fn(
+                qkv[prefill].transpose(0, 1),
+                conv_weights,
+                conv_bias,
+                activation="silu",
+                conv_states=windows,
+                has_initial_state=plan.segment_has_initial_state,
+                cache_indices=plan.segment_ids,
+                query_start_loc=plan.scan_cu_seqlens,
+                metadata=plan.conv_metadata,
+                output_groups=3,
+            ).unbind(0)
+            prepared = chunk_kda_with_fused_gate_prepare(
+                q=_rearr(q),
+                k=_rearr(k),
+                v=_rearr(v),
+                raw_g=g1[:, prefill],
+                beta=_cast_sigmoid(beta[0, prefill]).unsqueeze(0),
+                A_log=self.A_log,
+                g_bias=self.dt_bias,
+                cu_seqlens=plan.scan_cu_seqlens,
+                chunk_indices=plan.scan_chunk_indices,
+                use_qk_l2norm_in_kernel=True,
+                safe_gate=self.kda_safe_gate,
+                lower_bound=self.kda_lower_bound,
+            )
+        conv_state[slots] = final_windows
+        base = gather_initial_states(
+            recurrent_state, slots, plan.prefill_has_initial_state
+        )
+        initial_states, final_states = kcp.exchange_states(plan, prepared, base)
+        if prepared is not None:
+            chunk_kda_scan(
+                prepared,
+                initial_states,
+                output_final_state=False,
+                out=core_attn_out[:, prefill],
+                chunk_offsets=plan.scan_chunk_offsets,
+            )
+        scatter_states(recurrent_state, final_states, slots)
+
     @eager_break_during_capture
     def _forward(
         self,
@@ -465,6 +598,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Profile/warmup dummy runs may omit mamba-family metadata.
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
+        if attn_metadata_narrowed.cp_plan is not None:
+            assert attn_metadata_narrowed.non_spec_state_indices_tensor is not None
+            self._forward_kcp(
+                qkv_proj_states,
+                g1,
+                beta,
+                core_attn_out,
+                attn_metadata_narrowed.non_spec_state_indices_tensor,
+                attn_metadata_narrowed.cp_plan,
+            )
+            return
         has_initial_state = attn_metadata_narrowed.has_initial_state
         non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
         non_spec_state_indices_tensor = (
@@ -489,30 +633,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        (conv_state, recurrent_state) = constant_caches
-        # conv_state must be (..., dim, width-1) for the conv kernels.
-        # DS layout stores it that way directly; SD layout needs a transpose.
-        # Layout is process-global and resolved once at init (see __init__).
-        if not self._conv_state_dim_first:
-            conv_state = conv_state.transpose(-1, -2)
-
-        # One merged short-conv over q|k|v instead of three separate calls. The
-        # 1D conv is independent per channel, so concatenating q/k/v along the
-        # channel dim and running a single causal_conv1d is bit-identical to
-        # three calls. The merged weight is q|k|v conv weights concatenated;
-        # built once and cached (params are fixed after load). conv_state is
-        # already stored as the merged q|k|v state, so it is used directly.
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
-        conv_weights = self._merged_conv_weight
-        conv_bias = self.q_conv1d.bias
+        recurrent_state = constant_caches[1]
+        conv_state, conv_weights, conv_bias = self._conv_state_and_weights()
 
         # Split projections / gating into spec (draft-verify) and non-spec token
         # groups when speculative decoding is active. Spec tokens carry
