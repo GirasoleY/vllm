@@ -138,7 +138,10 @@ class HYV4DecoderLayer(nn.Module):
             self.block_type = "feedforward"
         else:
             self.mlp = HYV4MoEFused(
-                config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+                is_mtp=layer_idx >= config.num_hidden_layers,
             )
             self.block_type = "moe"
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -343,6 +346,10 @@ class HYV4Model(nn.Module):
         # (param_name, weight_name, expert_id, shard_id) for weights, fp8
         # weight scales and fp8 activation scales.
         if not hasattr(self, "_cached_expert_params_mapping"):
+            use_mega_moe = any(
+                isinstance(module, HYV4MoEFused) and module.use_mega_moe
+                for module in self.modules()
+            )
             self._cached_expert_params_mapping = fused_moe_make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
@@ -350,6 +357,7 @@ class HYV4Model(nn.Module):
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.num_experts,
                 num_redundant_experts=self.num_redundant_experts,
+                routed_experts_prefix="" if use_mega_moe else "routed_experts",
             )
         return self._cached_expert_params_mapping
 
@@ -447,7 +455,12 @@ class HYV4Model(nn.Module):
         # Fused expert mapping: experts.gate_up_proj (all experts in one tensor).
         # The packed weights are owned by the RoutedExperts submodule, so the
         # targets are experts.routed_experts.[base_layer.]w{13,2}_weight.
-        fused_expert_prefix = f".experts.routed_experts.{base_layer}"
+        routed_prefix = (
+            "routed_experts."
+            if any(".experts.routed_experts." in name for name in params_dict)
+            else ""
+        )
+        fused_expert_prefix = f".experts.{routed_prefix}{base_layer}"
         fused_expert_params_mapping = [
             (f"{fused_expert_prefix}w13_weight", ".experts.gate_up_proj", 0, "w1"),
             (f"{fused_expert_prefix}w2_weight", ".experts.down_proj", 0, "w2"),
@@ -742,6 +755,9 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         ]
         if missing:
             raise RuntimeError("Unloaded backbone FP8 scales: " + ", ".join(missing))
+        for module in self.model.modules():
+            if isinstance(module, HYV4MoEFused) and module.use_mega_moe:
+                module.experts.finalize_weights()
         return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

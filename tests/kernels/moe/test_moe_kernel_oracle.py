@@ -12,11 +12,38 @@ high confidence in the rest.
 
 from unittest.mock import patch
 
+import pytest
+
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.oracle import UnquantizedMoEKernelOracle
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
 )
+
+
+@pytest.mark.parametrize("scheme", ["block", "mxfp8", "tensor"])
+def test_trtllm_fp8_fused_router_rejects_simulated_routing(scheme):
+    """Do not send vLLM enum102 to FlashInfer's unsupported fused router."""
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
+        TrtLlmFp8ExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8Static128BlockSym,
+        kFp8StaticTensorSym,
+        kMxfp8Dynamic,
+        kMxfp8Static,
+    )
+
+    quant_keys = {
+        "block": (kFp8Static128BlockSym, kFp8Dynamic128Sym),
+        "mxfp8": (kMxfp8Static, kMxfp8Dynamic),
+        "tensor": (kFp8StaticTensorSym, kFp8StaticTensorSym),
+    }[scheme]
+    supports = TrtLlmFp8ExpertsMonolithic._supports_routing_method
+    assert not supports(RoutingMethodType.Simulated, *quant_keys)
+    assert supports(RoutingMethodType.DeepSeekV3, *quant_keys)
 
 
 class TestUnquantizedDelegation:

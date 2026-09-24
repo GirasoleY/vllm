@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dense FFN and MoE blocks for HY V4 (NVIDIA)."""
 
+import copy
+from contextlib import AbstractContextManager, nullcontext
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, set_current_vllm_config
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -91,6 +94,7 @@ class HYV4MoEFused(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        is_mtp: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -149,26 +153,85 @@ class HYV4MoEFused(nn.Module):
         use_swiglu_clamp = bool(raw_swiglu_limit) and float(raw_swiglu_limit) > 0
         moe_swiglu_limit = float(raw_swiglu_limit) if use_swiglu_clamp else None
 
-        self.experts = FusedMoEFactory(
-            num_experts=self.n_routed_experts,
-            top_k=top_k,
-            hidden_size=config.hidden_size,
-            intermediate_size=intermediate_size,
-            renormalize=config.route_norm,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            scoring_func="sigmoid",
-            use_grouped_topk=True,
-            num_expert_group=1,
-            topk_group=1,
-            routed_scaling_factor=router_scaling_factor,
-            e_score_correction_bias=self.expert_bias,
-            shared_experts=self.shared_experts,
-            swiglu_limit=moe_swiglu_limit,
+        requested_mega_moe = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        self.use_mega_moe = requested_mega_moe and not is_mtp
+        self.moe_swiglu_limit = moe_swiglu_limit
         self.prefix = prefix
+        if self.use_mega_moe:
+            if getattr(quant_config, "store_dtype", None) != "mxfp4":
+                raise ValueError("HYV4 MegaMoE requires MXFP4 routed-expert weights.")
+            parallel_config = vllm_config.parallel_config
+            if not parallel_config.enable_expert_parallel:
+                raise ValueError("HYV4 MegaMoE requires --enable-expert-parallel.")
+            if self.tp_size != 1:
+                raise ValueError("HYV4 MegaMoE currently requires TP1 with DP/EP.")
+            if (
+                self.enable_eplb
+                or parallel_config.enable_eplb
+                or self.n_redundant_experts
+            ):
+                raise ValueError("HYV4 MegaMoE EPLB is not implemented yet.")
+            if self.n_physical_experts % self.ep_size:
+                raise ValueError("HYV4 MegaMoE requires evenly sharded experts.")
+            from vllm.model_executor.layers.fused_moe.router.router_factory import (
+                create_fused_moe_router,
+            )
+            from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+
+            self.experts = DeepseekV4MegaMoEExperts(
+                vllm_config,
+                num_experts=self.n_physical_experts,
+                num_local_experts=self.n_local_physical_experts,
+                experts_start_idx=self.physical_expert_start,
+                top_k=top_k,
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                prefix=f"{prefix}.experts",
+            )
+            self.mega_router = create_fused_moe_router(
+                top_k=top_k,
+                global_num_experts=self.n_routed_experts,
+                renormalize=config.route_norm,
+                use_grouped_topk=True,
+                num_expert_group=1,
+                topk_group=1,
+                scoring_func="sigmoid",
+                routed_scaling_factor=router_scaling_factor,
+                e_score_correction_bias=self.expert_bias,
+            )
+            logger.info_once("HYV4 routed experts use DeepGEMM MegaMoE.")
+            return
+
+        # The FP8 draft must not inherit the target's MXFP4-only model backend.
+        factory_context: AbstractContextManager = nullcontext()
+        if requested_mega_moe:
+            draft_config = copy.copy(vllm_config)
+            draft_config.kernel_config = copy.copy(vllm_config.kernel_config)
+            draft_config.kernel_config.moe_backend = "auto"
+            factory_context = set_current_vllm_config(draft_config)
+
+        with factory_context:
+            self.experts = FusedMoEFactory(
+                num_experts=self.n_routed_experts,
+                top_k=top_k,
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                renormalize=config.route_norm,
+                quant_config=quant_config,
+                prefix=f"{prefix}.experts",
+                enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.n_redundant_experts,
+                scoring_func="sigmoid",
+                use_grouped_topk=True,
+                num_expert_group=1,
+                topk_group=1,
+                routed_scaling_factor=router_scaling_factor,
+                e_score_correction_bias=self.expert_bias,
+                shared_experts=self.shared_experts,
+                swiglu_limit=moe_swiglu_limit,
+            )
         if use_swiglu_clamp:
             logger.debug_once(
                 "HYV4MoEFused: swiglu_limit=%.1f enabled for routed experts",
@@ -184,7 +247,23 @@ class HYV4MoEFused(nn.Module):
         # and emits fp32 logits, so no explicit upcast is needed here.
         router_logits, _ = self.gate(hidden_states)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if self.use_mega_moe:
+            topk_weights, topk_ids = self.mega_router.select_experts(
+                hidden_states, router_logits, topk_indices_dtype=torch.int64
+            )
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=self.moe_swiglu_limit,
+            )
+            # Shared experts are unclamped and retain their FP8/BF16 path.
+            if self.shared_experts is not None:
+                final_hidden_states = final_hidden_states + self.shared_experts(
+                    hidden_states
+                )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         return final_hidden_states.view(orig_shape)

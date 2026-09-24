@@ -117,7 +117,8 @@ def test_backbone_completeness_checked_after_full_load(monkeypatch, case):
     target = SimpleNamespace(
         config=SimpleNamespace(num_hidden_layers=1, tie_word_embeddings=False),
         model=SimpleNamespace(
-            _pending_wk_fp8={"wk": {}} if case == "pending_wk" else {}
+            _pending_wk_fp8={"wk": {}} if case == "pending_wk" else {},
+            modules=lambda: iter(()),
         ),
         hf_to_vllm_mapper=model.WeightsMapper(),
         named_parameters=lambda: iter([(name, None)]),
@@ -144,3 +145,116 @@ def _backbone(monkeypatch, model, params):
         named_parameters=lambda: iter(params),
         get_expert_mapping=lambda: [],
     )
+
+
+@pytest.mark.parametrize("mega", [False, True])
+@pytest.mark.parametrize("suffix", ["weight", "weight_scale"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_expert_loader_preserves_packed_bytes_and_gate_up_shards(
+    monkeypatch, mega, suffix, fused
+):
+    """Both expert backends must receive every gate/up/down shard unchanged."""
+    from vllm.models.hy_v4.nvidia import model
+
+    routed = "" if mega else "routed_experts."
+    prefix = "layers.1.mlp.experts."
+    captured = []
+
+    def load(param, weight, name, shard_id, expert_id, return_success):
+        assert return_success
+        captured.append((name, shard_id, expert_id, weight.clone()))
+        return True
+
+    names = [f"{prefix}{routed}{projection}_{suffix}" for projection in ("w13", "w2")]
+    params = [(name, SimpleNamespace(weight_loader=load)) for name in names]
+    backbone = _backbone(monkeypatch, model, params)
+    backbone.config.num_experts = 2
+    backbone.num_redundant_experts = 0
+    moe = model.HYV4MoEFused.__new__(model.HYV4MoEFused)
+    torch.nn.Module.__init__(moe)
+    moe.use_mega_moe = mega
+    backbone.modules = lambda: iter((moe,))
+    backbone.get_expert_mapping = lambda: model.HYV4Model.get_expert_mapping(backbone)
+    backbone.load_fused_expert_weights = lambda *args: (
+        model.HYV4Model.load_fused_expert_weights(backbone, *args)
+    )
+    # Distinct bytes expose accidentally swapped gate/up or expert indices.
+    gate = torch.arange(12, dtype=torch.uint8).reshape(2, 3, 2)
+    up, down = gate + 20, gate + 40
+    if fused:
+        scale_suffix = "_scale" if suffix == "weight_scale" else ""
+        weights = [
+            (prefix + "gate_up_proj" + scale_suffix, torch.cat((gate, up), dim=-2)),
+            (prefix + "down_proj" + scale_suffix, down),
+        ]
+    else:
+        weights = [
+            (f"{prefix}{expert}.{projection}.{suffix}", tensor[expert])
+            for expert in range(2)
+            for projection, tensor in (
+                ("gate_proj", gate),
+                ("up_proj", up),
+                ("down_proj", down),
+            )
+        ]
+    assert model.HYV4Model.load_weights(backbone, weights) == set(names)
+    assert len(captured) == 6
+    for name, shard, expert, weight in captured:
+        assert name == names[shard == "w2"]
+        expected = {"w1": gate, "w3": up, "w2": down}[shard][expert]
+        assert weight.dtype == torch.uint8
+        torch.testing.assert_close(weight, expected)
+
+
+@pytest.mark.parametrize("factory_fails", [False, True])
+def test_mtp_backend_override_does_not_mutate_target_config(monkeypatch, factory_fails):
+    """FP8 MTP falls back to auto without leaking its choice to the MXFP4 target."""
+    from vllm.config import get_current_vllm_config, set_current_vllm_config
+    from vllm.models.hy_v4.nvidia import moe
+
+    config = SimpleNamespace(
+        num_experts=8,
+        num_experts_per_tok=2,
+        expert_hidden_dim=128,
+        hidden_size=128,
+        num_shared_experts=0,
+        route_norm=True,
+        swiglu_limit=10,
+    )
+    target = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+    )
+    monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        moe,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 4), rank_in_group=0
+        ),
+    )
+    monkeypatch.setattr(moe, "GateLinear", lambda *args, **kwargs: torch.nn.Identity())
+    quant = SimpleNamespace(store_dtype=None)
+
+    def create_experts(**kwargs):
+        draft = get_current_vllm_config()
+        assert draft is not target
+        assert draft.kernel_config.moe_backend == "auto"
+        assert target.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        assert kwargs["quant_config"] is quant
+        if factory_fails:
+            raise RuntimeError("draft construction failed")
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(moe, "FusedMoEFactory", create_experts)
+    with set_current_vllm_config(target):
+        if factory_fails:
+            with pytest.raises(RuntimeError, match="draft construction failed"):
+                moe.HYV4MoEFused(config, quant, is_mtp=True)
+        else:
+            draft = moe.HYV4MoEFused(config, quant, is_mtp=True)
+            assert not draft.use_mega_moe
+        assert get_current_vllm_config() is target
+        assert target.kernel_config.moe_backend == "deep_gemm_mega_moe"

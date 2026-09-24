@@ -387,6 +387,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         """Monolithic kernels need to express router support."""
         # NOTE(dbari): TopK routing could also be enabled, but need to validate models
         # NOTE(dbari): Default is not implemented and should not be enabled until it is
+        # Simulated routing must select the modular path: FlashInfer's fused
+        # router does not understand vLLM's Simulated enum (102).
 
         if (weight_key, activation_key) in [
             (kFp8Static128BlockSym, kFp8Dynamic128Sym),
@@ -400,7 +402,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 RoutingMethodType.SigmoidRenorm,
                 RoutingMethodType.Sigmoid,
                 RoutingMethodType.MiniMax2,
-                RoutingMethodType.Simulated,
             ]
         elif (weight_key, activation_key) == (kFp8StaticTensorSym, kFp8StaticTensorSym):
             # NOTE(dbari): as above, potentially allow others here.
@@ -412,7 +413,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 RoutingMethodType.SigmoidRenorm,
                 RoutingMethodType.Sigmoid,
                 RoutingMethodType.MiniMax2,
-                RoutingMethodType.Simulated,
             ]
         else:
             raise ValueError("Unsupported quantization scheme.")

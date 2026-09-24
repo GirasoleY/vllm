@@ -144,6 +144,22 @@ steps:
     - pytest -v -s kernels/test_fused_deepseek_v4_*.py
     - pytest -v -s models/test_deepseek_v4_mega_moe.py
 
+- label: ":nvidia: (4xB200) Hy4 MXFP4 MegaMoE"
+  key: hyv4-mxfp4-mega-moe-4xb200
+  timeout_in_minutes: 20
+  device: b200-k8s
+  num_devices: 4
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/models/hy_v4/nvidia/
+  - vllm/models/deepseek_v4/nvidia/
+  - vllm/model_executor/layers/fused_moe/router/
+  - vllm/utils/deep_gemm.py
+  - cmake/external_projects/deepgemm.cmake
+  - tests/models/test_hyv4_mega_moe.py
+  commands:
+  - torchrun --standalone --nproc-per-node=4 -m pytest -v -s models/test_hyv4_mega_moe.py
+
 # Catch-all for test files at the tests/kernels root. This job collects
 # the whole root so new files are wired by default.
 # Files with dedicated jobs elsewhere in this file are excluded via --ignore
