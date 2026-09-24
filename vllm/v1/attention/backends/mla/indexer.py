@@ -676,6 +676,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.slot_mapping_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int64,
@@ -694,6 +695,11 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
         if positions is not None:
+            if self.pcp_world_size > 1:
+                # The slot mapping spans the PCP group. Map local tokens, with
+                # padding never carrying a tail slot, then gather.
+                num_tokens = slot_mapping.numel() // self.pcp_world_size
+                slot_mapping = self.slot_mapping_buffer[:num_tokens].fill_(-1)
             slot_mapping_buffer = self.slot_mapping_buffer[
                 : slot_mapping.numel()
             ].view_as(slot_mapping)
@@ -707,6 +713,9 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
                 self.kv_cache_spec.block_size,
                 out=slot_mapping_buffer,
             )
+            if self.pcp_world_size > 1:
+                # Metadata must outlive the next all-gather's symmetric scratch reuse.
+                slot_mapping = get_pcp_group().all_gather(slot_mapping, dim=0).clone()
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
@@ -1229,9 +1238,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 out=self.compressed_slot_mapping_buffer,
             )
             if self.pcp_world_size > 1:
-                compressed_slot_mapping = get_pcp_group().all_gather(
-                    self.compressed_slot_mapping_buffer[:padded_num_tokens],
-                    dim=0,
+                # Metadata must outlive the next all-gather's symmetric scratch reuse.
+                compressed_slot_mapping = (
+                    get_pcp_group()
+                    .all_gather(
+                        self.compressed_slot_mapping_buffer[:padded_num_tokens],
+                        dim=0,
+                    )
+                    .clone()
                 )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
