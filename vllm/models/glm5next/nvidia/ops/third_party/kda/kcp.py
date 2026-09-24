@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Blackwell KCP affine-summary kernels.
+"""Blackwell KCP preparation and affine-summary kernels.
 
 Communication and state merging live in ``ops/kcp.py``. This module is
 imported lazily by the KCP path so ordinary KDA does not require CuTe DSL.
@@ -28,6 +28,86 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
 
 from vllm.cute_utils import _tcgen05, fence_before_tma_store, simple_tma_copy
+
+from .kernels import chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter
+
+
+def prepare_kcp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    raw_g: torch.Tensor,
+    beta_raw: torch.Tensor,
+    a_log: torch.Tensor,
+    bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    *,
+    lower_bound: float | None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, ...]:
+    """Prepare positive or ragged scan segments without a device readback.
+
+    Inputs may have nonnegative strides. Metadata values describe all tokens
+    exactly once and use contiguous int32 or int64 tensors built on the CPU.
+    Empty segments need no chunk entry. The returned A contains pre-inverted
+    16x16 diagonal blocks for the triangular merge.
+    """
+    # KCP also uses this extension when ordinary prefill selects Triton.
+    import vllm._flashkda_C  # noqa: F401
+
+    assert q.ndim == 4 and q.shape[0] == 1
+    tokens, heads, dim = q.shape[1:]
+    assert chunk_size in (16, 32, 64)
+    qn = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    kn = torch.empty_like(qn)
+    g = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    beta = torch.empty((1, tokens, heads), dtype=torch.float32, device=q.device)
+    A = torch.empty(
+        (1, tokens, heads, chunk_size), dtype=torch.float32, device=q.device
+    )
+    Aqk = torch.empty_like(A)
+    torch.ops._flashkda_C.kcp_prepare(
+        q,
+        k,
+        raw_g,
+        beta_raw,
+        a_log,
+        bias,
+        cu_seqlens,
+        chunk_indices,
+        qn,
+        kn,
+        g,
+        beta,
+        A,
+        Aqk,
+        lower_bound if lower_bound is not None else 0.0,
+        lower_bound is not None,
+        chunk_size,
+    )
+    if chunk_indices.shape[0] and chunk_size > 16:
+        subchunks = chunk_size // 16
+        chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[
+            (chunk_indices.shape[0] * subchunks * (subchunks - 1) // 2 * heads,)
+        ](
+            q=qn,
+            k=kn,
+            g=g,
+            beta=beta,
+            A=A,
+            Aqk=Aqk,
+            scale=dim**-0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=tokens,
+            NT=chunk_indices.shape[0],
+            H=heads,
+            K=dim,
+            BT=chunk_size,
+            BC=16,
+            NC=subchunks,
+        )
+    return qn, kn, g, beta, A, Aqk
 
 
 # S summary adapted from Thien Tran's Sm100ChunkHKernel, vLLM PR #43273,

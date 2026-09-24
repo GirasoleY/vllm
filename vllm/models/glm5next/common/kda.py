@@ -554,7 +554,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 k=_rearr(k),
                 v=_rearr(v),
                 raw_g=g1[:, prefill],
-                beta=_cast_sigmoid(beta[0, prefill]).unsqueeze(0),
+                beta=beta[:, prefill],
                 A_log=self.A_log,
                 g_bias=self.dt_bias,
                 cu_seqlens=plan.scan_cu_seqlens,
@@ -562,6 +562,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=True,
                 safe_gate=self.kda_safe_gate,
                 lower_bound=self.kda_lower_bound,
+                use_native=True,
             )
         conv_state[slots] = final_windows
         base = gather_initial_states(

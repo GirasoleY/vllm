@@ -150,6 +150,167 @@ def test_kcp_summaries_match_reference_and_preserve_destinations(
         )
 
 
+@pytest.mark.parametrize("use_tma", [False, True])
+@pytest.mark.parametrize("gate_shift", [0.0, -4.0, -10.0])
+@pytest.mark.parametrize(
+    "dtype,heads,dim,chunk_size,safe_gate,strided,lower_bound,gate_offset,uniform",
+    [
+        (torch.bfloat16, 64, 128, 64, True, False, LOWER_BOUND, 0.0, False),
+        (torch.float16, 2, 96, 32, True, True, LOWER_BOUND, 0.0, False),
+        (torch.float32, 1, 192, 16, False, True, LOWER_BOUND, 0.0, False),
+        (torch.bfloat16, 2, 128, 64, True, False, -10.0, 12.0, False),
+        # Bare exp factors are normal, but scaled BF16 operands lose precision.
+        (torch.bfloat16, 2, 128, 64, True, False, -5.4542, 80.0, True),
+    ],
+)
+@torch.inference_mode()
+def test_flashkda_prepare_matches_fla_for_ragged_segments(
+    monkeypatch,
+    use_tma,
+    gate_shift,
+    dtype,
+    heads,
+    dim,
+    chunk_size,
+    safe_gate,
+    strided,
+    lower_bound,
+    gate_offset,
+    uniform,
+):
+    """Native preparation covers full, short and empty segments without fallback."""
+    pytest.importorskip("vllm._flashkda_C")
+    if not hasattr(torch.ops._flashkda_C, "kcp_prepare"):
+        pytest.skip("FlashKDA extension was built without KCP preparation")
+    import importlib
+
+    from vllm.models.glm5next.common.kda import _cast_sigmoid
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import kernels
+    from vllm.models.glm5next.nvidia.ops.third_party.kda.kcp import (
+        prepare_kcp,
+    )
+    from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+    from vllm.third_party.flash_linear_attention.ops.solve_tril import solve_tril
+
+    solve = importlib.import_module(
+        "vllm.third_party.flash_linear_attention.ops.solve_tril"
+    )
+    prepare_module = importlib.import_module(prepare_kcp.__module__)
+    if use_tma:
+        from vllm.triton_utils.allocation import set_triton_allocator
+
+        set_triton_allocator(torch.device("cuda"))
+    monkeypatch.setattr(solve, "is_tma_supported", use_tma)
+
+    class PoisonedStorage:
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+        def empty(self, *args, **kwargs):
+            return torch.empty(*args, **kwargs).fill_(float("nan"))
+
+        def empty_like(self, *args, **kwargs):
+            return torch.empty_like(*args, **kwargs).fill_(float("nan"))
+
+    for module in (kernels, solve, prepare_module):
+        monkeypatch.setattr(module, "torch", PoisonedStorage())
+    torch.manual_seed(9202104)
+    tokens = 2 * chunk_size + 1
+    inputs_shape = (1, tokens, heads, dim * (2 if strided else 1))
+    q, k, raw_g = [
+        torch.randn(inputs_shape, device="cuda", dtype=dtype) for _ in range(3)
+    ]
+    if strided:
+        q, k, raw_g = (x[..., ::2] for x in (q, k, raw_g))
+    raw_g.mul_(0.1).add_(gate_shift + gate_offset)
+    beta_raw = torch.randn(1, tokens, 128, device="cuda", dtype=dtype)[
+        ..., 17 : 17 + heads
+    ]
+    a_log = torch.randn(heads, device="cuda") * 0.1
+    bias = torch.randn(heads * dim, device="cuda") * 0.1
+    if uniform:
+        q.fill_(1)
+        k.fill_(1)
+        beta_raw.zero_()
+        a_log.zero_()
+        bias.zero_()
+    inputs = q, k, raw_g, beta_raw, a_log, bias
+    cu = torch.tensor([0, 0, 1, chunk_size, tokens], device="cuda", dtype=torch.int64)
+    chunks = torch.tensor(
+        [[1, 0], [2, 0], [3, 0], [3, 1]], device="cuda", dtype=torch.int32
+    )
+    metadata = dict(cu_seqlens=cu, chunk_indices=chunks, chunk_size=chunk_size)
+    actual = prepare_kcp(
+        *inputs,
+        cu,
+        chunks,
+        lower_bound=lower_bound if safe_gate else None,
+        chunk_size=chunk_size,
+    )
+    qn, kn, beta = (
+        l2norm_fwd(q.contiguous()),
+        l2norm_fwd(k.contiguous()),
+        _cast_sigmoid(beta_raw),
+    )
+    gate = kernels.fused_kda_gate_chunk_cumsum(
+        raw_g.contiguous(),
+        a_log,
+        bias,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        **metadata,
+    )
+    a, aqk = kernels.chunk_kda_scaled_dot_kkt_fwd(
+        qn,
+        kn,
+        gate,
+        beta,
+        scale=dim**-0.5,
+        output_dtype=torch.float32,
+        **metadata,
+    )
+    # Poisoning covers padding and upper triangles in both preparation paths.
+    for value in (actual[4], actual[5], a, aqk):
+        assert torch.isfinite(value).all()
+    bf16_inverse = solve_tril(
+        a, cu_seqlens=cu, chunk_indices=chunks, output_dtype=torch.bfloat16
+    )
+    assert torch.isfinite(bf16_inverse).all()
+    # Compare the complete inverse; native preparation has inverted its diagonal.
+    inverse_args = dict(cu_seqlens=cu, chunk_indices=chunks, output_dtype=torch.float32)
+    actual = (
+        *actual[:4],
+        solve_tril(actual[4], diagonal_inverted=True, **inverse_args),
+        actual[5],
+    )
+    a = solve_tril(a, **inverse_args)
+    # Approximate gate activation and BF16 MMA differ from FLA materialization.
+    tolerances = [
+        (0, 0),
+        (0, 0),
+        (1e-3, 2e-3),
+        (0, 4e-6),
+        (1e-2, 1e-3),
+        (1e-2, 2e-4),
+    ]
+    for value, expected, (rtol, atol) in zip(
+        actual, (qn, kn, gate, beta, a, aqk), tolerances, strict=True
+    ):
+        assert torch.isfinite(value).all()
+        torch.testing.assert_close(value, expected, rtol=rtol, atol=atol)
+    empty = [x[:, :0] for x in inputs[:4]] + list(inputs[4:])
+    empty_cu = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+    empty_chunks = torch.empty((0, 2), device="cuda", dtype=torch.int64)
+    result = prepare_kcp(
+        *empty,
+        empty_cu,
+        empty_chunks,
+        lower_bound=lower_bound if safe_gate else None,
+        chunk_size=chunk_size,
+    )
+    assert all(value.numel() == 0 for value in result)
+
+
 class _EmulatedGroup:
     """Serialized rank threads that exchange tensors only in all_gather."""
 

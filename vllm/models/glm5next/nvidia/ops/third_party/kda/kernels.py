@@ -210,7 +210,7 @@ def fused_recurrent_kda(
     ],
     key=["BC"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NT"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     q,
     k,
@@ -222,6 +222,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     cu_seqlens,
     chunk_indices,
     T,
+    NT,
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
@@ -230,9 +231,16 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    work = tl.program_id(0)
+    i_t = work % NT
+    pairs = NC * (NC - 1) // 2
+    i_c = (work // NT) % pairs
+    i_bh = work // (NT * pairs)
     i_b, i_h = i_bh // H, i_bh % H
-    i_i, i_j = i_c // NC, i_c % NC
+    i_i = tl.full((), 1, tl.int32)
+    for boundary in tl.static_range(2, NC):
+        i_i += (i_c >= boundary * (boundary - 1) // 2).to(tl.int32)
+    i_j = i_c - i_i * (i_i - 1) // 2
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -246,9 +254,15 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    # Each lower tile also owns its mirrored upper zeros, even when the
+    # lower tile is outside a ragged tail but the upper tokens are valid.
+    o_t = i_t * BT + i_j * BC + tl.arange(0, BC)
+    o_c = i_i * BC + tl.arange(0, BC)
+    offsets = ((bos + o_t[:, None]) * H + i_h) * BT + o_c[None, :]
+    mask = (o_t[:, None] < T) & (o_c[None, :] < BT)
+    tl.store(A + offsets, 0.0, mask)
+    tl.store(Aqk + offsets, 0.0, mask)
     if i_t * BT + i_i * BC >= T:
-        return
-    if i_i <= i_j:
         return
 
     q += (bos * H + i_h) * K
@@ -393,7 +407,8 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     p_kt = k + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
     p_gk = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
 
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+    valid_columns = min(BC, T - i_t * BT - i_i * BC)
+    for j in range(0, valid_columns):
         b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
         b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
         b_ktg = b_kt[None, :] * exp2(b_g - b_gk[None, :])
@@ -405,6 +420,11 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         tl.store(Aqk + o_A + j, b_Aqk, mask=m_A)
         p_kt += H * K
         p_gk += H * K
+
+    # Valid tokens still own all BT columns, including a short final tile.
+    for j in range(valid_columns, BC):
+        tl.store(A + o_A + j, 0.0, mask=m_A)
+        tl.store(Aqk + o_A + j, 0.0, mask=m_A)
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
@@ -455,26 +475,28 @@ def chunk_kda_scaled_dot_kkt_fwd(
     BC = min(16, BT)
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
-    A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
-    Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
-    grid = (NT, NC * NC, B * H)
-    chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        A=A,
-        Aqk=Aqk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-        NC=NC,
-    )
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    if NC > 1:
+        grid = (NT * NC * (NC - 1) // 2 * B * H,)
+        chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            A=A,
+            Aqk=Aqk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            NT=NT,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+            NC=NC,
+        )
 
     grid = (NT, NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
@@ -1040,6 +1062,7 @@ def _chunk_kda_prepare_with_cumulative_g(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    prepared: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> ChunkKdaPrepared:
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
@@ -1047,18 +1070,28 @@ def _chunk_kda_prepare_with_cumulative_g(
     # calling this helper directly unless that invariant is upheld.
     # the intra Aqk is kept in fp32
     # the computation has very marginal effect on the entire throughput
-    A, Aqk = chunk_kda_scaled_dot_kkt_fwd(
-        q=q,
-        k=k,
-        gk=g,
-        beta=beta,
-        scale=scale,
+    A, Aqk = (
+        chunk_kda_scaled_dot_kkt_fwd(
+            q=q,
+            k=k,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+            output_dtype=torch.float32,
+        )
+        if prepared is None
+        else prepared
+    )
+    A = solve_tril(
+        A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
+        output_dtype=k.dtype,
+        diagonal_inverted=prepared is not None,
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     w, u, _, kg = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -1325,13 +1358,43 @@ def chunk_kda_with_fused_gate_prepare(
     use_qk_l2norm_in_kernel: bool = False,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    use_native: bool = False,
 ) -> ChunkKdaPrepared:
     """Prepare chunk KDA from raw gates, leaving initial states to the scan.
 
     ``chunk_kda_with_fused_gate`` equals this preparation followed by
     ``chunk_kda_scan``. Splitting them lets context parallelism derive each
-    segment's initial state from the prepared chunks.
+    segment's initial state from the prepared chunks. ``use_native`` fuses
+    q/k normalization, the gate, the beta sigmoid and the diagonal inversion
+    in one FlashKDA kernel; ``beta`` is then the raw projection.
     """
+    if use_native:
+        from .kcp import prepare_kcp
+
+        assert use_qk_l2norm_in_kernel and g_bias is not None
+        q, k, g, beta, A, Aqk = prepare_kcp(
+            q,
+            k,
+            raw_g,
+            beta,
+            A_log,
+            g_bias,
+            cu_seqlens,
+            chunk_indices,
+            lower_bound=lower_bound if safe_gate else None,
+            chunk_size=FLA_CHUNK_SIZE,
+        )
+        return _chunk_kda_prepare_with_cumulative_g(
+            q=q,
+            k=k,
+            v=v.contiguous(),
+            g=g,
+            beta=beta,
+            scale=k.shape[-1] ** -0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            prepared=(A, Aqk),
+        )
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
