@@ -29,16 +29,18 @@ LOWER_BOUND = -5.0
 
 @pytest.mark.parametrize("counts", [[8], [8, 8, 8], [8, 3, 0], [1, 8, 3, 0]])
 def test_kcp_merge_preserves_partial_states_and_contiguous_output(counts):
-    """The dense path and ragged path preserve state at every slot boundary."""
-    from vllm.models.glm5next.nvidia.ops.kcp import (
-        kcp_merge_states,
-    )
+    """Ordered FP32 merge with identity-filled absent slots matches a reference."""
+    from vllm.models.glm5next.nvidia.ops.kcp import kcp_merge_states
 
     torch.manual_seed(7)
     slots, heads, dim = 8, 2, 128
     summaries = torch.randn(slots, len(counts), heads, dim, 2 * dim, device="cuda")
     summaries *= 0.003
     summaries[..., dim:] += 0.95 * torch.eye(dim, device="cuda")
+    for request, count in enumerate(counts):
+        # Absent slots hold a zero S_ext and the identity transition.
+        summaries[count:, request] = 0
+        summaries[count:, request, :, :, dim:] = torch.eye(dim, device="cuda")
     original = summaries.clone()
     base = torch.randn(len(counts), heads, dim, dim, device="cuda") * 0.2
     expected_inits = base.new_empty(len(counts), slots, heads, dim, dim)
@@ -56,18 +58,22 @@ def test_kcp_merge_preserves_partial_states_and_contiguous_output(counts):
     order = [slot for rank in range(slots // 2) for slot in (rank, slots - 1 - rank)]
     summaries = summaries[order].contiguous()
     original_transition = summaries[..., dim:].clone()
-    initial, final = kcp_merge_states(
-        summaries,
-        base,
-        torch.tensor(counts, dtype=torch.int32, device="cuda"),
-        all_slots_full=all(count == slots for count in counts),
+    from vllm.v1.worker.gpu.pcp_manager import merge_source_rows
+
+    pairs = [(n, c) for n in range(len(counts)) for c in range(slots)]
+    rows = torch.tensor(merge_source_rows(len(counts), slots, pairs), device="cuda")
+    initial, final = kcp_merge_states(summaries, base, rows, len(pairs))
+    torch.testing.assert_close(
+        initial.view(len(counts), slots, heads, dim, dim),
+        expected_inits,
+        atol=1e-5,
+        rtol=1e-5,
     )
-    torch.testing.assert_close(initial, expected_inits, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(final, expected_final, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(
         summaries[..., dim:], original_transition, atol=0, rtol=0
     )
-    assert initial.is_contiguous() and final.is_contiguous()
+    assert final.is_contiguous()
 
 
 @pytest.mark.parametrize("batch", ["ragged", "empty", "none"])
@@ -492,7 +498,7 @@ def test_kcp_layer_matches_unpartitioned_forward(
         pad = torch.zeros(padding, dtype=torch.int64, device="cuda")
         local = torch.cat((index, pad))
         metadata = _reference_metadata(lengths, computed, slots, num_decodes)
-        metadata.cp_plan = plan
+        metadata.cp_plan = plan.with_state_indices(slots)
         contexts[rank] = SimpleNamespace(attn_metadata={"kda": metadata})
         cache = (conv.clone(), state.clone())
         out = torch.full((1, len(local), heads, dim), 7.0, device="cuda").bfloat16()

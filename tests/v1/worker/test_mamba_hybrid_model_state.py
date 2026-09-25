@@ -91,7 +91,7 @@ def test_hybrid_metadata_preserves_request_order(monkeypatch, mode, spec_tokens,
     state.supports_mm_inputs = False
     state._align_mode = align
     state.num_accepted_tokens_gpu = torch.tensor([4, 5, 6], dtype=torch.int32)
-    plan = object()
+    plan = Mock()
     build_plan = Mock(return_value=plan)
     state.pcp_manager = (
         None
@@ -114,7 +114,9 @@ def test_hybrid_metadata_preserves_request_order(monkeypatch, mode, spec_tokens,
     mla = Mock()
     kda = Mock(spec=mamba_hybrid.GDNAttentionMetadataBuilder)
     kda.mamba_aligned_state_indices = None
-    kda_metadata = mamba_hybrid.GDNAttentionMetadata(0, 0, 0, 0, 0, 0, 0)
+    kda_metadata = mamba_hybrid.GDNAttentionMetadata(
+        0, 0, 0, 0, 0, 0, 0, non_spec_state_indices_tensor=torch.tensor([3, 5])
+    )
     kda.build.return_value = kda.build_for_cudagraph_capture.return_value = kda_metadata
     groups = [
         [SimpleNamespace(layer_names=[name], get_metadata_builder=Mock(return_value=b))]
@@ -177,7 +179,10 @@ def test_hybrid_metadata_preserves_request_order(monkeypatch, mode, spec_tokens,
     state.recoverssm.record_step.assert_called_once()
     if mode == "pcp":
         build_plan.assert_called_once_with(3)
-        assert metadata["kda"].cp_plan is plan
+        plan.with_state_indices.assert_called_once_with(
+            kda_metadata.non_spec_state_indices_tensor
+        )
+        assert metadata["kda"].cp_plan is plan.with_state_indices.return_value
     else:
         build_plan.assert_not_called()
         assert metadata["kda"].cp_plan is None

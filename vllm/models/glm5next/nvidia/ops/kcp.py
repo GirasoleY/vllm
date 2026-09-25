@@ -27,7 +27,6 @@ window from the tails and the cached prefix, and run the ordinary kernels.
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.triton_utils import tl, triton
@@ -98,39 +97,65 @@ def kcp_compute_summaries(
     return out
 
 
+@triton.jit
+def _gather_merge_states_kernel(
+    base,
+    slots_hm,
+    rows,
+    out,
+    N,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Copy value-first [V, K] states from base rows or merged summary rows."""
+    row, h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    v = tl.program_id(2).to(tl.int64) * BV + tl.arange(0, BV)[:, None]
+    k = tl.arange(0, K)[None, :]
+    mask = v < V
+    source = tl.load(rows + row).to(tl.int64)
+    if source < N:
+        value = tl.load(base + ((source * H + h) * V + v) * K + k, mask=mask)
+    else:
+        # Summary rows are [K, V + K]; the merged state is its transposed S_ext.
+        summary = (source - N) * H + h
+        value = tl.load(slots_hm + (summary * K + k) * (V + K) + v, mask=mask)
+    tl.store(out + ((row * H + h) * V + v) * K + k, value, mask=mask)
+
+
 def kcp_merge_states(
     slots_hm: torch.Tensor,
     base_state: torch.Tensor,
-    num_slots: torch.Tensor,
-    *,
-    all_slots_full: bool = False,
+    merge_rows: torch.Tensor,
+    num_segments: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge rank/part summaries in chronological slot order using FP32.
 
-    Consumes S_ext as scratch. Returns all slot initial states and a contiguous
-    final state. The CPU plan certifies all_slots_full; absent slots retain
-    the preceding state.
+    ``slots_hm`` is [2P physical slots, N, H, K, V + K]; absent slots must hold
+    the identity transition and a zero S_ext, so every slot is one exact step.
+    Each step's FP32 GEMM overwrites that slot's S_ext with the state after it.
+    ``merge_rows`` (see ``merge_source_rows``) selects each segment's initial
+    state, then each request's final state. Both results are value-first and
+    contiguous.
     """
     S, N, H, K, VK = slots_hm.shape
     V = VK - K
-    init_states = slots_hm.new_empty(N, S, H, V, K)
-    h = base_state
+    assert slots_hm.is_contiguous() and base_state.is_contiguous()
+    after = slots_hm[..., :V].transpose(-1, -2)  # [S, N, H, V, K]
+    transposed = slots_hm[..., V:].transpose(-1, -2)
+    h = base_state.view(N * H, V, K)
     for c in range(S):
-        init_states[:, c] = h
-        physical_c = 2 * c if c < S // 2 else 2 * (S - 1 - c) + 1
-        m_c = slots_hm[physical_c, ..., V:]  # [N,H,K,K]
-        se_c = slots_hm[physical_c, ..., :V].transpose(-1, -2)  # [N,H,V,K]
-        se_c.view(N * H, V, K).baddbmm_(
-            h.reshape(N * H, V, K),
-            m_c.transpose(-1, -2).view(N * H, K, K),
-        )
-        h = (
-            se_c
-            if all_slots_full
-            else torch.where((c < num_slots).view(N, 1, 1, 1), se_c, h)
-        )
-    # The cache scatter consumes a contiguous state for each request.
-    return init_states, h.contiguous()
+        physical = 2 * c if c < S // 2 else 2 * (S - 1 - c) + 1
+        state = after[physical].view(N * H, V, K)
+        state.baddbmm_(h, transposed[physical].view(N * H, K, K))
+        h = state
+    out = base_state.new_empty(merge_rows.shape[0], H, V, K)
+    block = 32
+    _gather_merge_states_kernel[(merge_rows.shape[0], H, triton.cdiv(V, block))](
+        base_state, slots_hm, merge_rows, out, N, H=H, K=K, V=V, BV=block
+    )
+    return out[:num_segments], out[num_segments:]
 
 
 @triton.jit
@@ -172,28 +197,142 @@ def pack_conv_tails(plan: "HybridPCPPlan", qkv: torch.Tensor) -> torch.Tensor:
     return tails
 
 
+@triton.jit
+def _conv_windows_kernel(
+    conv_state,
+    state_indices,
+    has_initial_state,
+    tails,
+    pool_rows,
+    out,
+    stride_state_slot,
+    stride_state_channel,
+    stride_state_column,
+    stride_out_row,
+    stride_out_channel,
+    stride_out_column,
+    row_offset,
+    num_prefix_rows,
+    C: tl.constexpr,
+    HALO: tl.constexpr,
+    OUT_BY_SLOT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Select HALO raw inputs per row from cached prefixes and gathered tails."""
+    row = tl.program_id(0).to(tl.int64)
+    channel = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = channel < C
+    values = ()  # type: tuple
+    for column in tl.static_range(HALO):
+        source = tl.load(pool_rows + row * HALO + column).to(tl.int64)
+        from_prefix = source < num_prefix_rows
+        request = tl.where(from_prefix, source // HALO, 0)
+        slot = tl.load(state_indices + request).to(tl.int64)
+        continued = tl.load(has_initial_state + request).to(tl.int1)
+        prefix = tl.load(
+            conv_state
+            + slot * stride_state_slot
+            + channel * stride_state_channel
+            + (source % HALO) * stride_state_column,
+            mask=mask & from_prefix & continued,
+            other=0.0,
+        )
+        tail = tl.load(
+            tails + tl.maximum(source - num_prefix_rows, 0) * C + channel,
+            mask=mask & (source >= num_prefix_rows),
+            other=0.0,
+        )
+        values += (tl.where(from_prefix, prefix, tail.to(prefix.dtype)),)
+    # Load every column before storing: the final windows overwrite the prefix.
+    if OUT_BY_SLOT:
+        destination = tl.load(state_indices + row).to(tl.int64)
+    else:
+        destination = row + row_offset
+    for column in tl.static_range(HALO):
+        tl.store(
+            out
+            + destination * stride_out_row
+            + channel * stride_out_channel
+            + column * stride_out_column,
+            values[column],
+            mask=mask,
+        )
+
+
+def _launch_conv_windows(
+    plan, tails, conv_state, state_indices, rows, out, *, row_offset, out_by_slot
+):
+    channels = conv_state.shape[1]
+    assert tails.shape[-1] == channels and tails.is_contiguous()
+    if rows.shape[0] == 0:
+        return
+    block = 1024
+    _conv_windows_kernel[(rows.shape[0], triton.cdiv(channels, block))](
+        conv_state,
+        state_indices,
+        plan.prefill_has_initial_state,
+        tails,
+        rows,
+        out,
+        *conv_state.stride(),
+        *out.stride(),
+        row_offset,
+        plan.num_prefill_reqs * plan.halo_size,
+        C=channels,
+        HALO=plan.halo_size,
+        OUT_BY_SLOT=out_by_slot,
+        BLOCK=block,
+    )
+
+
 def conv_windows(
     plan: "HybridPCPPlan",
     tails: torch.Tensor,
     conv_state: torch.Tensor,
     state_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble segment initial and request final windows as [rows, C, halo].
+) -> torch.Tensor:
+    """Build segment initial windows as [1 + L, C, halo] in the cache's layout.
 
     ``tails`` are the gathered tails of every rank; ``conv_state`` is the
     (..., C, halo) cache view and ``state_indices`` the prefill requests' slots.
+    Row 0 is NULL_BLOCK_ID to the conv kernel; segments use rows 1..L.
     """
-    halo = plan.halo_size
-    assert conv_state.shape[-1] == halo
-    prefix = conv_state[state_indices].transpose(1, 2)
-    # Fresh requests start from zeros regardless of the slot's stale contents.
-    prefix = torch.where(
-        plan.prefill_has_initial_state.view(-1, 1, 1), prefix, prefix.new_zeros(())
+    assert conv_state.shape[-1] == plan.halo_size
+    shape = (plan.num_segments + 1, conv_state.shape[1], plan.halo_size)
+    if conv_state.stride(-1) == 1:
+        windows = conv_state.new_empty(shape)
+    else:
+        windows = conv_state.new_empty(shape[0], shape[2], shape[1]).transpose(1, 2)
+    _launch_conv_windows(
+        plan,
+        tails,
+        conv_state,
+        state_indices,
+        plan.halo_idx,
+        windows,
+        row_offset=1,
+        out_by_slot=False,
     )
-    pool = torch.cat((prefix.reshape(-1, prefix.shape[-1]), tails.to(prefix.dtype)))
-    # Row 0 is NULL_BLOCK_ID to the conv kernel; segments use rows 1..L.
-    initial = pool[F.pad(plan.halo_idx, (0, 0, 1, 0))].transpose(1, 2)
-    return initial, pool[plan.final_halo_idx].transpose(1, 2)
+    return windows
+
+
+def publish_conv_windows(
+    plan: "HybridPCPPlan",
+    tails: torch.Tensor,
+    conv_state: torch.Tensor,
+    state_indices: torch.Tensor,
+) -> None:
+    """Write every prefill request's final window into its conv cache slot."""
+    _launch_conv_windows(
+        plan,
+        tails,
+        conv_state,
+        state_indices,
+        plan.final_halo_idx,
+        conv_state,
+        row_offset=0,
+        out_by_slot=True,
+    )
 
 
 def local_summaries(
@@ -205,7 +344,9 @@ def local_summaries(
     N, H, V, K = base.shape
     summaries = base.new_empty(2 * N, H, K, V + K, dtype=torch.float32)
     if plan.num_segments != 2 * N:
+        # Absent parts are identity steps: zero S_ext, identity transition.
         summaries.zero_()
+        summaries[..., V:].diagonal(dim1=-2, dim2=-1).fill_(1.0)
     if prepared is not None:
         kcp_compute_summaries(
             kg=prepared.kg,
@@ -225,14 +366,12 @@ def merge_summaries(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return segment initial states and request final states, value-first."""
     N, H, V, K = base.shape
-    slots = 2 * plan.world
-    inits, final = kcp_merge_states(
-        gathered.view(slots, N, H, K, V + K),
-        base.float(),
-        plan.num_slots,
-        all_slots_full=plan.all_slots_full,
+    return kcp_merge_states(
+        gathered.view(2 * plan.world, N, H, K, V + K),
+        base.float().contiguous(),
+        plan.merge_rows,
+        plan.num_segments,
     )
-    return inits.view(N * slots, H, V, K)[plan.init_idx], final
 
 
 def exchange_states(

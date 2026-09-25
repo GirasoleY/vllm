@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -67,8 +67,6 @@ class HybridPCPPlan:
     num_prefill_tokens: int
     num_prefill_reqs: int
     num_segments: int
-    # Every prefill request fills all 2P slots.
-    all_slots_full: bool
     # Rows of the global Mamba metadata.
     decode_rows: torch.Tensor
     prefill_rows: torch.Tensor
@@ -82,15 +80,44 @@ class HybridPCPPlan:
     # Convolution window rows; row 0 is NULL_BLOCK_ID.
     segment_ids: torch.Tensor
     segment_has_initial_state: torch.Tensor
-    # Rows of this rank's [2 * N] summaries and of the merged [N * 2P] states.
+    # Rows of this rank's [2 * N] summaries; merge source rows of each segment's
+    # initial state followed by each request's final state (``merge_source_rows``).
     summary_idx: torch.Tensor
-    init_idx: torch.Tensor
-    num_slots: torch.Tensor
+    merge_rows: torch.Tensor
     # Local prefill token of each [N, 2, halo] tail row, or -1 if absent.
     tail_src_idx: torch.Tensor
     # Convolution pool rows of each segment's initial and request's final window.
     halo_idx: torch.Tensor
     final_halo_idx: torch.Tensor
+    # State cache slots of the rows above, set per Mamba group by the model state.
+    decode_slots: torch.Tensor | None = field(default=None, repr=False)
+    prefill_slots: torch.Tensor | None = field(default=None, repr=False)
+
+    def with_state_indices(self, state_indices: torch.Tensor) -> "HybridPCPPlan":
+        """Bind one Mamba group's per-request state slots, once per step."""
+        return replace(
+            self,
+            decode_slots=state_indices[self.decode_rows],
+            prefill_slots=state_indices[self.prefill_rows],
+        )
+
+
+def merge_source_rows(
+    num_requests: int, num_slots: int, segments: list[tuple[int, int]]
+) -> list[int]:
+    """Rows of the merge's state sources for (request, slot) segments, then finals.
+
+    Row n is request n's base state; row N + p * N + n is the state after
+    physical summary slot p of request n. Physical slot 2c holds chronological
+    slot c < P and slot 2(2P - 1 - c) + 1 holds c >= P.
+    """
+
+    def after(slot: int, request: int) -> int:
+        physical = 2 * slot if slot < num_slots // 2 else 2 * (num_slots - 1 - slot) + 1
+        return num_requests + physical * num_requests + request
+
+    rows = [n if c == 0 else after(c - 1, n) for n, c in segments]
+    return rows + [after(num_slots - 1, n) for n in range(num_requests)]
 
 
 class PCPManager:
@@ -564,7 +591,7 @@ class PCPManager:
             return rows
 
         scan_cu = [0]
-        summary_idx, init_idx, halo_idx = [], [], []
+        summary_idx, segment_slots, halo_idx = [], [], []
         tail_src_idx = np.full(num_prefills * 2 * halo_size, -1, dtype=np.int64)
         for segment in segments[num_decodes:]:
             n = request_of_row[segment.global_batch_req_idx]
@@ -587,7 +614,7 @@ class PCPManager:
             )
             scan_cu.append(scan_cu[-1] + segment.num_tokens)
             summary_idx.append(part(slot) * num_prefills + n)
-            init_idx.append(n * num_slots + slot)
+            segment_slots.append((n, slot))
             halo_idx.append(window(n, start))
         num_segments = len(summary_idx)
         final_halo_idx = [
@@ -615,7 +642,7 @@ class PCPManager:
             decode_rows=decode_rows,
             prefill_rows=prefill_rows,
             summary_idx=summary_idx,
-            init_idx=init_idx,
+            merge_rows=merge_source_rows(num_prefills, num_slots, segment_slots),
             tail_src_idx=tail_src_idx,
             halo_idx=np.asarray(halo_idx, dtype=np.int64).reshape(-1, halo_size),
             final_halo_idx=final_halo_idx,
@@ -631,7 +658,6 @@ class PCPManager:
             ),
             scan_chunk_offsets=prepare_chunk_offsets(scan_cu_cpu, FLA_CHUNK_SIZE),
             segment_ids=np.arange(1, num_segments + 1),
-            num_slots=(slot_lens > 0).sum(axis=1),
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
@@ -654,7 +680,6 @@ class PCPManager:
             num_prefill_tokens=scan_cu[-1],
             num_prefill_reqs=num_prefills,
             num_segments=num_segments,
-            all_slots_full=bool(np.all(slot_lens > 0)),
             conv_metadata=SimpleNamespace(
                 nums_dict=nums_dict,
                 batch_ptr=batch_ptr,

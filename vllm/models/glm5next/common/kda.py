@@ -487,7 +487,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g1: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
-        state_indices: torch.Tensor,
         plan: "HybridPCPPlan",
     ) -> None:
         """Hybrid-PCP step: local tokens, global state slots (see ``kcp``)."""
@@ -500,7 +499,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
 
         if num_decodes:
-            decode_slots = state_indices[plan.decode_rows]
+            decode_slots = plan.decode_slots
             decode_qkv = causal_conv1d_update(
                 qkv[:num_decodes],
                 conv_state,
@@ -532,9 +531,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         # Every rank joins both collectives, even without local prefill tokens.
         prefill = slice(num_decodes, num_decodes + num_prefills)
-        slots = state_indices[plan.prefill_rows]
+        slots = plan.prefill_slots
+        assert slots is not None and plan.decode_slots is not None
         tails = get_pcp_group().all_gather(kcp.pack_conv_tails(plan, qkv[prefill]), 0)
-        windows, final_windows = kcp.conv_windows(plan, tails, conv_state, slots)
+        windows = kcp.conv_windows(plan, tails, conv_state, slots)
         prepared = None
         if num_prefills:
             q, k, v = causal_conv1d_fn(
@@ -564,7 +564,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 lower_bound=self.kda_lower_bound,
                 use_native=True,
             )
-        conv_state[slots] = final_windows
+        kcp.publish_conv_windows(plan, tails, conv_state, slots)
         base = gather_initial_states(
             recurrent_state, slots, plan.prefill_has_initial_state
         )
@@ -600,14 +600,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         if attn_metadata_narrowed.cp_plan is not None:
-            assert attn_metadata_narrowed.non_spec_state_indices_tensor is not None
             self._forward_kcp(
-                qkv_proj_states,
-                g1,
-                beta,
-                core_attn_out,
-                attn_metadata_narrowed.non_spec_state_indices_tensor,
-                attn_metadata_narrowed.cp_plan,
+                qkv_proj_states, g1, beta, core_attn_out, attn_metadata_narrowed.cp_plan
             )
             return
         has_initial_state = attn_metadata_narrowed.has_initial_state

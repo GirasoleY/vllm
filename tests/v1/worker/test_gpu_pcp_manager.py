@@ -617,17 +617,19 @@ def test_plan_maps_local_tokens_and_halos_to_global_positions(
         )
         assert plan.summary_idx.unique().numel() == plan.num_segments
         slots = 2 * world
-        for segment, summary, init in zip(
-            prefill_segments, plan.summary_idx.tolist(), plan.init_idx.tolist()
-        ):
+        segment_slots = []
+        for segment, summary in zip(prefill_segments, plan.summary_idx.tolist()):
             g = segment.global_batch_req_idx
             n = int(np.searchsorted(prefill_rows, g))
             chunk = -(-lengths[g] // slots)
             slot = (segment.global_batch_slice.start - qsl[g]) // chunk
-            assert init == n * slots + slot
+            segment_slots.append((n, slot))
             part = int(slot != rank)
             assert slot == (rank if part == 0 else slots - 1 - rank)
             assert summary == part * len(prefill_rows) + n
+        assert plan.merge_rows.tolist() == pcp_manager_module.merge_source_rows(
+            len(prefill_rows), slots, segment_slots
+        )
         tail = torch.full(plan.tail_src_idx.shape, -1)
         valid = plan.tail_src_idx >= 0
         tail[valid] = torch.tensor(local, dtype=torch.int64)[plan.tail_src_idx[valid]]

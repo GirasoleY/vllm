@@ -378,12 +378,17 @@ class MambaHybridModelState(DefaultModelState):
             conv_shape = mamba_spec.shapes[0]
             halo_size = conv_shape[-1] if is_conv_state_dim_first() else conv_shape[0]
             plan = pcp.build_hybrid_plan(halo_size)
+            bound: dict[int, Any] = {}
             for group_id in mamba_group_ids:
                 for group in attn_groups[group_id]:
                     for layer_name in group.layer_names:
                         layer_metadata = attn_metadata[layer_name]
                         assert isinstance(layer_metadata, GDNAttentionMetadata)
-                        layer_metadata.cp_plan = plan
+                        if plan is not None and id(layer_metadata) not in bound:
+                            indices = layer_metadata.non_spec_state_indices_tensor
+                            assert indices is not None
+                            bound[id(layer_metadata)] = plan.with_state_indices(indices)
+                        layer_metadata.cp_plan = bound.get(id(layer_metadata))
         attn_metadata.update(local_attn_metadata)
         if self.recoverssm is not None:
             self.recoverssm.record_step(
