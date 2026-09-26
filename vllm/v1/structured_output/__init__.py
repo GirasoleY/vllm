@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from itertools import chain, islice
+from typing import TYPE_CHECKING, overload
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -31,6 +32,51 @@ else:
 
 
 logger = init_logger(__name__)
+
+
+class _TokenIdsView(Sequence[int]):
+    """Read-only `history[:history_len] + tail` that does not copy `history`."""
+
+    __slots__ = ("_history", "_history_len", "_tail")
+
+    def __init__(
+        self, history: Sequence[int], history_len: int, tail: Sequence[int]
+    ) -> None:
+        self._history = history
+        self._history_len = history_len
+        self._tail = tail
+
+    def __len__(self) -> int:
+        return self._history_len + len(self._tail)
+
+    def __iter__(self) -> Iterator[int]:
+        return chain(islice(self._history, self._history_len), self._tail)
+
+    def __contains__(self, item: object) -> bool:
+        history: Iterable[object] = islice(self._history, self._history_len)
+        return item in self._tail or item in history
+
+    @overload
+    def __getitem__(self, item: int) -> int: ...
+
+    @overload
+    def __getitem__(self, item: slice) -> list[int]: ...
+
+    def __getitem__(self, item: int | slice) -> int | list[int]:
+        h = self._history_len
+        if isinstance(item, slice):
+            start, stop, step = item.indices(len(self))
+            if step != 1:
+                return [self[i] for i in range(start, stop, step)]
+            return [
+                *self._history[start : min(stop, h)],
+                *self._tail[max(start - h, 0) : max(stop - h, 0)],
+            ]
+        if item < 0:
+            item += len(self)
+        if not 0 <= item < len(self):
+            raise IndexError(item)
+        return self._history[item] if item < h else self._tail[item - h]
 
 
 class StructuredOutputManager:
@@ -266,28 +312,14 @@ class StructuredOutputManager:
             if offset is not None:
                 return offset + 1
 
-        # Fallback to `find_reasoning_end_offset`
-        # TODO: Build a read-only Sequence view over all_token_ids
-        # instead of copying the entire all_token_ids into input_ids.
-        if spec_tokens_committed:
-            if not spec_tokens or not reasoner.is_reasoning_end_streaming(
-                request.all_token_ids, spec_tokens
-            ):
-                return num_spec_tokens + 1
-
-            input_ids = request.all_token_ids.copy()
-            delta_ids = list(spec_tokens)
-        else:
-            input_ids = request.all_token_ids.copy()
-            input_ids.extend(spec_tokens)
-            if not reasoner.is_reasoning_end_streaming(input_ids, spec_tokens):
-                return num_spec_tokens + 1
-            delta_ids = list(spec_tokens)
-
-        for i in range(num_spec_tokens - 1, 0, -1):
-            input_ids.pop()
-            delta_ids.pop()
-            if not reasoner.is_reasoning_end_streaming(input_ids, delta_ids):
+        # Fallback: find the shortest draft prefix that ends reasoning, checking
+        # views of history + draft prefix so the history is never copied.
+        history = request.all_token_ids
+        history_len = len(history) - (num_spec_tokens if spec_tokens_committed else 0)
+        for i in range(num_spec_tokens, 0, -1):
+            prefix = spec_tokens[:i]
+            view = _TokenIdsView(history, history_len, prefix)
+            if not reasoner.is_reasoning_end_streaming(view, prefix):
                 return i + 1
         return 1
 

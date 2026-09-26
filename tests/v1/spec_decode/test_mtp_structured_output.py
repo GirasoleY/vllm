@@ -11,7 +11,8 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import StructuredOutputManager, _TokenIdsView
+from vllm.v1.utils import ConstantList
 
 TOKENIZER = "gpt2"
 NUM_SPEC_TOKENS = 4
@@ -152,3 +153,68 @@ def test_bitmask_engine_reasoner_ends_midwindow_with_padding(backend):
     assert not (bitmask[2] == -1).all()
     assert reasoner.windows == [[pre, marker, post]]
     assert not grammar.is_terminated()
+
+
+class _NoCopyConstantList(ConstantList):
+    """Fails if the reasoning-end check copies the token history."""
+
+    def copy(self):
+        raise AssertionError("all_token_ids must not be copied")
+
+
+class _MarkerReasonerStub:
+    """Ends reasoning once `marker` is in the history; records every check."""
+
+    def __init__(self, marker: int):
+        self.marker = marker
+        self.calls: list[tuple[list[int], list[int]]] = []
+
+    def is_reasoning_end(self, input_ids):
+        return self.marker in input_ids
+
+    def is_reasoning_end_streaming(self, input_ids, delta_ids):
+        self.calls.append((list(input_ids), list(delta_ids)))
+        return self.marker in input_ids
+
+
+def test_token_ids_view_matches_list():
+    history, tail = [0, 1, 2, 3, 4], [5, 6]
+    for history_len in (0, 3, 5):
+        view = _TokenIdsView(history, history_len, tail)
+        expected = history[:history_len] + tail
+        assert len(view) == len(expected)
+        assert list(view) == expected
+        assert [x in view for x in range(8)] == [x in expected for x in range(8)]
+        for i in range(-len(expected), len(expected)):
+            assert view[i] == expected[i]
+        for start in range(-8, 9):
+            for stop in (*range(-8, 9), None):
+                for step in (None, 2, -1):
+                    s = slice(start, stop, step)
+                    assert view[s] == expected[s], s
+        with pytest.raises(IndexError):
+            view[len(expected)]
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_reasoning_end_checks_draft_prefixes_without_copy(committed):
+    """Each draft prefix is checked against history + prefix, longest first,
+    without copying `all_token_ids`."""
+    tokenizer, manager, request, prompt = _make_manager_and_request("xgrammar")
+    marker = tokenizer.encode("\n")[0]
+    reasoner = _MarkerReasonerStub(marker)
+    manager.reasoner_cls = type(reasoner)
+    request.structured_output_request.reasoner = reasoner
+    request.structured_output_request.reasoning_ended = False
+
+    drafts = [tokenizer.encode(" ")[0], marker, tokenizer.encode(",")[0]]
+    if committed:
+        request.append_output_token_ids(list(drafts))
+    request.all_token_ids = _NoCopyConstantList(request._all_token_ids)
+
+    start = manager._get_constraint_start(request, drafts, committed)
+
+    assert start == 2
+    assert reasoner.calls == [
+        (prompt + drafts[:i], drafts[:i]) for i in range(len(drafts), 0, -1)
+    ]
