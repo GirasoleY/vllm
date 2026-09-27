@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
+    hy4_padded_q_view_offset,
 )
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -249,19 +250,29 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
                 f"Padding num_heads from {actual_num_heads} to "
                 f"{padded_num_heads} for BF16 sparse prefill kernel"
             )
-            # Zero (not new_empty) the padded lanes: topk_indices is shared by
-            # all heads, so the kernel reduces across the head group and NaNs
-            # from uninitialized memory would leak into the real heads.
-            if out is None:
-                q_padded = q.new_zeros((q.shape[0], padded_num_heads, q.shape[2]))
+            # The padded lanes must be zero (not merely allocated): topk_indices
+            # is shared by all heads, so the kernel reduces across the head
+            # group and NaNs from uninitialized memory would leak into the real
+            # heads.
+            base = self._direct_q_base() if out is not None else None
+            tok0 = (
+                hy4_padded_q_view_offset(q, base, actual_num_heads)
+                if base is not None
+                else None
+            )
+            if tok0 is not None:
+                q = base[tok0 : tok0 + num_tokens]
             else:
-                *_, q_padded, _, _ = current_workspace_manager().get_simultaneous(
-                    *self.workspace_specs
-                )
-                q_padded = q_padded[:num_tokens]
-                q_padded[:, actual_num_heads:].zero_()
-            q_padded[:, :actual_num_heads, :] = q
-            q = q_padded
+                if out is None:
+                    q_padded = q.new_zeros((q.shape[0], padded_num_heads, q.shape[2]))
+                else:
+                    *_, q_padded, _, _ = current_workspace_manager().get_simultaneous(
+                        *self.workspace_specs
+                    )
+                    q_padded = q_padded[:num_tokens]
+                    q_padded[:, actual_num_heads:].zero_()
+                q_padded[:, :actual_num_heads, :] = q
+                q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
         output, _, lse = flash_mla_sparse_fwd(

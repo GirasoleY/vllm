@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -54,6 +55,53 @@ from vllm.v1.attention.ops.flashmla import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
+
+# HY4 attention data-movement knobs. The BF16 sparse prefill kernel needs a
+# head count that is a multiple of 128 on Blackwell; HY4 has 64, so its query
+# is head-padded and the padding heads must stay zero (the kernel reduces
+# across the head group, so they must not hold garbage).
+# HY4_ATTN_DIRECT_Q: the MLA layer writes the absorbed query straight into a
+# shared, zero-initialised head-padded buffer (get_mqa_q_buffer).
+# HY4_ATTN_STRIDED_OUT: the kernel's padded output rows are handed to the
+# v_up bmm as a head-strided view.
+# HY4_ATTN_FORCE_MIXED_BATCH: route prefill through the FP8 decode kernel,
+# which needs no head padding.
+_HY4_DIRECT_Q = os.getenv("HY4_ATTN_DIRECT_Q", "1") == "1"
+_HY4_STRIDED_OUT = os.getenv("HY4_ATTN_STRIDED_OUT", "1") == "1"
+_HY4_FORCE_MIXED_BATCH = os.getenv("HY4_ATTN_FORCE_MIXED_BATCH", "0") == "1"
+_HY4_DIRECT_Q_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def hy4_direct_q_buffer(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """The shared zero-initialised head-padded query buffer for *shape*."""
+    key = (tuple(shape), dtype, str(device))
+    buf = _HY4_DIRECT_Q_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.zeros(shape, dtype=dtype, device=device)
+        _HY4_DIRECT_Q_BUFFERS[key] = buf
+    return buf
+
+
+def hy4_padded_q_view_offset(
+    q: torch.Tensor, base: torch.Tensor, num_heads: int
+) -> int | None:
+    """Token offset of *q* inside *base* when *q* is a ``base[a:b, :num_heads]``
+    view (as handed out by ``get_mqa_q_buffer``); None otherwise."""
+    if q.dtype != base.dtype or q.dim() != 3 or q.shape[1] != num_heads:
+        return None
+    if q.stride() != base[:, :num_heads, :].stride():
+        return None
+    row_bytes = base.stride(0) * base.element_size()
+    delta = q.data_ptr() - base.data_ptr()
+    if delta < 0 or delta % row_bytes != 0:
+        return None
+    tok0 = delta // row_bytes
+    if tok0 + q.shape[0] > base.shape[0]:
+        return None
+    return tok0
+
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -378,7 +426,7 @@ class FlashMLASparseMetadataBuilder(
         # separate prefill/decode path can do.
         self.pcp_dcp_kv_gather = self.use_pcp and self.dcp_world_size > 1
         self.fp8_use_mixed_batch = (
-            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+            (self.num_heads < MIN_HEADS_FOR_BF16_PREFILL or _HY4_FORCE_MIXED_BATCH)
             and not self.use_hisparse
             and not self.pcp_dcp_kv_gather
         )
@@ -764,6 +812,37 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # from being released when another layer grows the shared workspace.
         current_workspace_manager().get_simultaneous(*self.workspace_specs)
 
+    def _direct_q_base(self) -> torch.Tensor | None:
+        """The dedicated head-padded query buffer for this layer's shape, or
+        None when the direct-query path does not apply."""
+        if not _HY4_DIRECT_Q or not is_quantized_kv_cache(self.kv_cache_dtype):
+            return None
+        if self.pcp_dcp_kv_gather or self.num_heads % self.prefill_padding == 0:
+            return None
+        # workspace_specs[-3] is (max_tokens, padded_prefill_query_heads, head_size).
+        shape, dtype = self.workspace_specs[-3]
+        device = torch.device("cuda", torch.cuda.current_device())
+        return hy4_direct_q_buffer(shape, dtype, device)
+
+    def get_mqa_q_buffer(
+        self, num_tokens: int, attn_metadata: FlashMLASparseMetadata | None
+    ) -> torch.Tensor | None:
+        """(num_tokens, num_heads, head_size) view into the dedicated head-padded
+        query buffer for the MLA layer to write the absorbed query into directly.
+        None when the direct-query path does not apply (bf16 cache, FP8 mixed
+        batch, PCP+DCP, no padding needed, knob off) or the batch has decode
+        rows."""
+        if attn_metadata is None or getattr(attn_metadata, "fp8_use_mixed_batch", True):
+            return None
+        # Pure-prefill batches only: the FP8 decode kernel wants a contiguous
+        # query.
+        if getattr(attn_metadata, "num_decode_tokens", None) != 0:
+            return None
+        base = self._direct_q_base()
+        if base is None or num_tokens > base.shape[0]:
+            return None
+        return base[:num_tokens, : self.num_heads, :]
+
     def _forward_bf16_kv(
         self,
         q: torch.Tensor,
@@ -1036,6 +1115,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 )
 
             assert fp8_metadata.prefill is not None
+            # Single-chunk prefill with no decode rows: hand the v_up bmm the
+            # kernel's padded output rows as a head-strided view.
+            strided_out = (
+                _HY4_STRIDED_OUT
+                and num_decode_tokens == 0
+                and len(fp8_metadata.prefill.chunks) == 1
+                and not self.pcp_dcp_kv_gather
+            )
             for chunk_index, chunk in enumerate(fp8_metadata.prefill.chunks):
                 chunk_workspace = prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
                 if uses_host_cache and chunk_index > 0:
@@ -1093,7 +1180,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     chunk_topk_length,
                     out=padded_out[chunk.tokens_slice],
                 )
-                attn_out[chunk.tokens_slice].copy_(chunk_out)
+                if strided_out and chunk_out.shape[0] == num_mqa_tokens:
+                    attn_out = chunk_out
+                else:
+                    attn_out[chunk.tokens_slice].copy_(chunk_out)
                 del chunk_out, chunk_lse
 
         if self.pcp_dcp_kv_gather and lse is None:
@@ -1289,16 +1379,27 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 f"Padding num_heads from {actual_num_heads} to "
                 f"{padded_num_heads} for BF16 sparse prefill kernel"
             )
-            if out is None:
-                q_padded = q.new_empty((q.shape[0], padded_num_heads, q.shape[2]))
+            base = self._direct_q_base() if out is not None else None
+            tok0 = (
+                hy4_padded_q_view_offset(q, base, actual_num_heads)
+                if base is not None
+                else None
+            )
+            if tok0 is not None:
+                # q is a view into the dedicated padded buffer; its padding
+                # heads are already zero.
+                q = base[tok0 : tok0 + num_tokens]
             else:
-                *_, q_padded, _, _ = current_workspace_manager().get_simultaneous(
-                    *self.workspace_specs
-                )
-                q_padded = q_padded[:num_tokens]
-                q_padded[:, actual_num_heads:].zero_()
-            q_padded[:, :actual_num_heads, :] = q
-            q = q_padded
+                if out is None:
+                    q_padded = q.new_empty((q.shape[0], padded_num_heads, q.shape[2]))
+                else:
+                    *_, q_padded, _, _ = current_workspace_manager().get_simultaneous(
+                        *self.workspace_specs
+                    )
+                    q_padded = q_padded[:num_tokens]
+                    q_padded[:, actual_num_heads:].zero_()
+                q_padded[:, :actual_num_heads, :] = q
+                q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
         output, _, lse = flash_mla_sparse_fwd(

@@ -808,7 +808,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
         q_dcp_replicated: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # `output`, when given, is written in place instead of allocating a
+        # fresh buffer.
         if self.use_direct_call:
             forward_context: ForwardContext = get_forward_context()
             attn_metadata_raw = forward_context.attn_metadata
@@ -840,7 +843,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             if self.hisparse_cache is not None:
                 self.hisparse_cache.finish_kv_update()
-            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+            if output is None:
+                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
                 kv_c_normed,
@@ -860,7 +864,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
-            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+            if output is None:
+                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             torch.ops.vllm.unified_mla_attention_with_output(
                 q,
                 kv_c_normed,
@@ -1016,6 +1021,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # Convert from (B, N, P) to (N, B, P)
             mqa_q_nope = mqa_q_nope.transpose(0, 1)
+            direct_q_buf: torch.Tensor | None = None
 
             if self.q_pad_num_heads is not None:
                 B, N, L = mqa_q_pe.shape
@@ -1073,14 +1079,35 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # Convert from (N, B, L) to (B, N, L)
                     mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
                 else:
-                    # Write the (N, B, L) bmm result straight into a
-                    # token-major (B, N, L) buffer so the MQA query is already
-                    # contiguous; a NoPE model (qk_rope_head_dim == 0) then
-                    # needs no concat at all.
-                    mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
-                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
+                    get_q_buf = getattr(self.impl, "get_mqa_q_buffer", None)
+                    if (
+                        get_q_buf is not None
+                        and not qrep_decode
+                        and self.impl.dcp_world_size == 1
+                        and not (fp8_attention and self.impl.supports_quant_query_input)
+                    ):
+                        direct_q_buf = get_q_buf(B, attn_metadata)
+                    if direct_q_buf is not None:
+                        # Write the absorbed query straight into the backend's
+                        # head-padded buffer; only the rope dims are copied.
+                        torch.bmm(
+                            mqa_q_nope,
+                            W_UK_T,
+                            out=direct_q_buf[..., :L].transpose(0, 1),
+                        )
+                        direct_q_buf[..., L:].copy_(mqa_q_pe)
+                        mqa_ql_nope = direct_q_buf[..., :L]
+                    else:
+                        # Write the (N, B, L) bmm result straight into a
+                        # token-major (B, N, L) buffer so the MQA query is already
+                        # contiguous; a NoPE model (qk_rope_head_dim == 0) then
+                        # needs no concat at all.
+                        mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
+                        torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if direct_q_buf is not None:
+                mqa_q = direct_q_buf
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
