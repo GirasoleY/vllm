@@ -42,6 +42,9 @@ if(FLASH_KDA_ARCHS)
     csrc/flashkda_registration.cpp
     ${flashkda_SOURCE_DIR}/csrc/flash_kda.cpp
     ${flashkda_SOURCE_DIR}/csrc/smxx/fwd_launch.cu)
+  # The registration translation unit includes KCP's kernels and launchers.
+  set_source_files_properties(csrc/flashkda_registration.cpp
+    PROPERTIES LANGUAGE CUDA)
   set(FLASH_KDA_INCLUDES
     ${flashkda_SOURCE_DIR}/csrc
     ${flashkda_SOURCE_DIR}/cutlass/include

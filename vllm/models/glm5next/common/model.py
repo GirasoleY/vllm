@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -91,6 +91,9 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import HybridPCPLayout
 
 logger = init_logger(__name__)
 
@@ -933,6 +936,14 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    supports_hybrid_pcp = current_platform.is_cuda()
+
+    def prepare_hybrid_pcp(self, layout: "HybridPCPLayout") -> None:
+        """Build this step's KCP plan ahead of the forward."""
+        from vllm.models.glm5next.nvidia.ops import kcp
+
+        kcp.plan_for(layout, self.config.linear_conv_kernel_dim - 1)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1029,6 +1040,11 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
 ):
+    supports_hybrid_pcp = current_platform.is_cuda()
+
+    def prepare_hybrid_pcp(self, layout: "HybridPCPLayout") -> None:
+        self.language_model.prepare_hybrid_pcp(layout)
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
