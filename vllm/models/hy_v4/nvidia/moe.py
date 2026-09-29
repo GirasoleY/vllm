@@ -223,6 +223,11 @@ class HYV4MoEFused(nn.Module):
             )
             from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 
+            # Shared experts hold full weights on every rank (replicated under
+            # sequence parallel), so they can run inside the MegaMoE kernel.
+            fuse_shared_experts = self.shared_experts is not None and (
+                self.use_sequence_parallel or self.tp_size == 1
+            )
             self.experts = DeepseekV4MegaMoEExperts(
                 vllm_config,
                 num_experts=self.n_physical_experts,
@@ -231,6 +236,10 @@ class HYV4MoEFused(nn.Module):
                 top_k=top_k,
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
+                num_shared_experts=(
+                    config.num_shared_experts if fuse_shared_experts else 0
+                ),
+                clamp_shared_experts=False,
                 prefix=f"{prefix}.experts",
             )
             self.mega_router = create_fused_moe_router(
@@ -300,8 +309,10 @@ class HYV4MoEFused(nn.Module):
                 topk_ids,
                 activation_clamp=self.moe_swiglu_limit,
             )
-            # Shared experts are unclamped and retain their FP8/BF16 path.
-            if self.shared_experts is not None:
+            if (
+                self.shared_experts is not None
+                and not self.experts.has_fused_shared_experts
+            ):
                 final_hidden_states = final_hidden_states + self.shared_experts(
                     hidden_states
                 )

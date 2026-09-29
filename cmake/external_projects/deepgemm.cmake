@@ -28,12 +28,12 @@ if(DEEPGEMM_SRC_DIR)
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
   # Keep in sync with tools/install_deepgemm.sh
-  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
-  # Pinned to the fork's dev branch: upstream 2.8.0 plus the SM120
-  # port, the SM90 paged-MQA kv_block=32/next_n=4 port, configurable SwiGLU
-  # alpha/beta, and SiTU for FP8/FP4 Mega MoE. Also includes the CUDA 12.x
-  # layout header fix from vllm-project/DeepGEMM#12.
-  set(_DEEPGEMM_UPSTREAM_TAG "e1f418c2a4f20818221f6b0e578b4c2f634d4c3f")
+  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/Inferact/DeepGEMM.git")
+  # Pinned to Inferact's hy4-fp8-shared-megamoe branch: vllm-project/DeepGEMM
+  # dev (upstream 2.8.0 plus the SM120 port, the SM90 paged-MQA
+  # kv_block=32/next_n=4 port, configurable SwiGLU alpha/beta, SiTU and NVFP4
+  # Mega MoE) plus an independent shared-expert clamp for FP8/FP4 Mega MoE.
+  set(_DEEPGEMM_UPSTREAM_TAG "11009aa5138cd0a1bd521377afe4fc6af7a92671")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)

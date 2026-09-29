@@ -222,6 +222,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         num_shared_experts: int = 0,
+        clamp_shared_experts: bool = True,
         prefix: str = "",
         num_logical_experts: int | None = None,
     ):
@@ -236,6 +237,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_shared_experts = num_shared_experts
+        self.clamp_shared_experts = clamp_shared_experts
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         self.num_logical_experts = (
@@ -373,8 +375,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "to be multiples of 128."
             )
 
-    @staticmethod
-    def _deep_gemm_supports_shared_experts(deep_gemm) -> bool:
+    def _deep_gemm_supports_shared_experts(self, deep_gemm) -> bool:
         """Check the Python API before touching a symmetric-memory group.
 
         This also gives users of an older precompiled vLLM wheel a safe serial
@@ -391,6 +392,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             and "num_shared_experts" in buffer_params
             and "shared_l1_weights" in kernel_params
             and "shared_l2_weights" in kernel_params
+            and (
+                self.clamp_shared_experts or "shared_activation_clamp" in kernel_params
+            )
         )
 
     def _finalize_shared_expert_weights(
@@ -416,7 +420,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         # 128x128). Build a dedicated, numerically equivalent scale view before
         # the generic linear post-load hook replaces the raw checkpoint scales
         # with its 128x128 DeepGEMM layout.
-        checkpoint_scale_dtypes = (torch.float8_e8m0fnu, torch.uint8)
+        checkpoint_scale_dtypes = (torch.float8_e8m0fnu, torch.uint8, torch.float32)
         if (
             gate_up_scale.dtype in checkpoint_scale_dtypes
             and down_scale.dtype in checkpoint_scale_dtypes
@@ -522,7 +526,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
             return None
 
-        scale_fp32 = self._ue8m0_uint8_to_float(scale.view(torch.uint8))
+        if scale.dtype == torch.float32:
+            # Packing into UE8M0 keeps only the exponent, so FP32 scales are
+            # accepted only when they are exact powers of two.
+            if ((scale.view(torch.int32) & ~0x7F800000) != 0).any():
+                logger.warning(
+                    "Disabling native MegaMoE shared-expert fusion for %s: "
+                    "FP32 shared scales are not UE8M0-representable.",
+                    self.prefix,
+                )
+                return None
+            scale_fp32 = scale
+        else:
+            scale_fp32 = self._ue8m0_uint8_to_float(scale.view(torch.uint8))
         scale_1x32 = (
             scale_fp32.repeat_interleave(block_m, dim=0)
             .repeat_interleave(block_k // 32, dim=1)[:mn, : k // 32]
@@ -769,6 +785,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 shared_l2_weights=self._transformed_shared_l2_weights,
                 activation_clamp=activation_clamp,
                 fast_math=fast_math,
+                **(
+                    {}
+                    if self.clamp_shared_experts
+                    else {"shared_activation_clamp": float("inf")}
+                ),
             )
         else:
             deep_gemm.fp8_fp4_mega_moe(

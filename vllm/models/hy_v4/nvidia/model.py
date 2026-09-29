@@ -927,7 +927,11 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             raise RuntimeError("Unloaded backbone FP8 scales: " + ", ".join(missing))
         for module in self.model.modules():
             if isinstance(module, HYV4MoEFused) and module.use_mega_moe:
-                module.experts.finalize_weights()
+                module.experts.finalize_weights(module.shared_experts)
+                # Detach the fused shared MLP so the linear post-load hooks
+                # cannot requantize the weights MegaMoE now shares storage with.
+                if module.experts.has_fused_shared_experts:
+                    module.shared_experts = None
         return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
