@@ -16,8 +16,9 @@ The subclass intentionally keeps the inherited ``get_name()``
 (``"FLASHMLA_SPARSE"``). Several shared code paths key off that exact string —
 `_canonicalize_sparse_mla_kv_cache_dtype` promotes a quantized KV cache to
 ``fp8_ds_mla`` for it, and `FlashMLASparseImpl` asserts that layout — so a new
-name would silently change KV cache behaviour. Only``supports_sink`` and the
-two kernel wrappers differ from the parent.
+name would silently change KV cache behaviour. ``supports_sink``, the two
+kernel wrappers, and the direct head-padded query buffer differ from the
+parent.
 """
 
 from typing import TYPE_CHECKING
@@ -25,11 +26,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
-    hy4_padded_q_view_offset,
 )
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -41,6 +42,42 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+
+# The BF16 sparse prefill kernel needs a head count that is a multiple of 128
+# on Blackwell; HY V4 has 64, so its query is head-padded and the padding
+# heads must stay zero (the kernel reduces across the head group).
+_DIRECT_Q_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def _direct_q_buffer(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """The shared zero-initialised head-padded query buffer for *shape*."""
+    key = (tuple(shape), dtype, str(device))
+    buf = _DIRECT_Q_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.zeros(shape, dtype=dtype, device=device)
+        _DIRECT_Q_BUFFERS[key] = buf
+    return buf
+
+
+def _padded_q_view_offset(
+    q: torch.Tensor, base: torch.Tensor, num_heads: int
+) -> int | None:
+    """Token offset of *q* inside *base* when *q* is a ``base[a:b, :num_heads]``
+    view (as handed out by ``get_mqa_q_buffer``); None otherwise."""
+    if q.dtype != base.dtype or q.dim() != 3 or q.shape[1] != num_heads:
+        return None
+    if q.stride() != base[:, :num_heads, :].stride():
+        return None
+    row_bytes = base.stride(0) * base.element_size()
+    delta = q.data_ptr() - base.data_ptr()
+    if delta < 0 or delta % row_bytes != 0:
+        return None
+    tok0 = delta // row_bytes
+    if tok0 + q.shape[0] > base.shape[0]:
+        return None
+    return tok0
 
 
 class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
@@ -215,6 +252,36 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
 
         return out, lse
 
+    def _direct_q_base(self) -> torch.Tensor | None:
+        """The dedicated head-padded query buffer for this layer's shape, or
+        None when the direct-query path does not apply."""
+        if not is_quantized_kv_cache(self.kv_cache_dtype):
+            return None
+        if self.pcp_dcp_kv_gather or self.num_heads % self.prefill_padding == 0:
+            return None
+        # workspace_specs[-3] is (max_tokens, padded_prefill_query_heads, head_size).
+        shape, dtype = self.workspace_specs[-3]
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        return _direct_q_buffer(shape, dtype, device)
+
+    def get_mqa_q_buffer(
+        self, num_tokens: int, attn_metadata: FlashMLASparseMetadata | None
+    ) -> torch.Tensor | None:
+        """(num_tokens, num_heads, head_size) view into the dedicated head-padded
+        query buffer for the MLA layer to write the absorbed query into directly.
+        None when the direct-query path does not apply (bf16 cache, FP8 mixed
+        batch, PCP+DCP, no padding needed) or the batch has decode rows."""
+        if attn_metadata is None or getattr(attn_metadata, "fp8_use_mixed_batch", True):
+            return None
+        # Pure-prefill batches only: the FP8 decode kernel wants a contiguous
+        # query.
+        if getattr(attn_metadata, "num_decode_tokens", None) != 0:
+            return None
+        base = self._direct_q_base()
+        if base is None or num_tokens > base.shape[0]:
+            return None
+        return base[:num_tokens, : self.num_heads, :]
+
     def _bf16_flash_mla_kernel(
         self,
         q: torch.Tensor,
@@ -256,11 +323,11 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             # heads.
             base = self._direct_q_base() if out is not None else None
             tok0 = (
-                hy4_padded_q_view_offset(q, base, actual_num_heads)
+                _padded_q_view_offset(q, base, actual_num_heads)
                 if base is not None
                 else None
             )
-            if tok0 is not None:
+            if tok0 is not None and base is not None:
                 q = base[tok0 : tok0 + num_tokens]
             else:
                 if out is None:
