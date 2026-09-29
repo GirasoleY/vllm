@@ -1036,6 +1036,13 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 )
 
             assert fp8_metadata.prefill is not None
+            # Single-chunk prefill with no decode rows: hand the v_up bmm the
+            # kernel's padded output rows as a head-strided view.
+            strided_out = (
+                num_decode_tokens == 0
+                and len(fp8_metadata.prefill.chunks) == 1
+                and not self.pcp_dcp_kv_gather
+            )
             for chunk_index, chunk in enumerate(fp8_metadata.prefill.chunks):
                 chunk_workspace = prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
                 if uses_host_cache and chunk_index > 0:
@@ -1093,7 +1100,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     chunk_topk_length,
                     out=padded_out[chunk.tokens_slice],
                 )
-                attn_out[chunk.tokens_slice].copy_(chunk_out)
+                if strided_out and chunk_out.shape[0] == num_mqa_tokens:
+                    attn_out = chunk_out
+                else:
+                    attn_out[chunk.tokens_slice].copy_(chunk_out)
                 del chunk_out, chunk_lse
 
         if self.pcp_dcp_kv_gather and lse is None:

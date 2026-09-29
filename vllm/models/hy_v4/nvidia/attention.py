@@ -760,11 +760,12 @@ class HYV4MLAAttention(nn.Module):
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
         if self.is_sparse:
             self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
-        out.copy_(
-            self.mla_attn(
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape=out.shape,
-            )
+        result = self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=out.shape,
+            output=out,
         )
+        if result.data_ptr() != out.data_ptr():
+            out.copy_(result)
