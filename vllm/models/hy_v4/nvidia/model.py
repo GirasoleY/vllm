@@ -63,6 +63,11 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -72,7 +77,7 @@ from .attention import (
     is_skip_topk_indexer_weight,
 )
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
-from .moe import HYV4FeedForward, HYV4MoEFused
+from .moe import HYV4FeedForward, HYV4MoEFused, use_hyv4_sequence_parallel
 
 logger = init_logger(__name__)
 
@@ -131,6 +136,11 @@ class HYV4DecoderLayer(nn.Module):
         self.enable_ihc = getattr(config, "enable_ihc", False)
         layer_idx = int(prefix.split(".")[-1])
         self.layer_idx = layer_idx
+        is_mtp = layer_idx >= config.num_hidden_layers
+        # MTP layers run on the full token set outside the sharded backbone.
+        self.use_sequence_parallel = (
+            use_hyv4_sequence_parallel(vllm_config) and not is_mtp
+        )
 
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = HYV4MLAAttention(
@@ -150,6 +160,8 @@ class HYV4DecoderLayer(nn.Module):
             layer_idx=layer_idx,
             topk_indices_buffer=topk_indices_buffer,
         )
+        if self.use_sequence_parallel:
+            self.self_attn.o_proj.reduce_results = False
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
             self.mlp = HYV4FeedForward(
@@ -157,6 +169,7 @@ class HYV4DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                use_sequence_parallel=self.use_sequence_parallel,
                 prefix=f"{prefix}.mlp",
             )
             self.block_type = "feedforward"
@@ -165,7 +178,7 @@ class HYV4DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                is_mtp=layer_idx >= config.num_hidden_layers,
+                is_mtp=is_mtp,
             )
             self.block_type = "moe"
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -215,6 +228,19 @@ class HYV4DecoderLayer(nn.Module):
                 norm_owner=self.input_layernorm,
             )
 
+    def _run_self_attn(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        if self.use_sequence_parallel:
+            hidden_states = sp_reduce_scatter(hidden_states)
+        return hidden_states
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -237,10 +263,7 @@ class HYV4DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        hidden_states = self._run_self_attn(positions, hidden_states)
 
         hidden_states = hidden_states + residual
         residual = hidden_states
@@ -259,10 +282,7 @@ class HYV4DecoderLayer(nn.Module):
         hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
         hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        hidden_states = self._run_self_attn(positions, hidden_states)
         hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
         hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
@@ -294,10 +314,7 @@ class HYV4DecoderLayer(nn.Module):
                 carry.mlp_out, carry.residual, carry.post_gates
             )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        hidden_states = self._run_self_attn(positions, hidden_states)
         residual, hidden_states, post_gates = self.hpc_mlp_post_pre(
             hidden_states, residual, post_gates
         )
@@ -318,10 +335,7 @@ class HYV4DecoderLayer(nn.Module):
 
         residual = self.hc_attn_layer.prepare_input(hidden_states)
         hidden_states, post_gates = self.hpc_attn_pre_norm(residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        hidden_states = self._run_self_attn(positions, hidden_states)
         residual, hidden_states, post_gates = self.hpc_mlp_post_pre(
             hidden_states, residual, post_gates
         )
@@ -358,6 +372,7 @@ class HYV4Model(nn.Module):
         self.quant_config = quant_config
         self.enable_ihc = getattr(config, "enable_ihc", False)
         self.ihc_fusion_mode = _ihc_fusion_mode()
+        self.use_sequence_parallel = use_hyv4_sequence_parallel(vllm_config)
 
         if get_pp_group().is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -501,6 +516,10 @@ class HYV4Model(nn.Module):
             # prepare_input, and residual is unused.
             residual = None if self.enable_ihc else intermediate_tensors["residual"]
 
+        num_tokens = hidden_states.shape[0]
+        if self.use_sequence_parallel:
+            hidden_states = sp_shard(hidden_states)
+
         num_layers = self.end_layer - self.start_layer
         first_layer = self.layers[self.start_layer] if num_layers else None
         mode = self.ihc_fusion_mode
@@ -511,9 +530,7 @@ class HYV4Model(nn.Module):
         )
         use_cross = fused_available and (
             mode == "cross"
-            or (
-                mode == "auto" and hidden_states.shape[0] >= _IHC_CROSS_LAYER_MIN_TOKENS
-            )
+            or (mode == "auto" and num_tokens >= _IHC_CROSS_LAYER_MIN_TOKENS)
         )
         use_single = fused_available and not use_cross and mode == "single"
         layers = islice(self.layers, self.start_layer, self.end_layer)
@@ -548,7 +565,10 @@ class HYV4Model(nn.Module):
         else:
             hidden_states = hidden_states + residual
 
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+        return hidden_states
 
     def load_fused_expert_weights(
         self,

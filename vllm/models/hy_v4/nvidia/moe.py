@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.config import get_current_vllm_config, set_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -19,8 +19,28 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_reduce_scatter,
+)
 
 logger = init_logger(__name__)
+
+
+def use_hyv4_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    """Whether TEP MegaMoE shards the residual stream across TP ranks.
+
+    MegaMoE dispatches each token over the EP group, so TP ranks must own
+    distinct tokens. Attention all-gathers its input and reduce-scatters its
+    output instead of all-reducing, keeping one collective per direction.
+    """
+    parallel_config = vllm_config.parallel_config
+    return (
+        vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.enable_expert_parallel
+        and parallel_config.tensor_parallel_size > 1
+    )
 
 
 class HYV4FeedForward(nn.Module):
@@ -29,6 +49,11 @@ class HYV4FeedForward(nn.Module):
     Used both for the dense decoder layers and for the MoE shared experts.
     The routed-expert SwiGLU clamp does not apply here, matching the reference
     implementation.
+
+    Under sequence parallel each rank owns a token shard. ``replicate`` keeps
+    full weights so the shard is finished locally; otherwise the weights stay
+    TP-sharded and ``forward`` all-gathers the tokens, computes this rank's
+    partial, and reduce-scatters back to the shard.
     """
 
     def __init__(
@@ -38,9 +63,13 @@ class HYV4FeedForward(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
+        use_sequence_parallel: bool = False,
+        replicate: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.shard_sequence_parallel = use_sequence_parallel and not replicate
+        disable_tp = use_sequence_parallel and replicate
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -50,6 +79,7 @@ class HYV4FeedForward(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -57,15 +87,20 @@ class HYV4FeedForward(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
+            reduce_results=reduce_results and not use_sequence_parallel,
+            disable_tp=disable_tp,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.shard_sequence_parallel:
+            x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
+        if self.shard_sequence_parallel:
+            out = sp_reduce_scatter(out)
         return out
 
 
@@ -132,6 +167,14 @@ class HYV4MoEFused(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        requested_mega_moe = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        )
+        self.use_mega_moe = requested_mega_moe and not is_mtp
+        self.use_sequence_parallel = self.use_mega_moe and use_hyv4_sequence_parallel(
+            vllm_config
+        )
+
         self.shared_experts: HYV4FeedForward | None
         if config.num_shared_experts > 0:
             self.shared_experts = HYV4FeedForward(
@@ -141,6 +184,8 @@ class HYV4MoEFused(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.shared_experts",
                 reduce_results=False,
+                use_sequence_parallel=self.use_sequence_parallel,
+                replicate=True,
             )
         else:
             self.shared_experts = None
@@ -153,10 +198,6 @@ class HYV4MoEFused(nn.Module):
         use_swiglu_clamp = bool(raw_swiglu_limit) and float(raw_swiglu_limit) > 0
         moe_swiglu_limit = float(raw_swiglu_limit) if use_swiglu_clamp else None
 
-        requested_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
-        self.use_mega_moe = requested_mega_moe and not is_mtp
         self.moe_swiglu_limit = moe_swiglu_limit
         self.prefix = prefix
         if self.use_mega_moe:
@@ -165,8 +206,10 @@ class HYV4MoEFused(nn.Module):
             parallel_config = vllm_config.parallel_config
             if not parallel_config.enable_expert_parallel:
                 raise ValueError("HYV4 MegaMoE requires --enable-expert-parallel.")
-            if self.tp_size != 1:
-                raise ValueError("HYV4 MegaMoE currently requires TP1 with DP/EP.")
+            if self.tp_size != 1 and not self.use_sequence_parallel:
+                raise ValueError(
+                    "HYV4 MegaMoE with TP>1 requires sequence parallel (PP=1)."
+                )
             if (
                 self.enable_eplb
                 or parallel_config.enable_eplb
