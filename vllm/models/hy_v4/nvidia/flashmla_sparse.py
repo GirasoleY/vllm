@@ -17,14 +17,22 @@ The subclass intentionally keeps the inherited ``get_name()``
 `_canonicalize_sparse_mla_kv_cache_dtype` promotes a quantized KV cache to
 ``fp8_ds_mla`` for it, and `FlashMLASparseImpl` asserts that layout — so a new
 name would silently change KV cache behaviour. ``supports_sink``, the two
-kernel wrappers, and the direct head-padded query buffer differ from the
-parent.
+kernel wrappers, DCP sink handling, and the direct head-padded query buffer
+differ from the parent.
+
+Under DCP the kernel runs on the DCP-gathered query heads over this rank's KV
+shard, and the per-rank outputs are merged by LSE. The kernel folds the sink
+into the output but not into the returned LSE, so applying it on every rank
+would count it ``dcp_world_size`` times. Instead only DCP rank 0 applies the
+(gathered) sink and adds it to its LSE, ``logaddexp(lse, sink)``; the merge
+then yields ``sum_i exp(lse_i) * out_i / (sum_i exp(lse_i) + exp(sink))``.
 """
 
 from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -125,7 +133,29 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             **mla_args,
         )
         self._validate_sinks(sinks, num_heads)
+        if sinks is not None and self.pcp_dcp_kv_gather:
+            raise NotImplementedError(
+                "HYV4 learnable sinks are not supported with PCP+DCP."
+            )
         self.sinks = sinks
+        # Sink handed to the kernels, laid out like the kernel's query heads.
+        # Under DCP it is rebuilt after weight loading, see
+        # `process_weights_after_loading`.
+        self._kernel_sinks = sinks
+        # Under DCP, the gathered sink that DCP rank 0 adds to its LSE.
+        self._dcp_lse_sinks: torch.Tensor | None = None
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        super().process_weights_after_loading(act_dtype)
+        if self.sinks is None or self.dcp_world_size <= 1:
+            return
+        # Same rank-major head order as the DCP query all-gather.
+        gathered = get_dcp_group().all_gather(self.sinks.contiguous(), dim=0)
+        if self.dcp_rank == 0:
+            self._kernel_sinks = gathered
+            self._dcp_lse_sinks = gathered
+        else:
+            self._kernel_sinks = None
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -176,7 +206,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
                 live on different devices.
 
         """
-        sinks = self.sinks
+        sinks = self._kernel_sinks
         if sinks is None:
             return None
 
@@ -209,6 +239,23 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         padded_sinks = sinks.new_full((kernel_heads,), float("-inf"))
         padded_sinks[:query_heads] = sinks
         return padded_sinks
+
+    def _forward_fp8_kv_mixed_batch(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        kernel_metadata: "FlashMLASparseMetadata.FP8KernelMetadata | None" = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        out, lse = super()._forward_fp8_kv_mixed_batch(
+            q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, kernel_metadata
+        )
+        # Applied after the parent resets rows with no local KV to (0, -inf),
+        # so rank 0 still contributes the sink term to those rows.
+        if lse is not None and self._dcp_lse_sinks is not None:
+            lse = torch.logaddexp(lse, self._dcp_lse_sinks)
+        return out, lse
 
     def _fp8_flash_mla_kernel(
         self,
