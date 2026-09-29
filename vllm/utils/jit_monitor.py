@@ -504,6 +504,22 @@ def _setup_tilelang_jit_hook() -> None:
         @functools.wraps(original_call)
         def _call_with_monitor(self, *args, **kwargs):
             global _tilelang_jitimpl_compile_depth
+            cache = getattr(self, "_kernel_cache", None)
+            if not _verbose and isinstance(cache, Mapping):
+                # Parsing the arguments for a cache key costs as much as the
+                # launch itself; a cache that grows during the call is a miss.
+                cached = len(cache)
+                _tilelang_jitimpl_compile_depth += 1
+                try:
+                    return original_call(self, *args, **kwargs)
+                finally:
+                    _tilelang_jitimpl_compile_depth -= 1
+                    if len(cache) > cached:
+                        func = getattr(self, "func", None)
+                        orig_func = getattr(func, "orig_func", None)
+                        _log_tilelang_jit_compile(
+                            _tilelang_kernel_name(orig_func or func)
+                        )
             cache_key = _tilelang_cache_miss_key(self, args, kwargs)
             if cache_key is None:
                 return original_call(self, *args, **kwargs)
