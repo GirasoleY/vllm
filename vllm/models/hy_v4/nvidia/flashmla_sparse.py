@@ -51,9 +51,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# The BF16 sparse prefill kernel needs a head count that is a multiple of 128
-# on Blackwell; HY V4 has 64, so its query is head-padded and the padding
-# heads must stay zero (the kernel reduces across the head group).
+# BF16 sparse prefill supports 64 or 128 heads. TP shards with fewer heads
+# use a head-padded query whose padding stays zero.
 _DIRECT_Q_BUFFERS: dict[tuple, torch.Tensor] = {}
 
 
@@ -343,8 +342,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
 
-        # NOTE(Chen): kernel requires num_local_head to be a multiple of
-        # 64 on hopper and 128 on blackwell. Pad from q's head count, not
+        # The kernel supports 64 or 128 heads. Pad from q's head count, not
         # self.num_heads: under DCP the heads are all-gathered before this.
         if actual_num_heads is None:
             actual_num_heads = q.shape[1]

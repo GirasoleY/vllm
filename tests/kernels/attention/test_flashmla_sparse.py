@@ -225,6 +225,60 @@ def test_sparse_flashmla_prefill_smoke(h_q: int):
     assert actual[0].shape == (s_q, h_q, d_v)
 
 
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("variable_topk", [False, True])
+def test_sparse_flashmla_64_heads_matches_padded_prefill(with_sink, variable_topk):
+    import vllm.v1.attention.ops.flashmla as fm
+
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
+
+    torch.manual_seed(0)
+    device = "cuda"
+    nq, nk, heads, dim, topk = 17, 1024, 64, 576, 128
+    q = torch.randn(nq, heads, dim, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(nk, 1, dim, dtype=torch.bfloat16, device=device)
+    indices = torch.randint(nk, (nq, 1, topk), dtype=torch.int32, device=device)
+    lengths = (
+        torch.arange(1, nq + 1, dtype=torch.int32, device=device) * 7
+        if variable_topk
+        else None
+    )
+    sink = torch.randn(heads, dtype=torch.float32, device=device) if with_sink else None
+    padded_q = torch.zeros(nq, 128, dim, dtype=q.dtype, device=device)
+    padded_q[:, :heads] = q
+    padded_sink = None
+    if sink is not None:
+        padded_sink = torch.full((128,), -torch.inf, device=device)
+        padded_sink[:heads] = sink
+    scale = dim**-0.5
+    actual, _, lse = fm.flash_mla_sparse_fwd(
+        q, kv, indices, scale, attn_sink=sink, topk_length=lengths
+    )
+    padded, _, padded_lse = fm.flash_mla_sparse_fwd(
+        padded_q, kv, indices, scale, attn_sink=padded_sink, topk_length=lengths
+    )
+
+    selected = kv[indices[:, 0].long(), 0].float()
+    logits = torch.einsum("qhd,qkd->qhk", q.float(), selected) * scale
+    if lengths is not None:
+        mask = torch.arange(topk, device=device)[None, :] >= lengths[:, None]
+        logits.masked_fill_(mask[:, None], -torch.inf)
+    expected_lse = logits.logsumexp(-1)
+    denominator = expected_lse
+    if sink is not None:
+        denominator = torch.logaddexp(denominator, sink[None])
+    probs = (logits - denominator[..., None]).exp()
+    expected = torch.einsum("qhk,qkd->qhd", probs, selected[..., :512])
+
+    # BF16 probability rounding and different reduction orders are not bit-exact.
+    for output in (actual, padded[:, :heads]):
+        torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.003)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(lse, padded_lse[:, :heads], rtol=1e-4, atol=1e-4)
+
+
 def test_deepseek_v4_prefill_chunk_planning_expands_for_short_sequences():
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
