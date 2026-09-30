@@ -1241,6 +1241,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping_np
         ]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
 
         if self.adaptive_verification is not None and draft_tokens:
             num_toks = self.adaptive_verification.get_num_tokens(
@@ -1255,6 +1256,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
+            max_seq_len_np=max_seq_len_np,
             has_prefill=bool(is_prefilling_np.any()),
         )
         supports_padded_prompt_tail_graph = (
@@ -1479,6 +1481,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=batch_req_state.prefill_len_np,
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
+            max_seq_len_np=batch_req_state.max_seq_len_np,
             has_prefill=batch_req_state.has_prefill,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
@@ -2376,6 +2379,7 @@ class BatchReqState(NamedTuple):
     prefill_len_np: np.ndarray  # [num_reqs]
     num_computed_prefill_tokens_np: np.ndarray  # [num_reqs]
     is_prefilling_np: np.ndarray  # [num_reqs]
+    max_seq_len_np: np.ndarray  # [num_reqs]
     has_prefill: bool
     is_padded_prompt_tail: bool = False
 

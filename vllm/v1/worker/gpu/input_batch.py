@@ -106,6 +106,9 @@ class InputBatch:
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
 
+    # [num_reqs] CPU request length cap, absent for dummy/capture batches.
+    max_seq_len_np: np.ndarray | None = None
+
     # Longest query the batch may contain. Set when a cudagraph descriptor promises
     # a query length this batch's own split does not reach, so attention metadata
     # stays valid for every replay the graph serves.

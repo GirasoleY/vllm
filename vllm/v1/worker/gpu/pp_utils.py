@@ -43,6 +43,14 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     prefill_len = input_batch.prefill_len_np
     # Exclude non-final prefill chunks (they don't produce a sample).
     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+    max_seq_len = input_batch.max_seq_len_np
+    if max_seq_len is not None:
+        finished_prefill = (
+            produces_sample
+            & input_batch.is_prefilling_np
+            & (prefill_len + 1 >= max_seq_len)
+        )
+        produces_sample &= ~finished_prefill
     return produces_sample if produces_sample.any() else None
 
 
