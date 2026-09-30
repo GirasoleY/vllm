@@ -28,8 +28,9 @@ class GateLinear(ReplicatedLinear):
     """
 
     # (hidden_size, num_experts) pairs with an instantiated fp32 kernel:
-    #   (3072, 256) -> MiniMax-M2/M2.5,  (6144, 128) -> MiniMax-M3
-    FP32_SUPPORTED_SHAPES = {(3072, 256), (6144, 128)}
+    #   (3072, 256) -> MiniMax-M2/M2.5,  (6144, 128) -> MiniMax-M3,
+    #   (6144, 256) -> HY V4
+    FP32_SUPPORTED_SHAPES = {(3072, 256), (6144, 128), (6144, 256)}
     FP32_MAX_TOKENS = 32
 
     def __init__(
@@ -210,6 +211,9 @@ class GateLinear(ReplicatedLinear):
 
 
 _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
+# (num_experts, hidden_size) -> largest odd num_tokens for which the fp32 kernel
+# beats BF16x3 on SM100 (odd M cannot use the token-group geometry).
+_FP32_ROUTER_GEMM_MAX_ODD_TOKENS_VS_BF16X3 = {(256, 6144): 23}
 
 
 def fp32_router_gemm_dispatch_impl(
@@ -223,7 +227,17 @@ def fp32_router_gemm_dispatch_impl(
     This must be wrapped in a custom op because our torch.compile integration
     does not support runtime dispatching on num_tokens.
     """
-    if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
+    num_tokens = x.shape[0]
+    use_fp32_kernel = num_tokens <= _FP32_ROUTER_GEMM_MAX_TOKENS
+    if (
+        use_fp32_kernel
+        and num_tokens % 2
+        and allow_bf16x3_router_gemm
+        and x.dtype == torch.bfloat16
+    ):
+        max_odd = _FP32_ROUTER_GEMM_MAX_ODD_TOKENS_VS_BF16X3.get(tuple(weight.shape))
+        use_fp32_kernel = max_odd is None or num_tokens <= max_odd
+    if use_fp32_kernel:
         if current_platform.is_rocm():
             from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
                 can_use_rocm_fp32_router_gemm,

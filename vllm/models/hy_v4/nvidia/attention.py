@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -42,6 +43,8 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import execute_in_parallel
+from vllm.utils.torch_utils import aux_stream
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
 
@@ -199,26 +202,22 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        qr: torch.Tensor,
-        positions: torch.Tensor,
-        rotary_emb: nn.Module,
-    ) -> torch.Tensor:
-        hidden_states, q_quant, k, weights = self.prepare_inputs(
-            hidden_states, qr, positions, rotary_emb
-        )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+    def project_k_and_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Fused wk + weights_proj GEMM; depends only on ``hidden_states``."""
+        return self.wk_weights_proj(hidden_states)[0]
 
     def prepare_inputs(
         self,
-        hidden_states: torch.Tensor,
         qr: torch.Tensor,
+        kw: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the quantized query, key and per-head weights of the indexer."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build the quantized query, key and per-head weights of the indexer.
+
+        Token-wise only (no attention metadata), so it can be CUDA-graph
+        captured and overlapped with the MLA query projection.
+        """
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
@@ -226,7 +225,6 @@ class Indexer(nn.Module):
             q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
         )
 
-        kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
@@ -262,7 +260,7 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return hidden_states, q_fp8, k, weights
+        return q_fp8, k, weights
 
 
 class HYV4MLAAttention(nn.Module):
@@ -478,6 +476,11 @@ class HYV4MLAAttention(nn.Module):
             self.use_hpc_gated_mla = False
         self.prefix = prefix
 
+        # Overlaps the hidden_states-only side projections with the MLA query
+        # path, following DeepSeek-V3.2 (DSA) in TensorRT-LLM.
+        self.aux_stream = aux_stream() if current_platform.is_cuda() else None
+        self.stream_events = [torch.cuda.Event() for _ in range(4)]
+
         # Per-head learnable attention sink. Created BEFORE ``MLAAttention`` so
         # it can be forwarded as the ``sinks`` impl kwarg. The parameter always
         # holds the local TP shard.
@@ -664,36 +667,55 @@ class HYV4MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q_c = None
-        if self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None
-            assert self.q_a_layernorm is not None
-            assert self.q_b_proj is not None
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_lora = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
-        else:
-            assert self.q_proj is not None
-            assert self.kv_a_proj_with_mqa is not None
-            q = self.q_proj(hidden_states)[0]
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        # Add a head dim of 1 to k_pe.
-        k_pe = k_pe.unsqueeze(1)
-        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim :], k_pe
+        indexer = self.indexer if self.is_sparse and not self.skip_topk else None
+        linear_gate = None if self.use_hpc_gated_mla else self.linear_gate
+        enable_multi_stream = (
+            self.aux_stream is not None
+            and hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
         )
+        aux_streams = [self.aux_stream] if self.aux_stream is not None else None
+        events = self.stream_events
 
-        if llama_4_scaling is not None:
-            q *= llama_4_scaling
+        def side_projections() -> tuple[torch.Tensor | None, torch.Tensor | None]:
+            indexer_kw = (
+                indexer.project_k_and_weights(hidden_states) if indexer else None
+            )
+            gate_score = linear_gate(hidden_states)[0] if linear_gate else None
+            return indexer_kw, gate_score
+
+        # Phase 1: q/kv down-projection on the default stream; the indexer
+        # wk/weights_proj and output-gate GEMMs on the aux stream.
+        (q_c, kv_lora), [side_out] = execute_in_parallel(
+            lambda: self._project_qkv_a(hidden_states),
+            [side_projections if indexer or linear_gate else None],
+            events[0],
+            [events[1]],
+            aux_streams,
+            enable=enable_multi_stream,
+        )
+        indexer_kw, gate_score = side_out if side_out is not None else (None, None)
+
+        def indexer_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            assert indexer is not None and q_c is not None and indexer_kw is not None
+            return indexer.prepare_inputs(
+                q_c, indexer_kw, positions, self.indexer_rope_emb
+            )
+
+        # Phase 2: MLA q up-projection + RoPE on the default stream; the
+        # indexer q/k preparation on the aux stream.
+        (q, kv_c_normed, k_pe), [index_inputs] = execute_in_parallel(
+            lambda: self._project_q_and_kv(
+                positions, hidden_states, q_c, kv_lora, llama_4_scaling
+            ),
+            [indexer_inputs if indexer else None],
+            events[2],
+            [events[3]],
+            aux_streams,
+            enable=enable_multi_stream,
+        )
+        index_q, index_k, index_weights = (
+            index_inputs if index_inputs is not None else (None, None, None)
+        )
 
         output_shape = (
             hidden_states.shape[0],
@@ -701,13 +723,19 @@ class HYV4MLAAttention(nn.Module):
         )
         # Single coarse eager break covering the indexer and MLA attention, as
         # the breakable cudagraph contract requires: everything that reads
-        # per-batch metadata runs in one eager segment, so no tensor has to stay
-        # alive across a capture-segment boundary.
+        # per-batch metadata runs in one eager segment.
         attn_out = torch.empty(
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
         self._indexer_and_attn(
-            hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
+            hidden_states,
+            index_q,
+            index_k,
+            index_weights,
+            q,
+            kv_c_normed,
+            k_pe,
+            attn_out,
         )
 
         if self.gated_mla and self.linear_gate is not None:
@@ -722,7 +750,7 @@ class HYV4MLAAttention(nn.Module):
                     attn_out,
                 )
             else:
-                gate_score = self.linear_gate(hidden_states)[0]
+                assert gate_score is not None
                 if self.config.gating_type == "headwise":
                     gate_score = gate_score.unsqueeze(-1)
                     attn_out = attn_out.reshape(
@@ -736,12 +764,58 @@ class HYV4MLAAttention(nn.Module):
         out, _ = self.o_proj(attn_out)
         return out
 
+    def _project_qkv_a(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Return the normalized q-lora activations (if any) and the kv-lora."""
+        if self.q_lora_rank is None:
+            assert self.kv_a_proj_with_mqa is not None
+            return None, self.kv_a_proj_with_mqa(hidden_states)[0]
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_a_layernorm is not None
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        return self.q_a_layernorm(q_c), kv_lora
+
+    def _project_q_and_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor | None,
+        kv_lora: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if q_c is not None:
+            assert self.q_b_proj is not None
+            q = self.q_b_proj(q_c)[0]
+        else:
+            assert self.q_proj is not None
+            q = self.q_proj(hidden_states)[0]
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        # Add a head dim of 1 to k_pe.
+        k_pe = k_pe.unsqueeze(1)
+        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+            positions, q[..., self.qk_nope_head_dim :], k_pe
+        )
+
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+        return q, kv_c_normed, k_pe
+
     @eager_break_during_capture
     def _indexer_and_attn(
         self,
         hidden_states: torch.Tensor,
-        q_c: torch.Tensor | None,
-        positions: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_k: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
@@ -754,10 +828,12 @@ class HYV4MLAAttention(nn.Module):
         break each) also means the attention inputs never have to survive a
         capture-segment boundary. The nested ``sparse_attn_indexer`` and
         ``unified_mla_attention_with_output`` breaks short-circuit here, since
-        the capture is no longer active inside an eager segment.
+        the capture is no longer active inside an eager segment. The indexer
+        q/k/weights are token-wise and prepared before the break.
         """
-        if self.indexer is not None and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        if index_q is not None:
+            assert self.indexer is not None and index_weights is not None
+            self.indexer.indexer_op(hidden_states, index_q, index_k, index_weights)
         if self.is_sparse:
             self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
         result = self.mla_attn(

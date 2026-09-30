@@ -261,6 +261,27 @@ void invokeFp32RouterGemm(float* output, InputT const* mat_a,
       launchFp32RouterGemm<InputT, 128, 1, kNumTokens, kNumExperts, kHiddenDim>(
           output, mat_a, mat_b, stream);
     }
+  } else if constexpr (std::is_same_v<InputT, __nv_bfloat16> &&
+                       kNumExperts == 256 && kHiddenDim == 6144) {
+    // HY V4. B300 sweep (cold 6.3MB weight, CUDA-graph replay):
+    //   M <= 6            : BS=384, EPB=1 (1.03-1.13x over legacy 128/1)
+    //   even M >= 8       : BS=192, EPB=2, 2 token groups (1.12-1.30x)
+    //   odd M >= 7        : BS=256, EPB=1
+    if (!isBlackwellFamily()) {
+      launchFp32RouterGemm<InputT, 128, 1, kNumTokens, kNumExperts, kHiddenDim>(
+          output, mat_a, mat_b, stream);
+      return;
+    }
+    if constexpr (kNumTokens <= 6) {
+      launchFp32RouterGemm<InputT, 384, 1, kNumTokens, kNumExperts, kHiddenDim>(
+          output, mat_a, mat_b, stream);
+    } else if constexpr (kNumTokens % 2 == 0) {
+      launchFp32RouterGemm<InputT, 192, 2, kNumTokens, kNumExperts, kHiddenDim,
+                           2>(output, mat_a, mat_b, stream);
+    } else {
+      launchFp32RouterGemm<InputT, 256, 1, kNumTokens, kNumExperts, kHiddenDim>(
+          output, mat_a, mat_b, stream);
+    }
   } else {
     launchFp32RouterGemm<InputT, 128, 1, kNumTokens, kNumExperts, kHiddenDim>(
         output, mat_a, mat_b, stream);
@@ -269,7 +290,8 @@ void invokeFp32RouterGemm(float* output, InputT const* mat_a,
 
 // ---------------------------------------------------------------------------
 // Explicit instantiations: M=1..32, for both input types, for the supported
-// (E, H) pairs:  (256, 3072) [MiniMax-M2/M2.5]  and  (128, 6144) [MiniMax-M3].
+// (E, H) pairs:  (256, 3072) [MiniMax-M2/M2.5], (128, 6144) [MiniMax-M3] and
+// (256, 6144) [HY V4].
 // ---------------------------------------------------------------------------
 
 #define INSTANTIATE(T, M, E, H)                                    \
@@ -314,6 +336,8 @@ INSTANTIATE_ALL(float, 256, 3072)
 INSTANTIATE_ALL(__nv_bfloat16, 256, 3072)
 INSTANTIATE_ALL(float, 128, 6144)
 INSTANTIATE_ALL(__nv_bfloat16, 128, 6144)
+INSTANTIATE_ALL(float, 256, 6144)
+INSTANTIATE_ALL(__nv_bfloat16, 256, 6144)
 
 #undef INSTANTIATE_ALL
 #undef INSTANTIATE
