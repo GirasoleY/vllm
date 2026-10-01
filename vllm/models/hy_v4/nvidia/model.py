@@ -895,6 +895,12 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 
         return logits
 
+    def process_weights_after_loading(self) -> None:
+        """Run post-load fusions that need final (requantized) weights."""
+        for module in self.model.modules():
+            if isinstance(module, HYV4MLAAttention):
+                module.prepare_gate_fusion()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # MTP layers are loaded by the MTP head, not by the target model. They
         # appear as model.mtp_layers.<i>.* and as the layer ids past the backbone.

@@ -93,6 +93,7 @@ def _make_decoder_layer(layer_index: int):
     layer = HYV4DecoderLayer.__new__(HYV4DecoderLayer)
     nn.Module.__init__(layer)
     layer.enable_ihc = True
+    layer.use_sequence_parallel = False
     layer.hc_attn_layer = _HC(hc_mult=4, gate=0.2 + layer_index * 0.03)
     layer.hc_mlp_layer = _HC(hc_mult=4, gate=0.4 + layer_index * 0.02)
     layer.input_layernorm = _Scale(1.1 + layer_index * 0.01)

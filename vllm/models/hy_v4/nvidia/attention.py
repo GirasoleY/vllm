@@ -42,6 +42,16 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.models.hy_v4.nvidia.indexer_fusion import (
+    fused_indexer_k_norm_rope,
+    fused_indexer_q_rope_quant,
+)
+from vllm.models.hy_v4.nvidia.prefill import (
+    fp8_linear,
+    gate_quant,
+    norm_quant,
+    packed_fp8_kernel,
+)
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
@@ -208,7 +218,7 @@ class Indexer(nn.Module):
 
     def prepare_inputs(
         self,
-        qr: torch.Tensor,
+        qr: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kw: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
@@ -218,8 +228,32 @@ class Indexer(nn.Module):
         Token-wise only (no attention metadata), so it can be CUDA-graph
         captured and overlapped with the MLA query projection.
         """
-        q, _ = self.wq_b(qr)
+        q = fp8_linear(self.wq_b, qr)
         q = q.view(-1, self.n_head, self.head_dim)
+        if (
+            q.dtype == torch.bfloat16
+            and self.head_dim == 128
+            and self.rope_dim == 64
+            and self.scale_fmt == "ue8m0"
+            and current_platform.is_cuda()
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            k = fused_indexer_k_norm_rope(
+                kw[:, : self.head_dim],
+                self.k_norm,
+                positions,
+                rotary_emb,
+            )
+            q_fp8, weights = fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                kw[:, self.head_dim :],
+                self.softmax_scale,
+                self.n_head**-0.5,
+                rotary_emb.is_neox_style,
+            )
+            return q_fp8, k, weights
         # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
         q_nope, q_pe = torch.split(
             q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
@@ -475,6 +509,8 @@ class HYV4MLAAttention(nn.Module):
             self.linear_gate = None
             self.use_hpc_gated_mla = False
         self.prefix = prefix
+        self.register_buffer("_qkv_gate_weight", None, persistent=False)
+        self.register_buffer("_qkv_gate_scale", None, persistent=False)
 
         # Overlaps the hidden_states-only side projections with the MLA query
         # path, following DeepSeek-V3.2 (DSA) in TensorRT-LLM.
@@ -521,6 +557,46 @@ class HYV4MLAAttention(nn.Module):
             attn_backend=sink_backend,
             **extra_impl_args,
         )
+
+    def prepare_gate_fusion(self) -> None:
+        """Concatenate the gate projection onto the q/kv projection weights.
+
+        Builds ``_qkv_gate_weight`` and ``_qkv_gate_scale`` by stacking the
+        ``fused_qkv_a_proj`` and ``linear_gate`` FP8 weights and block scales
+        along the output dimension, so prefill can run both as one GEMM on a
+        shared quantized input. Both layers' ``weight`` parameters are
+        re-pointed at views of the concatenated buffer, keeping their names and
+        shapes for weight reloads. Leaves the buffers None, and the forward on
+        separate GEMMs, unless both layers run on the DeepGEMM UE8M0 kernel on
+        CUDA and the HPC gated-MLA path is off.
+        """
+        qkv_kernel = packed_fp8_kernel(self.fused_qkv_a_proj)
+        gate_kernel = packed_fp8_kernel(self.linear_gate)
+        if qkv_kernel is None or gate_kernel is None or self.use_hpc_gated_mla:
+            return
+        qkv = qkv_kernel._get_layer_params(self.fused_qkv_a_proj)
+        gate = gate_kernel._get_layer_params(self.linear_gate)
+        if (
+            qkv.weight.device.type != "cuda"
+            or gate.weight.device.type != "cuda"
+            or qkv.block_scale.dtype != torch.int32
+            or gate.block_scale.dtype != torch.int32
+            or qkv.block_scale.shape[0] != qkv.weight.shape[0]
+            or gate.block_scale.shape[0] != gate.weight.shape[0]
+        ):
+            return
+        self._qkv_gate_weight = torch.cat((qkv.weight, gate.weight), dim=0)
+        self._qkv_gate_scale = (
+            torch.cat((qkv.block_scale, gate.block_scale), dim=0).T.contiguous().T
+        )
+        # Both projections retain their original names and shapes for reloads.
+        from vllm.model_executor.utils import replace_parameter
+
+        split = qkv.weight.shape[0]
+        replace_parameter(
+            self.fused_qkv_a_proj, "weight", self._qkv_gate_weight[:split]
+        )
+        replace_parameter(self.linear_gate, "weight", self._qkv_gate_weight[split:])
 
     @property
     def topk_indices_buffer(self) -> torch.Tensor | None:
@@ -668,25 +744,40 @@ class HYV4MLAAttention(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         indexer = self.indexer if self.is_sparse and not self.skip_topk else None
-        linear_gate = None if self.use_hpc_gated_mla else self.linear_gate
         enable_multi_stream = (
             self.aux_stream is not None
             and hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
         )
+        qkv_kernel = packed_fp8_kernel(self.fused_qkv_a_proj, hidden_states.shape[0])
+        fuse_gate_projection = (
+            self._qkv_gate_weight is not None
+            and not enable_multi_stream
+            and qkv_kernel is not None
+        )
+        linear_gate = (
+            None if self.use_hpc_gated_mla or fuse_gate_projection else self.linear_gate
+        )
         aux_streams = [self.aux_stream] if self.aux_stream is not None else None
         events = self.stream_events
+
+        shared_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = hidden_states
+        if qkv_kernel is not None and (
+            fuse_gate_projection
+            or packed_fp8_kernel(linear_gate, hidden_states.shape[0]) is not None
+        ):
+            shared_input = qkv_kernel.quant_fp8(hidden_states)
 
         def side_projections() -> tuple[torch.Tensor | None, torch.Tensor | None]:
             indexer_kw = (
                 indexer.project_k_and_weights(hidden_states) if indexer else None
             )
-            gate_score = linear_gate(hidden_states)[0] if linear_gate else None
+            gate_score = fp8_linear(linear_gate, shared_input) if linear_gate else None
             return indexer_kw, gate_score
 
-        # Phase 1: q/kv down-projection on the default stream; the indexer
-        # wk/weights_proj and output-gate GEMMs on the aux stream.
-        (q_c, kv_lora), [side_out] = execute_in_parallel(
-            lambda: self._project_qkv_a(hidden_states),
+        # The prefill projection includes the gate; decode can overlap its
+        # separate gate GEMM and the indexer projection with the query path.
+        (q_c, kv_lora, fused_gate), [side_out] = execute_in_parallel(
+            lambda: self._project_qkv_a(shared_input, fuse_gate_projection),
             [side_projections if indexer or linear_gate else None],
             events[0],
             [events[1]],
@@ -694,6 +785,8 @@ class HYV4MLAAttention(nn.Module):
             enable=enable_multi_stream,
         )
         indexer_kw, gate_score = side_out if side_out is not None else (None, None)
+        if fused_gate is not None:
+            gate_score = fused_gate
 
         def indexer_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             assert indexer is not None and q_c is not None and indexer_kw is not None
@@ -751,7 +844,13 @@ class HYV4MLAAttention(nn.Module):
                 )
             else:
                 assert gate_score is not None
-                if self.config.gating_type == "headwise":
+                if packed_fp8_kernel(self.o_proj, attn_out.shape[0]) is not None:
+                    attn_out = gate_quant(
+                        attn_out,
+                        gate_score,
+                        self.v_head_dim if self.config.gating_type == "headwise" else 1,
+                    )
+                elif self.config.gating_type == "headwise":
                     gate_score = gate_score.unsqueeze(-1)
                     attn_out = attn_out.reshape(
                         *attn_out.shape[:-1], -1, self.v_head_dim
@@ -761,36 +860,62 @@ class HYV4MLAAttention(nn.Module):
                 else:
                     attn_out = attn_out * torch.sigmoid(gate_score)
 
-        out, _ = self.o_proj(attn_out)
-        return out
+        return fp8_linear(self.o_proj, attn_out)
 
     def _project_qkv_a(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        """Return the normalized q-lora activations (if any) and the kv-lora."""
+        self,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        fuse_gate_projection: bool = False,
+    ) -> tuple[
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Return normalized q-lora, kv-lora and the optional fused gate."""
         if self.q_lora_rank is None:
             assert self.kv_a_proj_with_mqa is not None
-            return None, self.kv_a_proj_with_mqa(hidden_states)[0]
+            return None, self.kv_a_proj_with_mqa(hidden_states)[0], None
         assert self.fused_qkv_a_proj is not None
         assert self.q_a_layernorm is not None
-        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        gate = None
+        if fuse_gate_projection:
+            kernel = packed_fp8_kernel(self.fused_qkv_a_proj)
+            assert kernel is not None and isinstance(hidden_states, tuple)
+            projected = kernel.apply_block_scaled_mm(
+                hidden_states[0],
+                self._qkv_gate_weight,
+                hidden_states[1],
+                self._qkv_gate_scale,
+            )
+            split = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+            gate_start = self.fused_qkv_a_proj.weight.shape[0]
+            gate_size = self.num_local_heads * self.gate_projection_size_per_head
+            qkv_lora = projected[:, :split]
+            gate = projected[:, gate_start : gate_start + gate_size]
+        else:
+            qkv_lora = fp8_linear(self.fused_qkv_a_proj, hidden_states)
         q_c, kv_lora = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
-        return self.q_a_layernorm(q_c), kv_lora
+        if packed_fp8_kernel(self.q_b_proj, q_c.shape[0]) is not None and (
+            self.indexer is None
+            or packed_fp8_kernel(self.indexer.wq_b, q_c.shape[0]) is not None
+        ):
+            return norm_quant(q_c, self.q_a_layernorm), kv_lora, gate
+        return self.q_a_layernorm(q_c), kv_lora, gate
 
     def _project_q_and_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        q_c: torch.Tensor | None,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
         kv_lora: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if q_c is not None:
             assert self.q_b_proj is not None
-            q = self.q_b_proj(q_c)[0]
+            q = fp8_linear(self.q_b_proj, q_c)
         else:
             assert self.q_proj is not None
             q = self.q_proj(hidden_states)[0]

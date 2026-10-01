@@ -19,10 +19,14 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    silu_mul_quant_fp8_packed_triton,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
 )
+from vllm.models.hy_v4.nvidia.prefill import fp8_linear, packed_fp8_kernel
 
 logger = init_logger(__name__)
 
@@ -97,8 +101,11 @@ class HYV4FeedForward(nn.Module):
         if self.shard_sequence_parallel:
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
+        if packed_fp8_kernel(self.down_proj, gate_up.shape[0]) is not None:
+            out = silu_mul_quant_fp8_packed_triton(gate_up)
+        else:
+            out = self.act_fn(gate_up)
+        out = fp8_linear(self.down_proj, out)
         if self.shard_sequence_parallel:
             out = sp_reduce_scatter(out)
         return out
