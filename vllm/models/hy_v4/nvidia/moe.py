@@ -308,7 +308,7 @@ class HYV4MoEFused(nn.Module):
 
         if self.use_mega_moe:
             topk_weights, topk_ids = self.mega_router.select_experts(
-                hidden_states, router_logits, topk_indices_dtype=torch.int64
+                hidden_states, router_logits, topk_indices_dtype=torch.int32
             )
             final_hidden_states = self.experts(
                 hidden_states,
