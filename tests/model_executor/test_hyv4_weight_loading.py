@@ -208,7 +208,7 @@ def test_expert_loader_preserves_packed_bytes_and_gate_up_shards(
 
 @pytest.mark.parametrize("factory_fails", [False, True])
 def test_mtp_backend_override_does_not_mutate_target_config(monkeypatch, factory_fails):
-    """FP8 MTP falls back to auto without leaking its choice to the MXFP4 target."""
+    """Unsupported drafts fall back without changing the target backend."""
     from vllm.config import get_current_vllm_config, set_current_vllm_config
     from vllm.models.hy_v4.nvidia import moe
 
@@ -258,3 +258,106 @@ def test_mtp_backend_override_does_not_mutate_target_config(monkeypatch, factory
             assert not draft.use_mega_moe
         assert get_current_vllm_config() is target
         assert target.kernel_config.moe_backend == "deep_gemm_mega_moe"
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_mtp_megamoe_loads_fp8_weights_and_block_scales(fused):
+    """Split and fused checkpoints must preserve FP8 values and UE8M0 scales."""
+    from vllm.model_executor.layers.fused_moe import (
+        fused_moe_make_expert_params_mapping,
+    )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+    from vllm.models.hy_v4.nvidia.mtp import HYV4MTP, _prepare_mtp_fp8_expert_scale
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    adapter = DeepseekV4MegaMoEExperts(
+        config,
+        num_experts=4,
+        num_local_experts=2,
+        experts_start_idx=2,
+        top_k=2,
+        hidden_size=256,
+        intermediate_size=256,
+        fp8_weight_block_size=(128, 128),
+    )
+    draft = HYV4MTP.__new__(HYV4MTP)
+    torch.nn.Module.__init__(draft)
+    quant = Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+    quant.is_scale_e8m0 = True
+    base = "model.layers.78.mtp_block.mlp"
+    params = {
+        f"{base}.experts.{name}": param for name, param in adapter.named_parameters()
+    }
+    mapping = fused_moe_make_expert_params_mapping(
+        draft, "gate_proj", "down_proj", "up_proj", 4, routed_experts_prefix=""
+    )
+    fused_names = {
+        (base, name): f"{base}.experts.{name}" for name in ("w13_weight", "w2_weight")
+    }
+    torch.manual_seed(7)
+    gate, up, down = [
+        torch.randn(4, 256, 256).to(torch.float8_e4m3fn) for _ in range(3)
+    ]
+    scales = [torch.randint(116, 128, (4, 2, 2), dtype=torch.uint8) for _ in range(3)]
+    weights = []
+    if fused:
+        for suffix, values in (("", (gate, up, down)), ("_scale_inv", scales)):
+            weights.extend(
+                [
+                    (
+                        f"{base}.experts.gate_up_proj{suffix}",
+                        torch.cat(values[:2], dim=1),
+                    ),
+                    (f"{base}.experts.down_proj{suffix}", values[2]),
+                ]
+            )
+    else:
+        for expert in range(4):
+            for projection, weight, scale in zip(
+                ("gate_proj", "up_proj", "down_proj"), (gate, up, down), scales
+            ):
+                weights.extend(
+                    [
+                        (
+                            f"{base}.experts.{expert}.{projection}.weight",
+                            weight[expert],
+                        ),
+                        (f"{base}.experts.{expert}.{projection}.scale", scale[expert]),
+                    ]
+                )
+    loaded: set[str] = set()
+    for name, weight in weights:
+        name, weight = _prepare_mtp_fp8_expert_scale(quant, name, weight)
+        assert draft._load_expert_weight(
+            name, weight, params, loaded, mapping, fused_names, 4
+        )
+    assert loaded == set(params)
+    torch.testing.assert_close(
+        adapter.w13_weight.float(), torch.cat((gate[2:].float(), up[2:].float()), dim=1)
+    )
+    torch.testing.assert_close(adapter.w2_weight.float(), down[2:].float())
+    expected_scale = (
+        torch.cat((scales[0][2:], scales[1][2:]), dim=1)
+        .view(torch.float8_e8m0fnu)
+        .float()
+    )
+    torch.testing.assert_close(adapter.w13_weight_scale, expected_scale)
+    expanded = adapter._prepare_routed_expert_scale(adapter.w13_weight_scale)
+    torch.testing.assert_close(
+        expanded, expected_scale.repeat_interleave(128, 1).repeat_interleave(4, 2)
+    )
+
+
+@pytest.mark.parametrize("scale", [0.3, 0.0, float("inf"), float("nan")])
+def test_fp8_megamoe_rejects_scales_that_would_change_draft_weights(scale):
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+
+    adapter = SimpleNamespace(fp8_weight_block_size=(128, 128))
+    with pytest.raises(ValueError, match="UE8M0"):
+        DeepseekV4MegaMoEExperts._prepare_routed_expert_scale(
+            adapter, torch.full((1, 2, 2), scale)
+        )

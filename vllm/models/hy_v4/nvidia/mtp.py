@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_embed_norm import fused_eh_norm
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -40,6 +41,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from .model import HYV4DecoderLayer, _normalize_hyv4_config
+from .moe import HYV4MoEFused
 
 logger = init_logger(__name__)
 
@@ -149,9 +151,13 @@ def _prepare_mtp_fp8_expert_scale(
                 )
             )
         )
-        and name.endswith(".scale")
+        and (
+            name.endswith(".scale")
+            or (".mlp.experts." in name and name.endswith(("_scale", "_scale_inv")))
+        )
     ):
-        name = name[: -len(".scale")] + ".weight_scale_inv"
+        if name.endswith(".scale"):
+            name = name[: -len(".scale")] + ".weight_scale_inv"
         if (
             getattr(quant_config, "is_scale_e8m0", False)
             and loaded_weight.dtype == torch.uint8
@@ -394,11 +400,14 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
     ) -> torch.Tensor:
         del input_ids  # embeddings are resolved by the caller
         assert inputs_embeds is not None
-        inputs_embeds = self.enorm(inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        eh_input = fused_eh_norm(
+            inputs_embeds,
+            previous_hidden_states,
+            self.enorm.weight,
+            self.hnorm.weight,
+            self.enorm.variance_epsilon,
         )
+        hidden_states = self.eh_proj(eh_input)
         hidden_states, residual = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
@@ -733,6 +742,8 @@ class HYV4MTP(nn.Module):
                 continue
             consumed = True
             name_mapped = name.replace(weight_name, param_name)
+            if name_mapped not in params_dict and name_mapped.endswith("_scale_inv"):
+                name_mapped = name_mapped.removesuffix("_inv")
             if name_mapped not in params_dict:
                 continue
             param = params_dict[name_mapped]
@@ -778,6 +789,14 @@ class HYV4MTP(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=num_experts,
+            routed_experts_prefix=(
+                ""
+                if any(
+                    isinstance(module, HYV4MoEFused) and module.use_mega_moe
+                    for module in self.modules()
+                )
+                else "routed_experts"
+            ),
         )
         fused_expert_param_names: dict[tuple[str, str], str] = {}
         for param_name in params_dict:
@@ -957,4 +976,9 @@ class HYV4MTP(nn.Module):
             raise RuntimeError(
                 "HYV4 MTP incomplete checkpoint load: " + ", ".join(unassigned)
             )
+        for module in self.model.modules():
+            if isinstance(module, HYV4MoEFused) and module.use_mega_moe:
+                module.experts.finalize_weights(module.shared_experts)
+                if module.experts.has_fused_shared_experts:
+                    module.shared_experts = None
         return loaded_params

@@ -59,8 +59,9 @@ def ep_group():
 
 
 @pytest.mark.parametrize("tokens", [4, 128])
-def test_hyv4_mxfp4_real_routing_matches_dequantized_reference(
-    monkeypatch, tokens, ep_group
+@pytest.mark.parametrize("fp8_mtp", [False, True])
+def test_hyv4_real_routing_matches_dequantized_reference(
+    monkeypatch, tokens, ep_group, fp8_mtp
 ):
     from vllm.model_executor.layers.fused_moe.router.router_factory import (
         create_fused_moe_router,
@@ -87,12 +88,19 @@ def test_hyv4_mxfp4_real_routing_matches_dequantized_reference(
             hidden_size=h,
             intermediate_size=intermediate,
             prefix="model.layers.1.mlp.experts",
+            fp8_weight_block_size=(128, 128) if fp8_mtp else None,
         )
         # Values cover both signs and all E2M1 levels. Large inputs exercise clamp.
-        adapter.w13_weight.random_(0, 256)
-        adapter.w2_weight.random_(0, 256)
-        adapter.w13_weight_scale.fill_(121)
-        adapter.w2_weight_scale.fill_(121)
+        if fp8_mtp:
+            for weight in (adapter.w13_weight, adapter.w2_weight):
+                weight.copy_((torch.randn(weight.shape) * 2).to(torch.float8_e4m3fn))
+            adapter.w13_weight_scale.fill_(2**-6)
+            adapter.w2_weight_scale.fill_(2**-6)
+        else:
+            adapter.w13_weight.random_(0, 256)
+            adapter.w2_weight.random_(0, 256)
+            adapter.w13_weight_scale.fill_(121)
+            adapter.w2_weight_scale.fill_(121)
         w13, s13 = adapter.w13_weight.clone(), adapter.w13_weight_scale.clone()
         w2, s2 = adapter.w2_weight.clone(), adapter.w2_weight_scale.clone()
         moe = HYV4MoEFused.__new__(HYV4MoEFused)
@@ -142,17 +150,25 @@ def test_hyv4_mxfp4_real_routing_matches_dequantized_reference(
         qx = _fp8_roundtrip(all_x)
         reference = torch.zeros(world * tokens, h, dtype=torch.float32)
         clamped = 0
+
+        def dequant(weight, scale):
+            if fp8_mtp:
+                return weight.float() * scale.repeat_interleave(
+                    128, 0
+                ).repeat_interleave(128, 1)
+            return _unpack_fp4(weight, scale)
+
         for local_expert in range(experts // world):
             expert = rank * (experts // world) + local_expert
             rows, slots = torch.where(all_ids == expert)
             if rows.numel() == 0:
                 continue
-            first = qx[rows] @ _unpack_fp4(w13[local_expert], s13[local_expert]).T
+            first = qx[rows] @ dequant(w13[local_expert], s13[local_expert]).T
             gate, up = first.to(torch.bfloat16).float().chunk(2, -1)
             clamped += ((gate > 10) | (up.abs() > 10)).sum().item()
             act = torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
             act = _fp8_roundtrip(act * all_weights[rows, slots, None])
-            second = act @ _unpack_fp4(w2[local_expert], s2[local_expert]).T
+            second = act @ dequant(w2[local_expert], s2[local_expert]).T
             reference.index_add_(0, rows, second.to(torch.bfloat16).float())
         assert clamped > 0, "The fixture must exercise the Hy4 activation clamp"
         dist.all_reduce(reference)
@@ -165,7 +181,8 @@ def test_hyv4_mxfp4_real_routing_matches_dequantized_reference(
         assert torch.isfinite(output).all()
         relative_l2 = (output - expected).norm() / expected.norm()
         print(
-            f"rank={rank} tokens={tokens} relative_l2={relative_l2.item():.6f} "
+            f"rank={rank} fp8_mtp={fp8_mtp} tokens={tokens} "
+            f"relative_l2={relative_l2.item():.6f} "
             f"clamped={clamped}",
             flush=True,
         )

@@ -4,6 +4,7 @@
 
 import copy
 from contextlib import AbstractContextManager, nullcontext
+from typing import cast
 
 import torch
 from torch import nn
@@ -19,6 +20,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     silu_mul_quant_fp8_packed_triton,
 )
@@ -177,9 +179,15 @@ class HYV4MoEFused(nn.Module):
         requested_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
-        self.use_mega_moe = requested_mega_moe and not is_mtp
-        self.use_sequence_parallel = self.use_mega_moe and use_hyv4_sequence_parallel(
-            vllm_config
+        fp8_weight_block_size = (
+            quant_config.weight_block_size
+            if isinstance(quant_config, Fp8Config)
+            else None
+        )
+        fp8_mtp = is_mtp and self.tp_size == 1 and fp8_weight_block_size is not None
+        self.use_mega_moe = requested_mega_moe and (not is_mtp or fp8_mtp)
+        self.use_sequence_parallel = (
+            self.use_mega_moe and not is_mtp and use_hyv4_sequence_parallel(vllm_config)
         )
 
         self.shared_experts: HYV4FeedForward | None
@@ -208,8 +216,10 @@ class HYV4MoEFused(nn.Module):
         self.moe_swiglu_limit = moe_swiglu_limit
         self.prefix = prefix
         if self.use_mega_moe:
-            if getattr(quant_config, "store_dtype", None) != "mxfp4":
-                raise ValueError("HYV4 MegaMoE requires MXFP4 routed-expert weights.")
+            if not fp8_mtp and getattr(quant_config, "store_dtype", None) != "mxfp4":
+                raise ValueError(
+                    "HYV4 MegaMoE requires MXFP4 target or block-FP8 MTP weights."
+                )
             parallel_config = vllm_config.parallel_config
             if not parallel_config.enable_expert_parallel:
                 raise ValueError("HYV4 MegaMoE requires --enable-expert-parallel.")
@@ -248,6 +258,11 @@ class HYV4MoEFused(nn.Module):
                 ),
                 clamp_shared_experts=False,
                 prefix=f"{prefix}.experts",
+                fp8_weight_block_size=(
+                    cast(tuple[int, int], tuple(fp8_weight_block_size))
+                    if fp8_mtp and fp8_weight_block_size is not None
+                    else None
+                ),
             )
             self.mega_router = create_fused_moe_router(
                 top_k=top_k,
@@ -260,10 +275,14 @@ class HYV4MoEFused(nn.Module):
                 routed_scaling_factor=router_scaling_factor,
                 e_score_correction_bias=self.expert_bias,
             )
-            logger.info_once("HYV4 routed experts use DeepGEMM MegaMoE.")
+            logger.info_once(
+                "HYV4 %s routed experts use DeepGEMM MegaMoE (%s).",
+                "MTP" if is_mtp else "target",
+                self.experts.mma_type,
+            )
             return
 
-        # The FP8 draft must not inherit the target's MXFP4-only model backend.
+        # Unsupported draft formats/TP layouts retain the generic backend.
         factory_context: AbstractContextManager = nullcontext()
         if requested_mega_moe:
             draft_config = copy.copy(vllm_config)

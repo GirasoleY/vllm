@@ -229,3 +229,63 @@ def fused_embed_eh_norm(
         triton.next_power_of_2(h),
     )
     return out
+
+
+@triton.jit
+def _fused_eh_norm_kernel(
+    embeds_ptr,
+    embeds_stride,
+    prev_ptr,
+    prev_stride,
+    enorm_w_ptr,
+    hnorm_w_ptr,
+    eps,
+    out_ptr,
+    out_stride,
+    H: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Write independently normalized inputs into the two output halves."""
+    tok = tl.program_id(0)
+    off = tl.arange(0, BLOCK)
+    mask = off < H
+
+    e = tl.load(embeds_ptr + tok * embeds_stride + off, mask=mask, other=0.0)
+    ew = tl.load(enorm_w_ptr + off, mask=mask)
+    e_normed = _rms_norm(e, ew, eps, H)
+    tl.store(out_ptr + tok * out_stride + off, e_normed, mask=mask)
+
+    p = tl.load(prev_ptr + tok * prev_stride + off, mask=mask, other=0.0)
+    hw = tl.load(hnorm_w_ptr + off, mask=mask)
+    p_normed = _rms_norm(p, hw, eps, H)
+    tl.store(out_ptr + tok * out_stride + H + off, p_normed, mask=mask)
+
+
+def fused_eh_norm(
+    inputs_embeds: torch.Tensor,
+    previous_hidden: torch.Tensor,
+    enorm_w: torch.Tensor,
+    hnorm_w: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Returns cat([enorm(embeds), hnorm(prev_hidden)]) -> [N, 2H]."""
+    assert inputs_embeds.shape == previous_hidden.shape
+    assert inputs_embeds.stride(-1) == previous_hidden.stride(-1) == 1
+    n, h = inputs_embeds.shape
+    out = torch.empty(n, 2 * h, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+    if n == 0:
+        return out
+    _fused_eh_norm_kernel[(n,)](
+        inputs_embeds,
+        inputs_embeds.stride(0),
+        previous_hidden,
+        previous_hidden.stride(0),
+        enorm_w,
+        hnorm_w,
+        eps,
+        out,
+        out.stride(0),
+        h,
+        triton.next_power_of_2(h),
+    )
+    return out

@@ -225,6 +225,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         clamp_shared_experts: bool = True,
         prefix: str = "",
         num_logical_experts: int | None = None,
+        fp8_weight_block_size: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -239,6 +240,23 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.num_shared_experts = num_shared_experts
         self.clamp_shared_experts = clamp_shared_experts
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.fp8_weight_block_size = fp8_weight_block_size
+        self.mma_type = "fp8xfp8" if fp8_weight_block_size else "fp8xfp4"
+        self.weight_block_size = fp8_weight_block_size or (1, 32)
+        block_m, block_k = self.weight_block_size
+        if block_m <= 0 or block_k <= 0 or block_k % 32:
+            raise ValueError("MegaMoE requires weight blocks with K divisible by 32.")
+        if any(
+            size % block
+            for size in (hidden_size, intermediate_size)
+            for block in (block_m, block_k)
+        ):
+            raise ValueError(
+                "MegaMoE weight dimensions must align to the scale blocks."
+            )
+        weight_dtype = torch.float8_e4m3fn if fp8_weight_block_size else torch.uint8
+        scale_dtype = torch.float32 if fp8_weight_block_size else torch.uint8
+        packing = 1 if fp8_weight_block_size else 2
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -251,8 +269,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             torch.zeros(
                 num_local_experts,
                 2 * intermediate_size,
-                hidden_size // 2,
-                dtype=torch.uint8,
+                hidden_size // packing,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -261,9 +279,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.w13_weight_scale = nn.Parameter(
             torch.zeros(
                 num_local_experts,
-                2 * intermediate_size,
-                hidden_size // 32,
-                dtype=torch.uint8,
+                2 * intermediate_size // block_m,
+                hidden_size // block_k,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -274,8 +292,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             torch.zeros(
                 num_local_experts,
                 hidden_size,
-                intermediate_size // 2,
-                dtype=torch.uint8,
+                intermediate_size // packing,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -284,9 +302,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.w2_weight_scale = nn.Parameter(
             torch.zeros(
                 num_local_experts,
-                hidden_size,
-                intermediate_size // 32,
-                dtype=torch.uint8,
+                hidden_size // block_m,
+                intermediate_size // block_k,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -338,10 +356,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             if shard_id in ("w1", "w3"):
                 if "w13_" not in weight_name:
                     continue
-                shard_offset = 0 if shard_id == "w1" else self.intermediate_size
-                expert_data = expert_data.narrow(
-                    0, shard_offset, self.intermediate_size
-                )
+                shard_size = self.intermediate_size
+                if "scale" in weight_name:
+                    shard_size //= self.weight_block_size[0]
+                shard_offset = 0 if shard_id == "w1" else shard_size
+                expert_data = expert_data.narrow(0, shard_offset, shard_size)
             elif shard_id == "w2":
                 if "w2_" not in weight_name:
                     continue
@@ -555,6 +574,26 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             1,
         ).squeeze(0)
 
+    def _prepare_routed_expert_scale(self, scale: torch.Tensor) -> torch.Tensor:
+        if self.fp8_weight_block_size is None:
+            return self._ue8m0_uint8_to_float(scale).contiguous()
+        # Preserve checkpoint values exactly when expanding block FP8 to MXFP8.
+        # Truncating arbitrary FP32 scales to exponents would change draft logits.
+        if (
+            not torch.isfinite(scale).all()
+            or (scale <= 0).any()
+            or ((scale.view(torch.int32) & ~0x7F800000) != 0).any()
+        ):
+            raise ValueError(
+                "FP8 MegaMoE requires positive, finite UE8M0 weight scales."
+            )
+        block_m, block_k = self.fp8_weight_block_size
+        return (
+            scale.repeat_interleave(block_m, dim=1)
+            .repeat_interleave(block_k // 32, dim=2)
+            .contiguous()
+        )
+
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
 
@@ -563,14 +602,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
             w13_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
+                self._prepare_routed_expert_scale(self.w13_weight_scale.data),
                 2 * self.intermediate_size,
                 self.hidden_size,
                 (1, 32),
                 self.num_local_experts,
             )
             w2_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
+                self._prepare_routed_expert_scale(self.w2_weight_scale.data),
                 self.hidden_size,
                 self.intermediate_size,
                 (1, 32),
@@ -578,8 +617,18 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
             self._transformed_l1_weights, self._transformed_l2_weights = (
                 deep_gemm.transform_weights_for_mega_moe(
-                    (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                    (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
+                    (
+                        self.w13_weight.data
+                        if self.fp8_weight_block_size
+                        else self.w13_weight.data.view(torch.int8).contiguous(),
+                        w13_scale,
+                    ),
+                    (
+                        self.w2_weight.data
+                        if self.fp8_weight_block_size
+                        else self.w2_weight.data.view(torch.int8).contiguous(),
+                        w2_scale,
+                    ),
                 )
             )
             # Drop the original loader-side parameters: the MegaMoE kernels only
@@ -629,7 +678,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             self.intermediate_size,
             self.num_shared_experts if self.has_fused_shared_experts else 0,
         )
-        symm_buffer = self._symm_buffer_cache.get(key)
+        symm_buffer: typing.Any = self._symm_buffer_cache.get(key)
         if symm_buffer is None:
             symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
@@ -638,11 +687,26 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
+                mma_type=self.mma_type,
                 num_shared_experts=(
                     self.num_shared_experts if self.has_fused_shared_experts else 0
                 ),
             )
             self._symm_buffer_cache[key] = symm_buffer
+            logger.info_once(
+                "Allocated %s MegaMoE symmetric buffer: %.3f GiB, "
+                "capacity=%d tokens/rank, shared_experts=%d.",
+                self.mma_type,
+                symm_buffer.buffer.nbytes / (1 << 30),
+                symm_buffer.num_max_tokens_per_rank,
+                symm_buffer.num_shared_experts,
+            )
+        elif self.fp8_weight_block_size is not None:
+            logger.info_once(
+                "FP8 MegaMoE reuses the %s symmetric buffer (%.3f GiB).",
+                symm_buffer.mma_type,
+                symm_buffer.buffer.nbytes / (1 << 30),
+            )
         return symm_buffer
 
     def set_eplb_state(
@@ -757,7 +821,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 symm_buffer.num_max_tokens_per_rank,
                 num_tokens,
                 self.top_k,
-                "fp8xfp4",
+                self.mma_type,
             )
 
         prepare_megamoe_inputs(

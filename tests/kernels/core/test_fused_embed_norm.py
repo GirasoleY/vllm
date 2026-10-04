@@ -73,3 +73,40 @@ def test_fused_embed_eh_norm_matches_reference():
     ref = fused_eh_norm(positions, table[ids.long()], prev, enorm_w, hnorm_w, EPS)
 
     torch.testing.assert_close(fused, ref, atol=0.0, rtol=0.0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("n", [0, 1, 16, 32, 128])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("eps", [1e-6, 1e-5])
+@torch.inference_mode()
+def test_hyv4_eh_norm_matches_unfused(n, strided, eps, default_vllm_config):
+    """Preserve HY4's unmasked embedding and independent norm weights."""
+    from vllm.model_executor.layers.fused_embed_norm import (
+        fused_eh_norm as fused_hyv4_eh_norm,
+    )
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    set_random_seed(42)
+    h = 6144
+    step = 2 if strided else 1
+    e = torch.randn(n * step, h, device="cuda", dtype=DTYPE)[::step]
+    p = torch.randn_like(e) * 3
+    en = RMSNorm(h, eps=eps).to(device="cuda", dtype=DTYPE)
+    hn = RMSNorm(h, eps=eps).to(device="cuda", dtype=DTYPE)
+    en.weight.normal_(1, 0.2)
+    hn.weight.normal_(1, 0.2)
+    before = e.clone(), p.clone()
+    actual = fused_hyv4_eh_norm(e, p, en.weight, hn.weight, eps)
+    from vllm import _custom_ops as ops
+
+    en_out, hn_out = torch.empty_like(e), torch.empty_like(p)
+    if n:
+        ops.rms_norm(en_out, e, en.weight, eps)
+        ops.rms_norm(hn_out, p, hn.weight, eps)
+    expected = torch.cat([en_out, hn_out], dim=-1)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(e, before[0], rtol=0, atol=0)
+    torch.testing.assert_close(p, before[1], rtol=0, atol=0)
+    if n:
+        assert actual[0, :h].abs().max() > 0
