@@ -350,11 +350,14 @@ class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
                 block_table, seq_lens, row_req = self._flattened_decode_metadata(
                     attn_metadata, q.shape[0]
                 )
-        elif attn_metadata.decode.max_query_len > 1 and self.dcp_world_size == 1:
+        elif attn_metadata.decode.max_query_len > 1:
             # Causal spec decode: keep q compact and let the kernel tile each
             # request's length (uniform 1+k and adaptive ragged). Mirrors vllm #52157.
-            # DCP keeps the uniform reshape below: it needs LSE, which the kernels
-            # do not return on the ragged path (flashinfer #3238).
+            # The kernel reads per-request lengths from the device query_start_loc,
+            # so ragged, graph-padded and device-trimmed batches all stay correct.
+            # DCP takes this path too: monolithic CuTeDSL returns LSE for compact
+            # variable-Q input, with causal_seqlens_kv_global bounding each
+            # request's newest query token.
             cum_seq_lens_q = attn_metadata.decode.query_start_loc
             max_q_len = attn_metadata.decode.max_query_len
         # trtllm API requires extra dimension q_len_per_request for MTP
@@ -401,12 +404,10 @@ class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
             # fall back to cute-dsl for those.
             decode_backend = _select_mla_decode_backend(runtime_num_heads)
         if cum_seq_lens_q is not None:
-            # Neither decode backend returns LSE on the ragged path
-            # (flashinfer #3238); DCP, the only LSE consumer, took the uniform
-            # branch above, so this only guards a future caller wiring the two.
-            assert not return_lse, (
-                "FlashInferMLA ragged decode cannot return LSE; DCP and adaptive "
-                "variable-length decode are mutually exclusive."
+            # trtllm-gen does not return LSE on the ragged path (flashinfer #3238);
+            # DCP, the only LSE consumer, always runs monolithic CuTeDSL, which does.
+            assert not return_lse or self.dcp_world_size > 1, (
+                "FlashInferMLA ragged decode returns LSE only with DCP (CuTeDSL)."
             )
             extra_kwargs["cum_seq_lens_q"] = cum_seq_lens_q
             extra_kwargs["max_q_len"] = max_q_len
