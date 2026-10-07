@@ -720,7 +720,7 @@ class TestNixlHandshake:
             return_value=KVConnectorTransferResults(finished_sending={"sent"})
         )
         results = connector.get_transfer_results(set())
-        assert results.finished_sending == ({"sent"} if expected_tracked else set())
+        assert results.finished_sending == {"sent"}
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
