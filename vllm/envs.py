@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
+    VLLM_MOONCAKE_EAGER_LOOKUP: bool = False
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
@@ -1725,6 +1726,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
         os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")
     ),
+    # MooncakeStoreConnector (lookup_async): submit a new request's store
+    # lookup on the engine-core input thread as soon as the request is built,
+    # instead of when the scheduler's waiting loop first reaches it.
+    "VLLM_MOONCAKE_EAGER_LOOKUP": lambda: bool(
+        int(os.getenv("VLLM_MOONCAKE_EAGER_LOOKUP", "0"))
+    ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),
     # Override the hostname the rank registers as a Mooncake requester.
@@ -2329,6 +2336,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+        # Connector lookup timing only; does not affect compiled graphs.
+        "VLLM_MOONCAKE_EAGER_LOOKUP",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",
         "VLLM_AUDIO_FETCH_TIMEOUT",

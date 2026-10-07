@@ -2475,6 +2475,14 @@ class LookupKeyClient:
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
         self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        # prefetch() runs on the engine-core input thread (eager lookup);
+        # everything else on the scheduler thread.
+        self._futures_lock = threading.Lock()
+        # Submit time of prefetched (eager) lookups: a result older than this
+        # when first consumed is redone, so the window between the existence
+        # check and the load stays as short as without prefetching.
+        self._prefetch_submit_t: dict[str, float] = {}
+        self._prefetch_max_age_s = 2.0
 
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
@@ -2499,10 +2507,21 @@ class LookupKeyClient:
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
-        future = self.futures.get(req_id)
-        if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
-            self.futures[req_id] = future
+        with self._futures_lock:
+            future = self.futures.get(req_id)
+            submit_t = self._prefetch_submit_t.pop(req_id, None)
+            if (
+                future is not None
+                and submit_t is not None
+                and future.done()
+                and time.monotonic() - submit_t > self._prefetch_max_age_s
+            ):
+                future = None  # stale prefetched result: look up again
+            if future is None:
+                future = self.executor.submit(
+                    self._lookup, num_tokens, list(block_hashes)
+                )
+                self.futures[req_id] = future
         if non_block and not future.done():
             return None
         try:
@@ -2511,11 +2530,26 @@ class LookupKeyClient:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
             return MooncakeLookupResult(0)
         finally:
-            del self.futures[req_id]
+            with self._futures_lock:
+                self.futures.pop(req_id, None)
+
+    def prefetch(
+        self, req_id: str, num_tokens: int, block_hashes: list[BlockHash]
+    ) -> None:
+        """Submit the lookup for ``req_id`` now without waiting for or
+        consuming its result; a later ``lookup(req_id, ...)`` picks it up."""
+        with self._futures_lock:
+            if req_id not in self.futures:
+                self.futures[req_id] = self.executor.submit(
+                    self._lookup, num_tokens, list(block_hashes)
+                )
+                self._prefetch_submit_t[req_id] = time.monotonic()
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
-        future = self.futures.pop(req_id, None)
+        with self._futures_lock:
+            future = self.futures.pop(req_id, None)
+            self._prefetch_submit_t.pop(req_id, None)
         if future is not None:
             future.cancel()
 

@@ -207,6 +207,13 @@ class EngineCore:
                         content.update(worker_dict)
                 kv_connector.set_xfer_handshake_metadata_pp_aware(content)
 
+        # Opt-in eager connector lookup (VLLM_MOONCAKE_EAGER_LOOKUP): called on
+        # the input thread as soon as a request is built, so its async store
+        # lookup overlaps the wait for the busy loop's next iteration.
+        self._kv_preprocessed_hook: Callable[[Request], None] | None = None
+        if kv_connector is not None and envs.VLLM_MOONCAKE_EAGER_LOOKUP:
+            self._kv_preprocessed_hook = kv_connector.on_request_preprocessed
+
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
@@ -1061,6 +1068,13 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        hook = getattr(self, "_kv_preprocessed_hook", None)
+        if hook is not None:
+            try:
+                hook(req)
+            except Exception:
+                # Best effort: the scheduler's own lookup still runs.
+                logger.exception("KV connector eager lookup failed: %s", req.request_id)
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

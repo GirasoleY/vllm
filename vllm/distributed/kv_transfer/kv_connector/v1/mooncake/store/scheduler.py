@@ -5,6 +5,7 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -70,6 +71,10 @@ class MooncakeStoreScheduler:
             kv_event_config and kv_event_config.enable_kv_cache_events
         )
         self.client = LookupKeyClient(vllm_config)
+        # Opt-in: start each lookup on the engine-core input thread.
+        self.eager_lookup = (
+            self.enable_lookup and self.lookup_async and envs.VLLM_MOONCAKE_EAGER_LOOKUP
+        )
         self.kv_cache_config = kv_cache_config
         self._store_group_ids = kv_cache_config.prefix_cacheable_group_ids
         # Map scheduler group IDs to store group indices. Groups outside the
@@ -115,6 +120,24 @@ class MooncakeStoreScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
 
+    def _lookup_align(self) -> int:
+        # Fine-grained hits may land on a hash boundary inside a block; without
+        # partial hits, prefixes shorter than one physical block are skipped.
+        return (
+            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
+        )
+
+    def prefetch_lookup(self, request: Request) -> None:
+        """Eager lookup (input thread): submit the async store lookup now so
+        the scheduler's first get_num_new_matched_tokens finds it done."""
+        if not self.eager_lookup or request.skip_reading_prefix_cache:
+            return
+        if request.num_tokens < self._lookup_align():
+            return
+        self.client.prefetch(
+            request.request_id, request.num_tokens, request.block_hashes
+        )
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -128,12 +151,7 @@ class MooncakeStoreScheduler:
         if not self.enable_lookup:
             return 0, False
 
-        # Fine-grained hits may land on a hash boundary inside a block; without
-        # partial hits, prefixes shorter than one physical block are skipped.
-        align = (
-            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
-        )
-        if request.num_tokens < align:
+        if request.num_tokens < self._lookup_align():
             return 0, False
 
         lookup_result = self.client.lookup(
