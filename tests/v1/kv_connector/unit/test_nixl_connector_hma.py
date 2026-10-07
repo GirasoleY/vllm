@@ -91,6 +91,7 @@ def region_pull_worker():
     worker.src_xfer_handles_by_block_size = {64: 1}
     worker._dram_src_handles_by_block_size = {64: 2}
     worker.dst_xfer_side_handles = {"P": {0: 3}}
+    worker._remote_pp_stages = {}
     worker.dst_num_blocks = {"P": 100, "D": 100}
     worker.dst_region_num_blocks = {"P": [100, 100], "D": [100, 100]}
     worker._remote_agents = {"P": {(0, 0): "P-rank0"}}
@@ -685,6 +686,7 @@ def test_read_blocks_for_req_expands_remote_ids(
 
     worker = object.__new__(NixlConnectorWorker)
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
+    worker._remote_pp_stages = {}
     worker._engine_last_active = {}
     worker._recving_transfers = {}
     worker._bidirectional_kv_xfer_enabled = False

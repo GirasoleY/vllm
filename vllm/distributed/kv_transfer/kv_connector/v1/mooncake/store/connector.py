@@ -25,6 +25,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorTransferResults,
@@ -192,6 +193,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config)
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
+    ) -> None:
+        """Accept handshake metadata from every PP stage.
+
+        The store needs no peer handshake: each PP rank reads and writes its own
+        pp_rank-namespaced keys through the Mooncake master. Under MultiConnector
+        a PP prefill also sends the NixlConnector's per-stage metadata here, which
+        the base class would reject.
+        """
+        return None
 
     def shutdown(self):
         """Release connector resources on teardown.
