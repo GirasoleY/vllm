@@ -11,6 +11,9 @@ and the elementwise/dtype/alignment constraints hold.
 
 The per-head learnable sink is supported through `.flashmla_sparse`, which
 subclasses the platform's sparse MLA backend to forward ``attn_sink``.
+
+Prefill context parallelism (PCP) reuses the generic ``MLAAttention`` and
+``SparseAttnIndexer`` cache gathers.
 """
 
 from typing import cast
@@ -682,7 +685,9 @@ class HYV4MLAAttention(nn.Module):
                 "sink bias is disabled."
             )
             return None
-        cache_config = get_current_vllm_config().cache_config
+        vllm_config = get_current_vllm_config()
+        cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
         block_size = (
             cache_config.block_size
             if cache_config is not None and cache_config.user_specified_block_size
@@ -700,6 +705,8 @@ class HYV4MLAAttention(nn.Module):
             use_per_head_quant_scales=False,
             device_capability=capability,
             attn_type=AttentionType.DECODER,
+            use_pcp=parallel_config.prefill_context_parallel_size > 1,
+            use_dcp=parallel_config.decode_context_parallel_size > 1,
         )
         if invalid_reasons:
             logger.warning_once(
