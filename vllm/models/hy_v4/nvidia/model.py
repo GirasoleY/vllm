@@ -70,6 +70,10 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroupBuilder,
+    make_sparse_mla_index_group_builder,
+)
 
 from .attention import (
     HYV4MLAAttention,
@@ -129,6 +133,7 @@ class HYV4DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -159,6 +164,7 @@ class HYV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             layer_idx=layer_idx,
             topk_indices_buffer=topk_indices_buffer,
+            index_group_builder=index_group_builder,
         )
         if self.use_sequence_parallel:
             self.self_attn.o_proj.reduce_results = False
@@ -387,13 +393,18 @@ class HYV4Model(nn.Module):
         self.is_sparse = hasattr(config, "index_topk")
         if self.is_sparse:
             self.topk_indices_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.max_num_tokens_per_rank,
                 config.index_topk,
                 dtype=torch.int32,
                 device=self.device,
             )
         else:
             self.topk_indices_buffer = None
+        # Share one builder, so each "full" indexer layer starts one group with
+        # a decode-sized top-k workspace.
+        index_group_builder = make_sparse_mla_index_group_builder(
+            vllm_config, self.topk_indices_buffer
+        )
         self.config = config
         self.quant_config = quant_config
         self.enable_ihc = getattr(config, "enable_ihc", False)
@@ -418,6 +429,7 @@ class HYV4Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                index_group_builder=index_group_builder,
             ),
             prefix=f"{prefix}.layers",
         )

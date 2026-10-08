@@ -59,6 +59,7 @@ from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.selector import get_attn_backend
 
 logger = init_logger(__name__)
@@ -334,6 +335,7 @@ class HYV4MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -562,6 +564,7 @@ class HYV4MLAAttention(nn.Module):
             use_sparse=self.is_sparse,
             indexer=self.indexer,
             topk_indices_buffer=topk_indices_buffer,
+            index_group_builder=index_group_builder,
             attn_backend=sink_backend,
             **extra_impl_args,
         )

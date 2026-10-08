@@ -36,6 +36,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
+    get_prefill_workspace_factor,
     request_row_bounds,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
@@ -271,14 +272,12 @@ class FlashMLASparseMetadata(SparseMLACommonMetadata):
     fp8_use_mixed_batch: bool = False
 
 
-def get_prefill_workspace_size(max_model_len: int):
-    # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
-    # May be tuned later.
-    # Memory usage: 5 * max_model_len * 576 * 2 bytes
+def get_prefill_workspace_size(max_model_len: int, dcp_world_size: int = 1) -> int:
+    # NOTE(Lucas): the factor (5 by default) controls the prefill buffer size.
+    # Memory usage: factor * max_model_len * 576 * 2 bytes
     #   Example: DeepSeek-V3.2 with max_model_len=163840 ->
     #            5 * 163840 * 576 * 2 = ~900 MB
-    # This fits nicely below the typical MoE workspace size of >2GB so this is "free"
-    return max_model_len * 5
+    return int(max_model_len * get_prefill_workspace_factor(dcp_world_size))
 
 
 class FlashMLASparseMetadataBuilder(
@@ -494,7 +493,7 @@ class FlashMLASparseMetadataBuilder(
             prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
             # Chunk prefill requests to fit within workspace size
             max_prefill_buffer_size = get_prefill_workspace_size(
-                self.vllm_config.model_config.max_model_len
+                self.vllm_config.model_config.max_model_len, self.dcp_world_size
             )
             # Workspace rows per entry, and the prefill rows each entry covers.
             workspace_rows = prefill_seq_lens_cpu
@@ -694,7 +693,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         self.fp8_decode_padded_heads = self._compute_fp8_decode_padded_heads(num_heads)
 
         vllm_config = get_current_vllm_config()
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        max_tokens = vllm_config.max_num_tokens_per_rank
         q_concat_heads = num_heads
         if not is_quantized_kv_cache(kv_cache_dtype):
             q_concat_heads = (
@@ -725,10 +724,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         if kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS:
             # Reserve workspace during initialization
             assert vllm_config is not None and vllm_config.model_config is not None
-            prefill_workspace_size = get_prefill_workspace_size(
-                vllm_config.model_config.max_model_len
-            )
             parallel_config = vllm_config.parallel_config
+            prefill_workspace_size = get_prefill_workspace_size(
+                vllm_config.model_config.max_model_len,
+                parallel_config.decode_context_parallel_size,
+            )
             self.pcp_dcp_kv_gather = (
                 parallel_config.prefill_context_parallel_size > 1
                 and parallel_config.decode_context_parallel_size > 1
@@ -750,11 +750,18 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             padded_prefill_query_heads = round_up(
                 prefill_query_heads, self.prefill_padding
             )
+            # Without head padding, the kernel writes to the compact output.
+            # The padded q and output slots are then empty.
+            needs_padded_slots = (
+                padded_prefill_query_heads != prefill_query_heads
+                or prefill_query_heads != num_heads
+            )
+            padded_tokens = max_tokens if needs_padded_slots else 0
             self.workspace_specs.extend(
                 (shape, torch.bfloat16)
                 for shape in (
-                    (max_tokens, padded_prefill_query_heads, head_size),
-                    (max_tokens, padded_prefill_query_heads, self.kv_lora_rank),
+                    (padded_tokens, padded_prefill_query_heads, head_size),
+                    (padded_tokens, padded_prefill_query_heads, self.kv_lora_rank),
                     (max_tokens, prefill_query_heads, self.kv_lora_rank),
                 )
             )
@@ -1091,16 +1098,21 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     assert topk_length is not None
                     chunk_topk_length = topk_length[chunk.tokens_slice]
 
+                chunk_dst = (
+                    padded_out[chunk.tokens_slice]
+                    if padded_out.shape[0] > 0
+                    else attn_out[chunk.tokens_slice]
+                )
                 chunk_out, chunk_lse = self._bf16_flash_mla_kernel(
                     chunk_q,
                     chunk_workspace,
                     chunk_topk_indices_workspace,
                     chunk_topk_length,
-                    out=padded_out[chunk.tokens_slice],
+                    out=chunk_dst,
                 )
                 if strided_out and chunk_out.shape[0] == num_mqa_tokens:
                     attn_out = chunk_out
-                else:
+                elif chunk_out.data_ptr() != attn_out[chunk.tokens_slice].data_ptr():
                     attn_out[chunk.tokens_slice].copy_(chunk_out)
                 del chunk_out, chunk_lse
 

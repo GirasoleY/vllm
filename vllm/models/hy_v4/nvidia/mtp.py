@@ -36,6 +36,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroupBuilder,
+    make_sparse_mla_index_group_builder,
+)
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -358,6 +362,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         super().__init__()
         del model_config  # kept for signature parity with the other MTP heads
@@ -388,6 +393,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
+            index_group_builder=index_group_builder,
         )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -460,11 +466,14 @@ class HYV4MultiTokenPredictor(nn.Module):
             from vllm.platforms import current_platform
 
             self.topk_indices_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.max_num_tokens_per_rank,
                 config.index_topk,
                 dtype=torch.int32,
                 device=current_platform.device_type,
             )
+        index_group_builder = make_sparse_mla_index_group_builder(
+            vllm_config, self.topk_indices_buffer
+        )
 
         self.layers = nn.ModuleDict(
             {
@@ -476,6 +485,7 @@ class HYV4MultiTokenPredictor(nn.Module):
                     cache_config=vllm_config.cache_config,
                     quant_config=self.quant_config,
                     topk_indices_buffer=self.topk_indices_buffer,
+                    index_group_builder=index_group_builder,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,

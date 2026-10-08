@@ -239,7 +239,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.num_shared_experts = num_shared_experts
         self.clamp_shared_experts = clamp_shared_experts
-        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_tokens = vllm_config.max_num_tokens_per_rank
         self.fp8_weight_block_size = fp8_weight_block_size
         self.mma_type = "fp8xfp8" if fp8_weight_block_size else "fp8xfp4"
         self.weight_block_size = fp8_weight_block_size or (1, 32)

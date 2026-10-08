@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
@@ -400,6 +400,108 @@ def test_pcp_first_chunk_row_is_never_short(pcp_world_size, query_len):
     assert len(set(charged_per_rank)) == 1, (
         f"ranks would chunk differently for {query_len=}: {charged_per_rank}"
     )
+
+
+def _max_num_tokens_per_rank(config) -> int:
+    return VllmConfig.max_num_tokens_per_rank.fget(config)
+
+
+def _make_bound_config(
+    pcp: int,
+    max_num_batched_tokens: int,
+    max_num_seqs: int,
+    num_spec: int | None,
+    *,
+    dcp: int = 1,
+    dp: int = 1,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    method: str = "mtp",
+    parallel_drafting: bool = False,
+):
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=dcp,
+            data_parallel_size=dp,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
+        uniform_decode_query_len=1 + (num_spec or 0),
+        speculative_config=None
+        if num_spec is None
+        else SimpleNamespace(
+            method=method,
+            num_speculative_tokens=num_spec,
+            parallel_drafting=parallel_drafting,
+        ),
+    )
+
+
+@pytest.mark.parametrize("pcp_world_size", [2, 4, 8])
+@pytest.mark.parametrize("num_spec", [None, 3])
+def test_per_rank_token_bound_covers_partitioned_batches(pcp_world_size, num_spec):
+    """No rank's share of a schedulable batch exceeds the per-rank bound."""
+    max_num_batched_tokens, max_num_seqs = 8192, 32
+    decode_query_len = 1 + (num_spec or 0)
+    bound = _max_num_tokens_per_rank(
+        _make_bound_config(
+            pcp_world_size, max_num_batched_tokens, max_num_seqs, num_spec
+        )
+    )
+    assert bound < max_num_batched_tokens
+    managers = [
+        PCPManager(
+            pcp_world_size=pcp_world_size, pcp_rank=r, device=torch.device("cpu")
+        )
+        for r in range(pcp_world_size)
+    ]
+    rng = np.random.default_rng(0)
+    for trial in range(400):
+        num_decodes = int(rng.integers(0, max_num_seqs + 1))
+        if trial % 4 == 0:
+            num_decodes = max_num_seqs  # all replicated decode queries
+        budget = max_num_batched_tokens - num_decodes * decode_query_len
+        query_lens = [decode_query_len] * num_decodes
+        while len(query_lens) < max_num_seqs and budget > 0:
+            # Short prefills maximize the per-chunk rounding overhead.
+            length = int(
+                rng.integers(1, 3 * pcp_world_size if trial % 2 else budget + 1)
+            )
+            length = min(length, budget)
+            query_lens.append(length)
+            budget -= length
+        num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+        is_prefilling = np.arange(len(query_lens)) >= num_decodes
+        for rank, manager in enumerate(managers):
+            local = sum(
+                chunk_len
+                for _, _, chunk_len in manager._iter_rank_chunks(
+                    rank, num_scheduled_tokens, is_prefilling
+                )
+            )
+            assert local <= bound, (local, bound, query_lens)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"dcp": 2},
+        {"dp": 2},
+        {"cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY},
+        {"method": "dspark"},
+        {"parallel_drafting": True},
+    ],
+)
+def test_per_rank_token_bound_falls_back_outside_proven_configs(overrides):
+    config = _make_bound_config(4, 32768, 32, 3, **overrides)
+    assert _max_num_tokens_per_rank(config) == 32768
+
+
+def test_per_rank_token_bound_is_noop_without_pcp():
+    assert _max_num_tokens_per_rank(_make_bound_config(1, 16384, 32, 3)) == 16384
 
 
 def _make_global_decode_batch(

@@ -495,6 +495,17 @@ class SparseMLAIndexGroupBuilder:
         return group, group_index
 
 
+def make_sparse_mla_index_group_builder(
+    vllm_config: VllmConfig, topk_indices_buffer: torch.Tensor | None
+) -> SparseMLAIndexGroupBuilder | None:
+    """One builder per model, its physical top-k workspace sized for decode."""
+    if topk_indices_buffer is None:
+        return None
+    return SparseMLAIndexGroupBuilder(
+        topk_indices_buffer, get_sparse_mla_index_group_max_rows(vllm_config)
+    )
+
+
 def get_sparse_mla_index_group_max_rows(vllm_config: VllmConfig) -> int:
     max_query_len = 1
     speculative_config = vllm_config.speculative_config

@@ -695,6 +695,37 @@ class VllmConfig:
         return 1 + self.num_speculative_tokens
 
     @property
+    def max_num_tokens_per_rank(self) -> int:
+        """Maximum query tokens one rank runs in one forward step.
+
+        This is `max_num_batched_tokens`, except under PCP without DCP: each
+        rank then gets 2 of the `2 * pcp` chunks of each prefill, and all ranks
+        get all decode tokens. Use this to size per-step buffers. The PCP bound
+        is used only where it is proven: no DP, no CUDA graphs (capture sizes
+        go up to `max_num_batched_tokens`), and no speculator or a fixed-length
+        MTP one. `PCPManager.partition_batch` checks it.
+        """
+        max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+        parallel_config = self.parallel_config
+        pcp = parallel_config.prefill_context_parallel_size
+        spec = self.speculative_config
+        if (
+            pcp <= 1
+            or parallel_config.decode_context_parallel_size > 1
+            or parallel_config.data_parallel_size > 1
+            or self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            or (spec is not None and (spec.method != "mtp" or spec.parallel_drafting))
+        ):
+            return max_num_batched_tokens
+        max_num_seqs = self.scheduler_config.max_num_seqs
+        bound = (
+            -(-max_num_batched_tokens // pcp)
+            + 2 * max_num_seqs
+            + max_num_seqs * self.uniform_decode_query_len
+        )
+        return min(max_num_batched_tokens, bound)
+
+    @property
     def use_v2_model_runner(self) -> bool:
         if self.attention_config.hisparse_config is not None:
             if envs.VLLM_USE_V2_MODEL_RUNNER is False:

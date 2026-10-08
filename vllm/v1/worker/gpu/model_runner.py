@@ -780,6 +780,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "skip_attn must only be True for initial memory profiling."
             )
 
+        # Dummy batches skip PCP partitioning. Cap them at the per-rank bound.
+        if not uniform_decode:
+            num_tokens = min(num_tokens, self.vllm_config.max_num_tokens_per_rank)
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
         if uniform_decode:

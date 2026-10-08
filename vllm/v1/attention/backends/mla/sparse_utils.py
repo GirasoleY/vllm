@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.model_executor.warmup.jit_warmup import (
@@ -23,6 +24,17 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.block_table import get_block_table_width
+
+
+def get_prefill_workspace_factor(dcp_world_size: int = 1) -> float:
+    """Return the sparse MLA prefill workspace size over max_model_len."""
+    factor = envs.VLLM_SPARSE_MLA_PREFILL_WORKSPACE_FACTOR
+    if factor < 1:
+        raise ValueError(
+            f"VLLM_SPARSE_MLA_PREFILL_WORKSPACE_FACTOR must be >= 1, got {factor}."
+        )
+    # DCP rounds shards up, so keep 2x with DCP.
+    return max(factor, 2.0) if dcp_world_size > 1 else factor
 
 
 def request_row_bounds(req_idx: np.ndarray) -> np.ndarray:

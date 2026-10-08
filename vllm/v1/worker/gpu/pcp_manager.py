@@ -55,8 +55,10 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        max_num_tokens_per_rank: int | None = None,
     ) -> None:
         self.pcp_world_size = pcp_world_size
+        self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.pcp_rank = pcp_rank
         self.device = device
         self.dcp_world_size = dcp_world_size
@@ -503,10 +505,15 @@ class PCPManager:
             num_local_tokens,
             per_rank_num_tokens,
         )
-        if num_local_tokens_padded > input_buffers.max_num_tokens:
+        # Step buffers are sized for VllmConfig.max_num_tokens_per_rank.
+        max_local_tokens = min(
+            input_buffers.max_num_tokens,
+            self.max_num_tokens_per_rank or input_buffers.max_num_tokens,
+        )
+        if num_local_tokens_padded > max_local_tokens:
             raise RuntimeError(
-                "PCP local token count exceeds the MRV2 input buffer size: "
-                f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
+                "PCP local token count exceeds the per-rank token bound: "
+                f"{num_local_tokens_padded} > {max_local_tokens}."
             )
         rank_token_start = self.pcp_rank * num_local_tokens_padded
         assert self._padded_gather_idx is not None
@@ -865,6 +872,7 @@ def maybe_build_pcp_manager(
         max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         block_tables=block_tables,
         dcp_world_size=dcp_size,
+        max_num_tokens_per_rank=vllm_config.max_num_tokens_per_rank,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
     )
