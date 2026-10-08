@@ -328,6 +328,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
 
+  // HY V4 iHC boundary: optional post step, pre and RMSNorm (SM90+).
+  // conditionally compiled so impl registration is in source file
+  ops.def(
+      "hy_v4_ihc_boundary(Tensor residual, Tensor? x, Tensor? post, "
+      "Tensor weight, Tensor hc_scale, Tensor hc_base, Tensor? norm_weight, "
+      "float magnitude, float hc_eps, float rms_eps, float variance_eps, "
+      "bool round_before_norm) -> (Tensor, Tensor, Tensor)");
+
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
   ops.def(
       "rearrange_kn_weight_as_n32k16_order(Tensor b_qweight, Tensor b_scales, "
