@@ -555,6 +555,16 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def on_request_preprocessed(self, request: "Request") -> None:
+        """Called on the engine-core input thread right after a new request
+        is built, before the scheduler sees it (opt-in; see
+        VLLM_MOONCAKE_EAGER_LOOKUP). It may run concurrently with schedule(),
+        so implementations must only start thread-safe background work (e.g.
+        an async prefix lookup) and must not touch scheduler state. The default
+        implementation is a no-op.
+        """
+        return
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """Update KVConnector state from worker-side connectors output.
 

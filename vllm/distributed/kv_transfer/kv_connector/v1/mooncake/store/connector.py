@@ -233,6 +233,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, blocks, num_external_tokens
         )
 
+    def on_request_preprocessed(self, request: Request) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.prefetch_lookup(request)
+
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
