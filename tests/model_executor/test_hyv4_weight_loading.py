@@ -660,3 +660,26 @@ def test_mtp_nvfp4_loads_packed_weights_and_both_scale_levels():
             adapter.w13_input_scale[local], torch.stack((gate[3], up[3]))
         )
         torch.testing.assert_close(adapter.w2_input_scale[local], down[3])
+
+
+@pytest.mark.parametrize(("start_layer", "shared"), [(39, True), (41, False)])
+def test_pp_stage_start_on_shared_topk_layer(start_layer, shared):
+    """A stage starting on a shared layer needs the previous stage's indices;
+    models that do not pass them between stages must reject the split."""
+    from vllm.models.hy_v4.nvidia.attention import check_pp_stage_topk_sharing
+
+    num_layers = 78
+    config = SimpleNamespace(
+        index_topk=2048,
+        num_hidden_layers=num_layers,
+        layer_types=["deepseek_sparse_attention"] * num_layers,
+        indexer_types=[
+            "full" if i == 0 or (i - 1) % 4 == 0 else "shared"
+            for i in range(num_layers)
+        ],
+    )
+    if shared:
+        with pytest.raises(ValueError, match="VLLM_PP_LAYER_PARTITION"):
+            check_pp_stage_topk_sharing(config, start_layer, num_layers)
+    else:
+        check_pp_stage_topk_sharing(config, start_layer, num_layers)
