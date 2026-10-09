@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import functools
+import time
+
 import torch
 import torch.distributed as dist
 
@@ -28,6 +31,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
+from vllm.third_party.trtllm_gvr_topk import (
+    gvr_topk_decode_self_sampling_host as gvr_topk,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -317,6 +323,63 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+# GVR is slower than top_k_per_row_prefill on rows of <= 4K keys (GB300).
+_GVR_MIN_LOGITS_COLS = 8192
+
+
+@functools.cache
+def use_gvr_prefill_topk() -> bool:
+    """GVR prefill top-k is enabled and supported (SM100/103 with CuTe DSL)."""
+    return (
+        envs.VLLM_SPARSE_INDEXER_GVR_PREFILL_TOPK
+        and current_platform.is_device_capability_family(100)
+        and has_cutedsl()
+    )
+
+
+def warmup_gvr_prefill_topk(model: torch.nn.Module, max_model_len: int) -> None:
+    """Compile the GVR prefill engines of every indexer top-k (~7 s each)."""
+    if not use_gvr_prefill_topk():
+        return
+    for k in {
+        m.topk_tokens for m in model.modules() if isinstance(m, SparseAttnIndexer)
+    }:
+        start = time.perf_counter()
+        gvr_topk.warmup_prefill(k, max_model_len)
+        logger.info(
+            "GVR prefill top-k warmup (k=%d) took %.1fs.",
+            k,
+            time.perf_counter() - start,
+        )
+
+
+def prefill_topk(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    allow_gvr: bool = True,
+) -> None:
+    """Exact per-row top-k of logits[r, ks:ke] into topk_indices (-1 padded)."""
+    if allow_gvr and use_gvr_prefill_topk() and logits.shape[1] > _GVR_MIN_LOGITS_COLS:
+        # Engines are compiled by kernel warmup; never compile while serving.
+        if gvr_topk.prefill_ready(logits, topk_indices):
+            gvr_topk.run_prefill(logits, row_starts, row_ends, topk_indices)
+            return
+        logger.warning_once("GVR prefill top-k not warmed up; using fallback.")
+    ops.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        topk_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -588,7 +651,6 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         clean_logits=False,
                     )
-                num_rows = logits.shape[0]
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source
                     # publishes its top blocks; later indexers mask their
@@ -613,15 +675,14 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                ops.top_k_per_row_prefill(
+                prefill_topk(
                     logits,
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
                     topk_tokens,
+                    # Exact on -inf candidate masks, but up to 8x slower there.
+                    allow_gvr=candidate_blocks is None,
                 )
 
             if deinterleave_idx is None:
