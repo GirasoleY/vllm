@@ -299,12 +299,17 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         return out, lse
 
     def _direct_q_base(self) -> torch.Tensor | None:
-        """The dedicated head-padded query buffer for this layer's shape, or
-        None when the direct-query path does not apply."""
-        if not is_quantized_kv_cache(self.kv_cache_dtype):
+        """The buffer the MLA layer writes the absorbed query into (replacing
+        concat_mla_q), or None when the direct-query path does not apply."""
+        if not is_quantized_kv_cache(self.kv_cache_dtype) or self.pcp_dcp_kv_gather:
             return None
-        if self.pcp_dcp_kv_gather or self.num_heads % self.prefill_padding == 0:
-            return None
+        if self.num_heads % self.prefill_padding == 0:
+            # No padding: the q-concat slot itself, at offset 0 of the
+            # workspace; forward_mqa's other slots lie after it.
+            (q_concat,) = current_workspace_manager().get_simultaneous(
+                self.workspace_specs[0]
+            )
+            return q_concat
         # workspace_specs[-3] is (max_tokens, padded_prefill_query_heads, head_size).
         shape, dtype = self.workspace_specs[-3]
         device = torch.device("cuda", torch.accelerator.current_device_index())
