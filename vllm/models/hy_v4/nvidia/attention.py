@@ -28,8 +28,10 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.model_executor.layers.hpc import hpc_gated_mla_gemm, hpc_gated_mla_supported
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -42,7 +44,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.hy_v4.nvidia.indexer_fusion import (
@@ -60,6 +62,11 @@ from vllm.utils.multi_stream_utils import execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.ops.pcp import (
+    HY4PCPKVExchange,
+    init_hy4_pcp_kv_exchange,
+)
 from vllm.v1.attention.selector import get_attn_backend
 
 logger = init_logger(__name__)
@@ -568,6 +575,7 @@ class HYV4MLAAttention(nn.Module):
             attn_backend=sink_backend,
             **extra_impl_args,
         )
+        self.kv_exchange = self._init_hy4_kv_exchange(vllm_config)
 
     def prepare_gate_fusion(self) -> None:
         """Concatenate the gate projection onto the q/kv projection weights.
@@ -809,18 +817,30 @@ class HYV4MLAAttention(nn.Module):
                 q_c, indexer_kw, positions, self.indexer_rope_emb
             )
 
-        # Phase 2: MLA q up-projection + RoPE on the default stream; the
-        # indexer q/k preparation on the aux stream.
-        (q, kv_c_normed, k_pe), [index_inputs] = execute_in_parallel(
-            lambda: self._project_q_and_kv(
-                positions, hidden_states, q_c, kv_lora, llama_4_scaling
-            ),
-            [indexer_inputs if indexer else None],
-            events[2],
-            [events[3]],
-            aux_streams,
-            enable=enable_multi_stream,
+        kv_exchange = (
+            self.kv_exchange
+            if self.kv_exchange is not None
+            and llama_4_scaling is None
+            and self._is_sparse_mla_prefill(kv_lora.shape[0])
+            else None
         )
+        if kv_exchange is not None:
+            q, kv_c_normed, k_pe, index_inputs = self._project_q_and_kv_fused(
+                kv_exchange, positions, q_c, kv_lora, indexer_kw
+            )
+        else:
+            # Phase 2: MLA q up-projection + RoPE on the default stream; the
+            # indexer q/k preparation on the aux stream.
+            (q, kv_c_normed, k_pe), [index_inputs] = execute_in_parallel(
+                lambda: self._project_q_and_kv(
+                    positions, hidden_states, q_c, kv_lora, llama_4_scaling
+                ),
+                [indexer_inputs if indexer else None],
+                events[2],
+                [events[3]],
+                aux_streams,
+                enable=enable_multi_stream,
+            )
         index_q, index_k, index_weights = (
             index_inputs if index_inputs is not None else (None, None, None)
         )
@@ -844,6 +864,7 @@ class HYV4MLAAttention(nn.Module):
             kv_c_normed,
             k_pe,
             attn_out,
+            kv_exchange,
         )
 
         if self.gated_mla and self.linear_gate is not None:
@@ -876,6 +897,147 @@ class HYV4MLAAttention(nn.Module):
                     attn_out = attn_out * torch.sigmoid(gate_score)
 
         return fp8_linear(self.o_proj, attn_out)
+
+    def _init_hy4_kv_exchange(self, vllm_config: VllmConfig) -> HY4PCPKVExchange | None:
+        """The fused PCP prologue's exchange, if this layer supports it."""
+        if (
+            vllm_config.parallel_config.prefill_context_parallel_size <= 1
+            or envs.VLLM_HY4_PCP_PROLOGUE == "0"
+        ):
+            return None
+        mla = self.mla_attn
+        indexer = self.indexer if self.is_sparse and not self.skip_topk else None
+        ok = (
+            self.q_lora_rank is not None
+            and mla.kv_cache_dtype == "nvfp4_ds_mla"
+            and mla.hisparse_cache is None
+            and self.kv_lora_rank == 512
+            and self.qk_nope_head_dim == 192
+            and self.qk_rope_head_dim == 64
+            and type(self.rotary_emb) is RotaryEmbedding
+            and not self.rotary_emb.is_neox_style
+            and self.kv_a_layernorm.weight.dtype == torch.bfloat16
+        )
+        if ok and indexer is not None:
+            ok = (
+                indexer.head_dim == 128
+                and indexer.rope_dim == 64
+                and indexer.scale_fmt == "ue8m0"
+                and not indexer.indexer_op.use_fp4_cache
+                and not envs.VLLM_BATCH_INVARIANT
+                and self.indexer_rope_emb is not None
+                and not self.indexer_rope_emb.is_neox_style
+                and indexer.k_norm.weight.dtype == torch.float32
+                and indexer.k_norm.bias is not None
+                and indexer.k_norm.bias.dtype == torch.float32
+            )
+        if not ok:
+            message = f"HY4 PCP prologue does not support layer {mla.layer_name}"
+            if envs.VLLM_HY4_PCP_PROLOGUE == "1":
+                raise ValueError(f"{message} (VLLM_HY4_PCP_PROLOGUE=1).")
+            logger.info_once(f"{message}; using the unfused path.")
+            return None
+        return init_hy4_pcp_kv_exchange(vllm_config)
+
+    def _is_sparse_mla_prefill(self, num_tokens: int) -> bool:
+        """Pure prefill through sparse MQA. Agrees across PCP ranks: metadata
+        is global and token counts are padded."""
+        assert self.kv_exchange is not None
+        if (
+            torch.cuda.is_current_stream_capturing()
+            or not 0 < num_tokens <= self.kv_exchange.max_local_tokens
+        ):
+            return False
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return False
+        metadata = attn_metadata.get(self.mla_attn.layer_name)
+        return (
+            metadata is not None
+            and getattr(metadata, "num_decode_tokens", 1) == 0
+            # Dense MHA prefill reads the local K, not the cache.
+            and not self.mla_attn._use_sparse_mha(cast(MLACommonMetadata, metadata))
+        )
+
+    def _project_q_and_kv_fused(
+        self,
+        kv_exchange: HY4PCPKVExchange,
+        positions: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+        kv_lora: torch.Tensor,
+        indexer_kw: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, None, torch.Tensor] | None,
+    ]:
+        """Multicast K as cache rows on a side stream; meanwhile the Q GEMMs,
+        then one kernel for q_pe RoPE, indexer Q RoPE + quant and the
+        indexer's top-k row reset."""
+        assert self.q_b_proj is not None and q_c is not None
+        # K and Q share the activation dtype, so one cos/sin cache each.
+        cos_sin = self.rotary_emb._match_cos_sin_cache_dtype(kv_lora)
+        indexer = self.indexer if indexer_kw is not None else None
+        index_k = index_w = index_cos_sin = k_norm = None
+        if indexer is not None:
+            assert indexer_kw is not None
+            index_k, index_w = indexer_kw.split(
+                [indexer.head_dim, indexer_kw.shape[-1] - indexer.head_dim], dim=-1
+            )
+            index_rope = cast(RotaryEmbedding, self.indexer_rope_emb)
+            index_cos_sin = index_rope._match_cos_sin_cache_dtype(kv_lora)
+            k_norm = indexer.k_norm
+        kv_exchange.multicast(
+            kv_lora,
+            index_k,
+            positions,
+            cos_sin,
+            index_cos_sin,
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.variance_epsilon,
+            k_norm.weight if k_norm is not None else None,
+            k_norm.bias if k_norm is not None else None,
+            k_norm.eps if k_norm is not None else 0.0,
+        )
+
+        q = fp8_linear(self.q_b_proj, q_c)
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        index_q = index_q_fp8 = index_weights = topk_indices = None
+        softmax_scale = head_scale = 1.0
+        if indexer is not None:
+            index_q = fp8_linear(indexer.wq_b, q_c).view(
+                -1, indexer.n_head, indexer.head_dim
+            )
+            index_q_fp8 = torch.empty_like(index_q, dtype=current_platform.fp8_dtype())
+            index_weights = torch.empty(
+                index_q.shape[:2], dtype=torch.float32, device=index_q.device
+            )
+            softmax_scale, head_scale = indexer.softmax_scale, indexer.n_head**-0.5
+            topk_indices = indexer.indexer_op.topk_indices_buffer[: q.shape[0]]
+        torch.ops._C.hy4_q_rope_indexer_quant(
+            q,
+            q,
+            positions,
+            cos_sin,
+            index_q,
+            index_w,
+            index_cos_sin,
+            index_q_fp8,
+            index_weights,
+            topk_indices,
+            softmax_scale,
+            head_scale,
+            False,
+        )
+        index_inputs = None
+        if index_q_fp8 is not None:
+            assert index_weights is not None
+            index_inputs = (index_q_fp8, None, index_weights)
+        # Unused: sparse MQA reads K from the cache.
+        kv_c_normed = kv_lora[..., : self.kv_lora_rank]
+        k_pe = kv_lora[..., self.kv_lora_rank :].unsqueeze(1)
+        return q, kv_c_normed, k_pe, index_inputs
 
     def _project_qkv_a(
         self,
@@ -960,6 +1122,7 @@ class HYV4MLAAttention(nn.Module):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
+        kv_exchange: HY4PCPKVExchange | None = None,
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -971,8 +1134,35 @@ class HYV4MLAAttention(nn.Module):
         the capture is no longer active inside an eager segment. The indexer
         q/k/weights are token-wise and prepared before the break.
         """
+        # The exchange fills the caches; skip the layers' own inserts.
+        cache_filled = kv_exchange is not None
+        if kv_exchange is not None:
+            forward_context = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
+            slot_mappings = forward_context.slot_mapping
+            assert isinstance(attn_metadata, dict) and isinstance(slot_mappings, dict)
+            index_cache = index_slot_mapping = None
+            if index_q is not None:
+                assert self.indexer is not None
+                k_cache = self.indexer.k_cache
+                index_metadata = attn_metadata[k_cache.prefix]
+                assert isinstance(index_metadata, DeepseekV32IndexerMetadata)
+                index_cache, index_slot_mapping = (
+                    k_cache.kv_cache,
+                    index_metadata.slot_mapping,
+                )
+            kv_exchange.wait_cache_insert(
+                slot_mappings[self.mla_attn.layer_name],
+                self.mla_attn.kv_cache,
+                index_cache,
+                index_slot_mapping,
+            )
+        self.mla_attn.skip_kv_cache_update = cache_filled
         if index_q is not None:
             assert self.indexer is not None and index_weights is not None
+            self.indexer.indexer_op.skip_k_cache_insert = cache_filled
+            # The Q kernel already reset the top-k rows on the exchange path.
+            self.indexer.indexer_op.skip_topk_buffer_clear = cache_filled
             self.indexer.indexer_op(hidden_states, index_q, index_k, index_weights)
         if self.is_sparse:
             self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]

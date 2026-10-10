@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_GVR_PREFILL_TOPK: bool = False
     VLLM_SPARSE_MLA_PREFILL_WORKSPACE_FACTOR: float = 5.0
+    VLLM_HY4_PCP_PROLOGUE: Literal["auto", "1", "0"] = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1101,6 +1102,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buffer uses 8x this factor.
     "VLLM_SPARSE_MLA_PREFILL_WORKSPACE_FACTOR": lambda: float(
         os.getenv("VLLM_SPARSE_MLA_PREFILL_WORKSPACE_FACTOR", "5")
+    ),
+    # HY V4 PCP prefill: fused K norm/RoPE/quant + NVLS multicast in place of
+    # the all-gathers, and fused Q RoPE/indexer quant. "auto": on where
+    # supported; "1": required; "0": off. Decode, dense-MHA prefill and CUDA
+    # graph capture always use the unfused path.
+    "VLLM_HY4_PCP_PROLOGUE": env_with_choices(
+        "VLLM_HY4_PCP_PROLOGUE", "auto", ["auto", "1", "0"]
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

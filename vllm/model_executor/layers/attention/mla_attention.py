@@ -591,6 +591,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        # Set by models that fill the KV cache themselves (HY V4 PCP prologue).
+        self.skip_kv_cache_update = False
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -757,7 +759,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_scale: torch.Tensor,
     ) -> None:
         cache = self.hisparse_cache
-        if slot_mapping is None or (cache is not None and cache.dummy_batch):
+        if (
+            slot_mapping is None
+            or self.skip_kv_cache_update
+            or (cache is not None and cache.dummy_batch)
+        ):
             return
         kv_c_normed, k_pe, slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,

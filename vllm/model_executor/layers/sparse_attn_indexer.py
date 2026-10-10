@@ -941,6 +941,8 @@ class SparseAttnIndexer(CustomOp):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
+        # Set by callers that already reset topk_indices_buffer to -1.
+        self.skip_topk_buffer_clear = False
         self.use_fp4_cache = use_fp4_cache
         self.compress_ratio = compress_ratio
         # v4.1 two-level selection: the candidate source indexer writes the
@@ -1060,7 +1062,7 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
-            False,
+            self.skip_topk_buffer_clear,
             candidate_blocks=self.candidate_blocks,
             candidate_block_size=self.candidate_block_size,
             candidate_write=self.candidate_write,
