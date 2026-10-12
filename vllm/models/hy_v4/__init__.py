@@ -36,7 +36,13 @@ else:
 # The draft head has no ROCm-specific implementation yet.
 from .nvidia.mtp import HYV4MTP  # noqa: E402
 
+if TYPE_CHECKING or current_platform.is_cuda():
+    from .nvidia.vl_model import HYV4VLForConditionalGeneration
+else:
+    from .vl_stub import HYV4VLForConditionalGeneration  # type: ignore[assignment]
+
 __all__ = [
     "HYV4ForCausalLM",
     "HYV4MTP",
+    "HYV4VLForConditionalGeneration",
 ]

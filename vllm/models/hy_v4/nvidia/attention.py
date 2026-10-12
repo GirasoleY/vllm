@@ -253,6 +253,9 @@ class Indexer(nn.Module):
             and self.scale_fmt == "ue8m0"
             and current_platform.is_cuda()
             and not envs.VLLM_BATCH_INVARIANT
+            # The fused kernels index a 1D cos/sin cache per token; the
+            # multimodal mrope path needs the 2D-positions fallback below.
+            and positions.ndim != 2
         ):
             k = fused_indexer_k_norm_rope(
                 kw[:, : self.head_dim],
@@ -283,9 +286,10 @@ class Indexer(nn.Module):
             k, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
         )
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # RoPE (NeoX) can introduce extra leading dims, so flatten back to the
-        # token-major shapes.
+        if positions.ndim == 2:
+            q_pe, k_pe = rotary_emb(positions, q_pe.reshape(q.shape[0], -1), k_pe)
+        else:
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
         k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
@@ -821,6 +825,9 @@ class HYV4MLAAttention(nn.Module):
             self.kv_exchange
             if self.kv_exchange is not None
             and llama_4_scaling is None
+            # The fused prologue kernels apply RoPE from a 1D cos/sin cache;
+            # multimodal mrope requests fall back to _project_q_and_kv.
+            and positions.ndim != 2
             and self._is_sparse_mla_prefill(kv_lora.shape[0])
             else None
         )
@@ -1101,11 +1108,22 @@ class HYV4MLAAttention(nn.Module):
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        # Add a head dim of 1 to k_pe.
-        k_pe = k_pe.unsqueeze(1)
-        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim :], k_pe
-        )
+        if positions.ndim == 2:
+            q_pe, k_pe = self.rotary_emb(
+                positions,
+                q[..., self.qk_nope_head_dim :].reshape(q.shape[0], -1),
+                k_pe,
+            )
+            q[..., self.qk_nope_head_dim :] = q_pe.reshape(
+                q.shape[0], self.num_local_heads, self.qk_rope_head_dim
+            )
+            k_pe = k_pe.reshape(-1, 1, self.qk_rope_head_dim)
+        else:
+            # Add a head dim of 1 to k_pe.
+            k_pe = k_pe.unsqueeze(1)
+            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim :], k_pe
+            )
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling

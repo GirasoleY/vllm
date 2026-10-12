@@ -442,6 +442,10 @@ _MULTIMODAL_MODELS = {
         "Granite4VisionForConditionalGeneration",
     ),
     "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
+    "HYV4VLForConditionalGeneration": (
+        "vllm.models.hy_v4",
+        "HYV4VLForConditionalGeneration",
+    ),
     "InternVLChatModel": ("internvl", "InternVLChatModel"),
     "InternS1ForConditionalGeneration": (
         "interns1",
