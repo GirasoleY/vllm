@@ -271,6 +271,7 @@ def test_mtp_megamoe_loads_fp8_weights_and_block_scales(fused):
     from vllm.models.hy_v4.nvidia.mtp import HYV4MTP, _prepare_mtp_fp8_expert_scale
 
     config = SimpleNamespace(
+        max_num_tokens_per_rank=32,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
@@ -361,3 +362,91 @@ def test_fp8_megamoe_rejects_scales_that_would_change_draft_weights(scale):
         DeepseekV4MegaMoEExperts._prepare_routed_expert_scale(
             adapter, torch.full((1, 2, 2), scale)
         )
+
+
+@pytest.mark.parametrize("algorithm", ["MXFP4", "NONE", None, "FP8"])
+def test_mtp_megamoe_selects_checkpoint_packing(monkeypatch, algorithm):
+    """Packed MTP experts must not take the block-FP8 allocation path."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.hy_v4.nvidia import moe
+    from vllm.models.hy_v4.nvidia.mtp import _create_mtp_quant_config
+
+    backbone = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+        store_dtype="mxfp4",
+    )
+    config = SimpleNamespace(
+        mtp_quant_algo=algorithm,
+        quantization_config={"weight_block_size": [128, 128]},
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_hidden_dim=128,
+        hidden_size=128,
+        num_shared_experts=0,
+        route_norm=True,
+        swiglu_limit=10,
+    )
+    quant = _create_mtp_quant_config(config, backbone)
+    runtime = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
+        max_num_tokens_per_rank=32,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        moe,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+        ),
+    )
+    monkeypatch.setattr(moe, "GateLinear", lambda *a, **kw: torch.nn.Identity())
+    with set_current_vllm_config(runtime):
+        draft = moe.HYV4MoEFused(config, quant, is_mtp=True)
+    assert draft.use_mega_moe
+    packed = algorithm != "FP8"
+    expected = torch.full(
+        (128, 64 if packed else 128),
+        1,
+        dtype=torch.uint8 if packed else torch.float8_e4m3fn,
+    )
+    draft.experts.weight_loader(
+        draft.experts.w2_weight, expected, "experts.w2_weight", "w2", 0
+    )
+    torch.testing.assert_close(draft.experts.w2_weight[0], expected)
+    assert draft.experts.mma_type == ("fp8xfp4" if packed else "fp8xfp8")
+    assert backbone.store_dtype == "mxfp4"
+
+
+def test_mtp_mxfp4_rejects_incompatible_backbone():
+    from vllm.models.hy_v4.nvidia.mtp import _create_mtp_quant_config
+
+    with pytest.raises(ValueError, match="MXFP4 backbone"):
+        _create_mtp_quant_config(SimpleNamespace(mtp_quant_algo="MXFP4"), None)
+
+
+def test_mtp_mxfp4_preserves_packed_expert_scale_bytes():
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.hy_v4.nvidia.mtp import _prepare_mtp_fp8_expert_scale
+
+    quant = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+        store_dtype="mxfp4",
+    )
+    quant.is_scale_e8m0 = True
+    raw = torch.tensor([116, 127, 128], dtype=torch.uint8)
+    name, scale = _prepare_mtp_fp8_expert_scale(
+        quant, "model.layers.78.mtp_block.mlp.experts.0.down_proj.scale", raw
+    )
+    assert name.endswith(".weight_scale_inv")
+    assert scale.dtype == torch.uint8
+    torch.testing.assert_close(scale, raw)

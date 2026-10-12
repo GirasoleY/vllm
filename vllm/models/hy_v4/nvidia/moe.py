@@ -182,10 +182,16 @@ class HYV4MoEFused(nn.Module):
         fp8_weight_block_size = (
             quant_config.weight_block_size
             if isinstance(quant_config, Fp8Config)
+            and quant_config.store_dtype != "mxfp4"
             else None
         )
         fp8_mtp = is_mtp and self.tp_size == 1 and fp8_weight_block_size is not None
-        self.use_mega_moe = requested_mega_moe and (not is_mtp or fp8_mtp)
+        mxfp4_mtp = (
+            is_mtp
+            and self.tp_size == 1
+            and getattr(quant_config, "store_dtype", None) == "mxfp4"
+        )
+        self.use_mega_moe = requested_mega_moe and (not is_mtp or fp8_mtp or mxfp4_mtp)
         self.use_sequence_parallel = (
             self.use_mega_moe and not is_mtp and use_hyv4_sequence_parallel(vllm_config)
         )

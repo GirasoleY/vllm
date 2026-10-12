@@ -165,6 +165,7 @@ def _prepare_mtp_fp8_expert_scale(
         if (
             getattr(quant_config, "is_scale_e8m0", False)
             and loaded_weight.dtype == torch.uint8
+            and not (quant_config.store_dtype == "mxfp4" and ".mlp.experts." in name)
         ):
             # UE8M0 scale exponents are stored as raw uint8 bytes: reinterpret
             # the bits instead of numerically converting them.
@@ -180,7 +181,8 @@ def _create_mtp_quant_config(
 
     The MTP quantization algorithm is given by the ``mtp_quant_algo`` field in
     ``config.json``, independently of the backbone's quantization. Supported
-    values are ``"FP8"``, ``"NONE"`` (inherit the backbone) and ``"BF16"`` /
+    values are ``"FP8"``, ``"MXFP4"`` (packed backbone format),
+    ``"NONE"`` (inherit the backbone) and ``"BF16"`` /
     ``"FP16"`` (unquantized). A missing or ``"NONE"`` value falls back to the
     backbone config.
 
@@ -210,6 +212,17 @@ def _create_mtp_quant_config(
             "MTP layers are unquantized (mtp_quant_algo=%s).", mtp_quant_algo
         )
         return None
+
+    if mtp_quant_algo == "MXFP4":
+        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+        if not isinstance(backbone_quant_config, Fp8Config) or (
+            backbone_quant_config.store_dtype != "mxfp4"
+        ):
+            raise ValueError(
+                "MXFP4 MTP requires an MXFP4 backbone quantization config."
+            )
+        return backbone_quant_config
 
     if mtp_quant_algo == "FP8":
         from vllm.model_executor.layers.quantization.fp8 import Fp8Config
