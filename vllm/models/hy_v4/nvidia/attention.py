@@ -47,6 +47,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
+    fused_indexer_q_rope_quant as fused_indexer_q_rope_quant_mxfp4,
+)
 from vllm.models.hy_v4.nvidia.indexer_fusion import (
     fused_indexer_k_norm_rope,
     fused_indexer_q_rope_quant,
@@ -62,7 +65,10 @@ from vllm.utils.multi_stream_utils import execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    dsa_indexer_uses_fp4,
+)
 from vllm.v1.attention.ops.pcp import (
     HY4PCPKVExchange,
     init_hy4_pcp_kv_exchange,
@@ -202,11 +208,14 @@ class Indexer(nn.Module):
         self.quant_block_size = 128
         self.topk_indices_buffer = topk_indices_buffer
 
-        # FP8 naive cache: values in fp8 plus one fp32 scale per
-        # ``quant_block_size`` elements.
+        # FP8: values + one fp32 scale per ``quant_block_size``. MXFP4: packed
+        # E2M1 + one UE8M0 scale per 32.
+        self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
         assert cache_config is not None, "HYV4 indexer requires cache_config"
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
+            head_dim=self.head_dim // 2 + self.head_dim // 32
+            if self.use_fp4_kv
+            else self.head_dim + self.head_dim // self.quant_block_size * 4,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
@@ -226,6 +235,7 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            use_fp4_cache=self.use_fp4_kv,
         )
 
     def project_k_and_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -263,6 +273,19 @@ class Indexer(nn.Module):
                 positions,
                 rotary_emb,
             )
+            if self.use_fp4_kv:
+                # DeepSeek V4 kernel; same trailing interleaved RoPE.
+                assert not rotary_emb.is_neox_style
+                q_fp4, weights = fused_indexer_q_rope_quant_mxfp4(
+                    positions,
+                    q,
+                    rotary_emb.cos_sin_cache,
+                    kw[:, self.head_dim :].contiguous(),
+                    self.softmax_scale,
+                    self.n_head**-0.5,
+                    use_fp4=True,
+                )
+                return q_fp4, k, weights
             q_fp8, weights = fused_indexer_q_rope_quant(
                 positions,
                 q,

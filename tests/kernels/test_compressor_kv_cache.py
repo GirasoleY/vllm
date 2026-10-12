@@ -1410,6 +1410,43 @@ def test_indexer_quant_cache_roundtrip(num_tokens: int, block_size: int):
         )
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize("num_tokens", [1, 17, 300])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_indexer_mxfp4_quant_cache_roundtrip(num_tokens: int, block_size: int):
+    """MXFP4 K → indexer_k_quant_and_cache → cp_gather_indexer_k_quant_cache
+    → bit-exact against the MXFP4 reference."""
+    head_dim = 128
+    device = "cuda"
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    k = torch.randn(num_tokens + 3, head_dim, dtype=torch.bfloat16, device=device)
+    k[:, 7] *= 20  # outlier channel
+    slot_mapping = torch.arange(num_tokens + 3, dtype=torch.int64, device=device)
+    slot_mapping[num_tokens:] = -1
+    kv_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        head_dim // 2 + head_dim // 32,
+        dtype=torch.uint8,
+        device=device,
+    )
+    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, 32, "ue8m0")
+
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device)[None]
+    cu_seq_lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+    dst_k = torch.zeros(num_tokens, head_dim // 2, dtype=torch.uint8, device=device)
+    dst_scale = torch.zeros(
+        num_tokens, head_dim // 32, dtype=torch.uint8, device=device
+    )
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+    )
+
+    ref_k, ref_scale = quantize_to_mxfp4(k[:num_tokens])
+    assert torch.equal(dst_k, ref_k)
+    assert torch.equal(dst_scale, ref_scale)
+
+
 def test_indexer_gather_accepts_upper_bound_output():
     """Gather only exact cu_seq_lens even when dst is over-allocated."""
     head_dim = 128

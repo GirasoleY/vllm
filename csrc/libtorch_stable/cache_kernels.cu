@@ -679,6 +679,71 @@ __global__ void indexer_k_quant_and_cache_kernel(
   }
 }
 
+// E2M1 code of x, rounded like cvt.rn.satfinite.e2m1x2.f32 (ties to even).
+__device__ __forceinline__ uint8_t float_to_e2m1(float x) {
+  const float ax = fabsf(x);
+  const uint8_t code = ax <= 0.25f   ? 0
+                       : ax < 0.75f  ? 1
+                       : ax <= 1.25f ? 2
+                       : ax < 1.75f  ? 3
+                       : ax <= 2.5f  ? 4
+                       : ax < 3.5f   ? 5
+                       : ax <= 5.0f  ? 6
+                                     : 7;
+  return code | (signbit(x) ? 8 : 0);
+}
+
+// MXFP4 (DeepSeek V4 indexer layout): per cache block, block_size rows of
+// head_dim / 2 packed E2M1 (low nibble = even element), then block_size rows
+// of head_dim / 32 UE8M0 scales. 4 elements per thread, 8 threads per scale.
+template <typename scalar_t>
+__global__ void indexer_k_mxfp4_quant_and_cache_kernel(
+    const scalar_t* __restrict__ k,            // [num_tokens, head_dim]
+    uint8_t* __restrict__ kv_cache,            // [num_blocks, block_size, ...]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int head_dim, const int cache_block_size,
+    const int64_t cache_block_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+  const int d = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+  float x[4];
+  float amax = 0.0f;
+  for (int i = 0; i < 4; i++) {
+    x[i] = d < head_dim ? float(k[token_idx * head_dim + d + i]) : 0.0f;
+    amax = fmaxf(amax, fabsf(x[i]));
+  }
+  for (int mask = 4; mask > 0; mask /= 2) {
+#ifdef USE_ROCM
+    amax = fmaxf(amax, __shfl_xor_sync(uint64_t(-1), amax, mask));
+#else
+    amax = fmaxf(amax, __shfl_xor_sync(unsigned(-1), amax, mask));
+#endif
+  }
+  if (d >= head_dim) {
+    return;
+  }
+  // Scale 2^ceil(log2(amax / 6)), as in DeepSeek V4.
+  const float e =
+      fminf(fmaxf(ceilf(log2f(fmaxf(amax, 6.0f * 0x1p-126f) * (1.0f / 6.0f))),
+                  -127.0f),
+            127.0f);
+  const float inv_scale = 1.0f / exp2f(e);
+  uint8_t* page = kv_cache + (slot_idx / cache_block_size) * cache_block_stride;
+  const int64_t pos = slot_idx % cache_block_size;
+  uint8_t* vals = page + pos * (head_dim / 2) + d / 2;
+  vals[0] =
+      float_to_e2m1(x[0] * inv_scale) | (float_to_e2m1(x[1] * inv_scale) << 4);
+  vals[1] =
+      float_to_e2m1(x[2] * inv_scale) | (float_to_e2m1(x[3] * inv_scale) << 4);
+  if (threadIdx.x % 8 == 0) {
+    page[cache_block_size * (head_dim / 2) + pos * (head_dim / 32) + d / 32] =
+        static_cast<uint8_t>(e + 127.0f);
+  }
+}
+
 template <int BLOCK_Y_SIZE>
 __global__ void cp_gather_indexer_k_quant_cache_kernel(
     const char* __restrict__ kv_cache,  // [num_blocks, block_size,
@@ -1927,6 +1992,26 @@ void indexer_k_quant_and_cache(
                   "k and kv_cache must be on the same device");
   STD_TORCH_CHECK(k.device() == slot_mapping.device(),
                   "k and slot_mapping must be on the same device");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      k.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  // MXFP4 cache, identified by its entry size (as cp_gather does).
+  if (head_dim % 32 == 0 && kv_cache.size(2) == head_dim / 2 + head_dim / 32) {
+    dim3 grid(num_tokens, (head_dim + 127) / 128);
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+        k.scalar_type(), "indexer_k_mxfp4_quant_and_cache", [&] {
+          vllm::indexer_k_mxfp4_quant_and_cache_kernel<scalar_t>
+              <<<grid, 32, 0, stream>>>(
+                  reinterpret_cast<const scalar_t*>(k.data_ptr()),
+                  reinterpret_cast<uint8_t*>(kv_cache.data_ptr()),
+                  slot_mapping.const_data_ptr<int64_t>(), head_dim,
+                  cache_block_size, cache_block_stride);
+        });
+    return;
+  }
+
   STD_TORCH_CHECK(head_dim % quant_block_size == 0,
                   "head_dim must be divisible by quant_block_size");
 
@@ -1934,9 +2019,6 @@ void indexer_k_quant_and_cache(
   dim3 grid(num_tokens, (head_dim + quant_block_size * vec_size - 1) /
                             (quant_block_size * vec_size));
   dim3 block(32, vec_size);
-  const torch::stable::accelerator::DeviceGuard device_guard(
-      k.get_device_index());
-  const cudaStream_t stream = get_current_cuda_stream();
 
   static const std::string kv_cache_dtype = "fp8_e4m3";
   DISPATCH_BY_KV_CACHE_DTYPE(k.scalar_type(), kv_cache_dtype,
