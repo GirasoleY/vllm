@@ -82,6 +82,7 @@ from .attention import (
 )
 from .hc import CudaIHCPostPre, HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused, use_hyv4_sequence_parallel
+from .prefill import packed_fp8_kernel
 
 logger = init_logger(__name__)
 
@@ -261,13 +262,17 @@ class HYV4DecoderLayer(nn.Module):
             )
 
     def _run_self_attn(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[-1]]
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            hidden_states_quant=hidden_states_quant,
         )
         if self.use_sequence_parallel:
             hidden_states = sp_reduce_scatter(hidden_states)
@@ -326,6 +331,18 @@ class HYV4DecoderLayer(nn.Module):
         # Under iHC the residual is carried inside hidden_states.
         return hidden_states, None
 
+    def _attn_boundary(self, boundary: nn.Module, *args: torch.Tensor):
+        """Runs the iHC boundary before attention, appending attention's packed
+        FP8 input when the CUDA boundary can emit it (else None)."""
+        if (
+            isinstance(boundary, CudaIHCPostPre)
+            and not self.use_sequence_parallel
+            and packed_fp8_kernel(self.self_attn.fused_qkv_a_proj, args[0].shape[0])
+            is not None
+        ):
+            return boundary(*args, fp8_out=True)
+        return (*boundary(*args), None)
+
     def _forward_ihc_fused(
         self,
         positions: torch.Tensor,
@@ -340,13 +357,15 @@ class HYV4DecoderLayer(nn.Module):
 
         if carry is None:
             residual = self.hc_attn_layer.prepare_input(hidden_states)
-            hidden_states, post_gates = self.hpc_attn_pre_norm(residual)
+            hidden_states, post_gates, hidden_quant = self._attn_boundary(
+                self.hpc_attn_pre_norm, residual
+            )
         else:
-            residual, hidden_states, post_gates = self.hpc_attn_post_pre(
-                carry.mlp_out, carry.residual, carry.post_gates
+            residual, hidden_states, post_gates, hidden_quant = self._attn_boundary(
+                self.hpc_attn_post_pre, carry.mlp_out, carry.residual, carry.post_gates
             )
 
-        hidden_states = self._run_self_attn(positions, hidden_states)
+        hidden_states = self._run_self_attn(positions, hidden_states, hidden_quant)
         residual, hidden_states, post_gates = self.hpc_mlp_post_pre(
             hidden_states, residual, post_gates
         )
@@ -366,8 +385,10 @@ class HYV4DecoderLayer(nn.Module):
         assert self.hpc_mlp_post_pre is not None
 
         residual = self.hc_attn_layer.prepare_input(hidden_states)
-        hidden_states, post_gates = self.hpc_attn_pre_norm(residual)
-        hidden_states = self._run_self_attn(positions, hidden_states)
+        hidden_states, post_gates, hidden_quant = self._attn_boundary(
+            self.hpc_attn_pre_norm, residual
+        )
+        hidden_states = self._run_self_attn(positions, hidden_states, hidden_quant)
         residual, hidden_states, post_gates = self.hpc_mlp_post_pre(
             hidden_states, residual, post_gates
         )

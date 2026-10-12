@@ -334,7 +334,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "hy_v4_ihc_boundary(Tensor residual, Tensor? x, Tensor? post, "
       "Tensor weight, Tensor hc_scale, Tensor hc_base, Tensor? norm_weight, "
       "float magnitude, float hc_eps, float rms_eps, float variance_eps, "
-      "bool round_before_norm) -> (Tensor, Tensor, Tensor)");
+      "bool round_before_norm, bool fp8_out=False) -> "
+      "(Tensor, Tensor, Tensor, Tensor, Tensor)");
 
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
   ops.def(

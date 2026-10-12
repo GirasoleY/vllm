@@ -25,6 +25,10 @@
 // in FP32 into the norm (round_before_norm = false, FMA accumulation, as the
 // HPC library's fused kernel) or is rounded to BF16 first (round_before_norm =
 // true, no FMA, as the unfused path). The norm rounds once.
+//
+// With fp8_out, the finish kernel also quantizes the BF16 hidden state to FP8
+// with one UE8M0 scale per 128 channels, in the packed layout of
+// per_token_group_quant_fp8_packed_for_deepgemm (bitwise equal to it).
 
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
@@ -36,6 +40,7 @@
 #include "libtorch_stable/torch_utils.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -62,7 +67,9 @@ constexpr int kMaxHidden = kBlock * kVec * kMaxRowIters;
 constexpr int kSplitChoices[] = {96, 80, 64, 56, 48, 40, 32, 28,
                                  24, 20, 16, 8,  4,  2,  1};
 constexpr int kMaxSplits = 96;
-constexpr int kStatGroup = 16;  // threads per statistic in the finish kernel
+constexpr int kStatGroup = 16;    // threads per statistic in the finish kernel
+constexpr int kQuantGroup = 128;  // channels per FP8 scale
+constexpr float kFp8Max = 448.f;
 
 __device__ __forceinline__ void mma_bf16(float (&d)[4], uint32_t const (&a)[4],
                                          uint32_t b0, uint32_t b1) {
@@ -253,20 +260,60 @@ __launch_bounds__(kBlock, 4) __global__
   cudaTriggerProgrammaticLaunchCompletion();
 }
 
+// Quantizes this thread's 8 BF16 values; 16 consecutive threads hold one
+// 128-channel group. Same arithmetic as
+// per_token_group_quant_8bit_packed_register_kernel: scale = 2^ceil(log2(
+// max(amax, eps) / 448)), values clamped to +-448 and rounded to nearest.
+// The scale byte goes to [h / 512, tok] (int32 column-major, 4 per int32).
+__device__ __forceinline__ void quantize8(uint4 raw, int lane, int64_t tok,
+                                          int h, uint8_t* __restrict__ fp8_out,
+                                          uint8_t* __restrict__ scale_out,
+                                          int scale_stride, int hidden) {
+  float y[kVec];
+  unpack8(raw, y);
+  float amax = 1e-10f;
+#pragma unroll
+  for (int v = 0; v < kVec; v++) {
+    amax = fmaxf(amax, fabsf(y[v]));
+  }
+  unsigned const mask = 0xffffu << (lane & 16);
+#pragma unroll
+  for (int off = 8; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, off));
+  }
+  uint32_t const bits =
+      __float_as_uint(fmaxf(__fdiv_rn(amax, kFp8Max), 1e-10f));
+  uint32_t const exp = ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u);
+  float const inv = __uint_as_float((254u - exp) << 23);  // exact 1 / scale
+  uint2 q;
+  auto* p = reinterpret_cast<__nv_fp8x2_storage_t*>(&q);
+#pragma unroll
+  for (int v = 0; v < kVec / 2; v++) {
+    float2 const f =
+        make_float2(fminf(fmaxf(y[2 * v] * inv, -kFp8Max), kFp8Max),
+                    fminf(fmaxf(y[2 * v + 1] * inv, -kFp8Max), kFp8Max));
+    p[v] = __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+  }
+  *reinterpret_cast<uint2*>(fp8_out + tok * hidden + h) = q;
+  if ((lane & 15) == 0) {
+    int const group = h / kQuantGroup;
+    scale_out[((group / 4) * static_cast<int64_t>(scale_stride) + tok) * 4 +
+              group % 4] = static_cast<uint8_t>(exp);
+  }
+}
+
 // One CTA per token: gates, gated reduction and RMSNorm. Each thread keeps its
 // slice of the reduced row in registers, so the hidden state is written once.
-template <bool kFuseNorm, bool kRoundBeforeNorm>
-__launch_bounds__(kBlock) __global__
-    void ihc_finish_kernel(__nv_bfloat16 const* __restrict__ residual,
-                           float const* __restrict__ partials,
-                           float const* __restrict__ hc_scale,
-                           float const* __restrict__ hc_base,
-                           __nv_bfloat16 const* __restrict__ norm_weight,
-                           float* __restrict__ post_out,
-                           __nv_bfloat16* __restrict__ hidden_out,
-                           int num_tokens, int hidden, int num_splits,
-                           float magnitude, float hc_eps, float rms_eps,
-                           float var_eps) {
+template <bool kFuseNorm, bool kRoundBeforeNorm, bool kFp8Out>
+__launch_bounds__(kBlock) __global__ void ihc_finish_kernel(
+    __nv_bfloat16 const* __restrict__ residual,
+    float const* __restrict__ partials, float const* __restrict__ hc_scale,
+    float const* __restrict__ hc_base,
+    __nv_bfloat16 const* __restrict__ norm_weight, float* __restrict__ post_out,
+    __nv_bfloat16* __restrict__ hidden_out, uint8_t* __restrict__ fp8_out,
+    uint8_t* __restrict__ scale_out, int scale_stride, int num_tokens,
+    int hidden, int num_splits, float magnitude, float hc_eps, float rms_eps,
+    float var_eps) {
   cudaGridDependencySynchronize();
   int64_t const tok = blockIdx.x;
   int const tid = threadIdx.x;
@@ -378,7 +425,11 @@ __launch_bounds__(kBlock) __global__
         row[it][v] = row[it][v] * rnorm * nw[v];
       }
     }
-    *reinterpret_cast<uint4*>(hidden_out + tok * hidden + h) = pack8(row[it]);
+    uint4 const out = pack8(row[it]);
+    *reinterpret_cast<uint4*>(hidden_out + tok * hidden + h) = out;
+    if constexpr (kFp8Out) {
+      quantize8(out, lane, tok, h, fp8_out, scale_out, scale_stride, hidden);
+    }
   }
   cudaTriggerProgrammaticLaunchCompletion();
 }
@@ -430,16 +481,17 @@ inline StatsKernel pick_stats_kernel(int splits, bool has_post) {
 
 using FinishKernel = void (*)(__nv_bfloat16 const*, float const*, float const*,
                               float const*, __nv_bfloat16 const*, float*,
-                              __nv_bfloat16*, int, int, int, float, float,
-                              float, float);
+                              __nv_bfloat16*, uint8_t*, uint8_t*, int, int, int,
+                              int, float, float, float, float);
 
+template <bool kFp8Out>
 inline FinishKernel pick_finish_kernel(bool fuse_norm, bool round_before_norm) {
   if (fuse_norm) {
-    return round_before_norm ? ihc_finish_kernel<true, true>
-                             : ihc_finish_kernel<true, false>;
+    return round_before_norm ? ihc_finish_kernel<true, true, kFp8Out>
+                             : ihc_finish_kernel<true, false, kFp8Out>;
   }
-  return round_before_norm ? ihc_finish_kernel<false, true>
-                           : ihc_finish_kernel<false, false>;
+  return round_before_norm ? ihc_finish_kernel<false, true, kFp8Out>
+                           : ihc_finish_kernel<false, false, kFp8Out>;
 }
 
 inline bool split_fits(int64_t hidden, int splits) {
@@ -495,10 +547,12 @@ void launch_pdl(Kernel kernel, int grid, cudaStream_t stream, Args... args) {
 
 // residual: [M, 4, H] BF16. x: [M, H] BF16 and post: [M, 4] FP32 (both or
 // neither). weight: [8, 4 * H] FP32. Returns hidden [M, H] BF16, post gates
-// [M, 4] FP32 and, with a post step, the new residual [M, 4, H] BF16 (else an
-// empty tensor). Allocating here costs less host time than in Python.
+// [M, 4] FP32, with a post step the new residual [M, 4, H] BF16, and with
+// fp8_out the FP8 hidden [M, H] and its scales; tensors not produced are
+// empty. Allocating here costs less host time than in Python.
 // round_before_norm: see the rounding note at the top of the file.
-std::tuple<torch::stable::Tensor, torch::stable::Tensor, torch::stable::Tensor>
+std::tuple<torch::stable::Tensor, torch::stable::Tensor, torch::stable::Tensor,
+           torch::stable::Tensor, torch::stable::Tensor>
 hy_v4_ihc_boundary(torch::stable::Tensor const& residual,
                    std::optional<torch::stable::Tensor> const& x,
                    std::optional<torch::stable::Tensor> const& post,
@@ -507,7 +561,7 @@ hy_v4_ihc_boundary(torch::stable::Tensor const& residual,
                    torch::stable::Tensor const& hc_base,
                    std::optional<torch::stable::Tensor> const& norm_weight,
                    double magnitude, double hc_eps, double rms_eps,
-                   double variance_eps, bool round_before_norm) {
+                   double variance_eps, bool round_before_norm, bool fp8_out) {
   using namespace vllm::hy_v4_ihc;
   using torch::headeronly::ScalarType;
   bool const has_post = x.has_value();
@@ -521,6 +575,8 @@ hy_v4_ihc_boundary(torch::stable::Tensor const& residual,
   STD_TORCH_CHECK(hidden % 64 == 0 && hidden <= kMaxHidden,
                   "hy_v4_ihc_boundary: hidden must be a multiple of 64 and at "
                   "most 8192");
+  STD_TORCH_CHECK(!fp8_out || hidden % 512 == 0,
+                  "hy_v4_ihc_boundary: fp8_out needs hidden % 512 == 0");
   STD_TORCH_CHECK(residual.scalar_type() == ScalarType::BFloat16 &&
                       residual.is_contiguous(),
                   "hy_v4_ihc_boundary: residual must be contiguous BF16");
@@ -561,8 +617,17 @@ hy_v4_ihc_boundary(torch::stable::Tensor const& residual,
       torch::stable::new_empty(residual, {num_tokens, kHc}, ScalarType::Float);
   auto residual_out = torch::stable::new_empty(
       residual, {has_post ? num_tokens : 0, kHc, hidden});
+  // DeepGEMM's layout: scale [m, k / 512] with strides (1, m padded to 4).
+  int64_t const scale_m = fp8_out ? (num_tokens + 3) / 4 * 4 : 0;
+  auto fp8_hidden = torch::stable::new_empty(
+      residual, {fp8_out ? num_tokens : 0, hidden}, ScalarType::Float8_e4m3fn);
+  auto fp8_scale = torch::stable::transpose(
+      torch::stable::new_empty(residual, {fp8_out ? hidden / 512 : 0, scale_m},
+                               ScalarType::Int),
+      0, 1);
+  fp8_scale = torch::stable::narrow(fp8_scale, 0, 0, fp8_out ? num_tokens : 0);
   if (num_tokens == 0) {
-    return {hidden_out, post_out, residual_out};
+    return {hidden_out, post_out, residual_out, fp8_hidden, fp8_scale};
   }
   // 16-byte vector accesses.
   STD_TORCH_CHECK(aligned16(residual.data_ptr()) &&
@@ -597,8 +662,9 @@ hy_v4_ihc_boundary(torch::stable::Tensor const& residual,
       reinterpret_cast<float const*>(weight.data_ptr()), res_out, partials_ptr,
       m, h);
   launch_pdl(
-      pick_finish_kernel(fuse_norm, round_before_norm), m, stream,
-      has_post ? static_cast<__nv_bfloat16 const*>(res_out) : res_in,
+      fp8_out ? pick_finish_kernel<true>(fuse_norm, round_before_norm)
+              : pick_finish_kernel<false>(fuse_norm, round_before_norm),
+      m, stream, has_post ? static_cast<__nv_bfloat16 const*>(res_out) : res_in,
       static_cast<float const*>(partials_ptr),
       reinterpret_cast<float const*>(hc_scale.data_ptr()),
       reinterpret_cast<float const*>(hc_base.data_ptr()),
@@ -606,10 +672,13 @@ hy_v4_ihc_boundary(torch::stable::Tensor const& residual,
           ? reinterpret_cast<__nv_bfloat16 const*>(norm_weight->data_ptr())
           : nullptr,
       reinterpret_cast<float*>(post_out.mutable_data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(hidden_out.mutable_data_ptr()), m, h,
-      num_splits, static_cast<float>(magnitude), static_cast<float>(hc_eps),
+      reinterpret_cast<__nv_bfloat16*>(hidden_out.mutable_data_ptr()),
+      reinterpret_cast<uint8_t*>(fp8_hidden.mutable_data_ptr()),
+      reinterpret_cast<uint8_t*>(fp8_scale.mutable_data_ptr()),
+      static_cast<int>(scale_m), m, h, num_splits,
+      static_cast<float>(magnitude), static_cast<float>(hc_eps),
       static_cast<float>(rms_eps), static_cast<float>(variance_eps));
-  return {hidden_out, post_out, residual_out};
+  return {hidden_out, post_out, residual_out, fp8_hidden, fp8_scale};
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, m) {

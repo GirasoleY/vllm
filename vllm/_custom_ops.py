@@ -2423,16 +2423,25 @@ def hy_v4_ihc_boundary(
     rms_eps: float,
     variance_eps: float,
     round_before_norm: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fp8_out: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor] | None,
+]:
     """HY V4 iHC boundary: optional post step, then pre and RMSNorm.
 
-    Returns ``(residual, hidden_states, post_gates)``. With ``x`` and ``post``
-    the residual is a new tensor holding ``post * x + residual``; otherwise it
-    is the input residual. All inputs must be contiguous. The gated reduction
-    enters the norm in FP32, as in the HPC library's fused kernel, unless
-    ``round_before_norm`` rounds it to BF16 first, as the unfused path does.
+    Returns ``(residual, hidden_states, post_gates, hidden_fp8)``. With ``x``
+    and ``post`` the residual is a new tensor holding ``post * x + residual``;
+    otherwise it is the input residual. All inputs must be contiguous. The
+    gated reduction enters the norm in FP32, as in the HPC library's fused
+    kernel, unless ``round_before_norm`` rounds it to BF16 first, as the
+    unfused path does. With ``fp8_out``, ``hidden_fp8`` equals
+    ``per_token_group_quant_fp8_packed_for_deepgemm(hidden_states, 128)``;
+    otherwise it is None.
     """
-    hidden, post_out, residual_out = torch.ops._C.hy_v4_ihc_boundary(
+    hidden, post_out, residual_out, q, s = torch.ops._C.hy_v4_ihc_boundary(
         residual,
         x,
         post,
@@ -2445,8 +2454,14 @@ def hy_v4_ihc_boundary(
         rms_eps,
         variance_eps,
         round_before_norm,
+        fp8_out,
     )
-    return residual_out if x is not None else residual, hidden, post_out
+    return (
+        residual_out if x is not None else residual,
+        hidden,
+        post_out,
+        (q, s) if fp8_out else None,
+    )
 
 
 def topk_softmax(

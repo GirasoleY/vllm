@@ -792,7 +792,11 @@ class HYV4MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        *,
+        hidden_states_quant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """``hidden_states_quant``: ``hidden_states`` pre-quantized as ``(fp8,
+        packed UE8M0 scales)``, used instead of quantizing it here."""
         indexer = self.indexer if self.is_sparse and not self.skip_topk else None
         enable_multi_stream = (
             self.aux_stream is not None
@@ -815,7 +819,11 @@ class HYV4MLAAttention(nn.Module):
             fuse_gate_projection
             or packed_fp8_kernel(linear_gate, hidden_states.shape[0]) is not None
         ):
-            shared_input = qkv_kernel.quant_fp8(hidden_states)
+            shared_input = (
+                hidden_states_quant
+                if hidden_states_quant is not None
+                else qkv_kernel.quant_fp8(hidden_states)
+            )
 
         def side_projections() -> tuple[torch.Tensor | None, torch.Tensor | None]:
             indexer_kw = (

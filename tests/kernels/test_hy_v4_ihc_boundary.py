@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8_packed_for_deepgemm,
+)
 from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_post, triton_ihc_pre
 
 pytestmark = pytest.mark.skipif(
@@ -90,7 +93,7 @@ def test_boundary_matches_reference(
     if not with_norm:
         norm_weight = None
 
-    new_residual, hidden, gates = ops.hy_v4_ihc_boundary(
+    new_residual, hidden, gates, _ = ops.hy_v4_ihc_boundary(
         residual,
         xa,
         post,
@@ -140,3 +143,37 @@ def test_boundary_is_deterministic(num_tokens):
     for _ in range(3):
         for a, b in zip(first, ops.hy_v4_ihc_boundary(*args)):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 17, 130, 2051])
+@pytest.mark.parametrize("hidden_size", [2048, 6144])
+@pytest.mark.parametrize("with_post", [True, False])
+def test_fp8_out_matches_separate_quant(num_tokens, hidden_size, with_post):
+    xa, residual, post, weight, scale, base, norm_weight = _inputs(
+        num_tokens, hidden_size, offset_views=False
+    )
+    # Per-128-channel norm weights over many binades, so group scales differ.
+    norm_weight = (
+        (
+            norm_weight.float().view(-1, 128)
+            * torch.exp2(torch.randint(-8, 8, (hidden_size // 128, 1), device="cuda"))
+        )
+        .flatten()
+        .to(torch.bfloat16)
+    )
+    if not with_post:
+        xa = post = None
+    args = (residual, xa, post, weight, scale, base, norm_weight)
+    args += (MAGNITUDE, HC_EPS, NORM_EPS, VARIANCE_EPS)
+    plain = ops.hy_v4_ihc_boundary(*args)
+    fused = ops.hy_v4_ihc_boundary(*args, fp8_out=True)
+    assert plain[3] is None
+    for a, b in zip(plain[:3], fused[:3]):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    q, s = fused[3]
+    ref_q, ref_s = per_token_group_quant_fp8_packed_for_deepgemm(
+        fused[1], group_size=128, use_ue8m0=True
+    )
+    assert s.shape == ref_s.shape and s.stride() == ref_s.stride()
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s, ref_s)

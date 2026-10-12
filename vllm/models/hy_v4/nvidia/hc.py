@@ -425,14 +425,11 @@ class CudaIHCPostPre(nn.Module):
     def support(cls, hc_mult: int, hidden_size: int) -> bool:
         return ops.hy_v4_ihc_boundary_supported(hc_mult, hidden_size)
 
-    def _run(
-        self,
-        xa: torch.Tensor | None,
-        residual: torch.Tensor,
-        post_gates: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, *args: torch.Tensor, fp8_out: bool = False):
+        """``fp8_out`` appends the packed FP8 hidden state ``(fp8, scales)``."""
+        xa, residual, post_gates = (None, *args, None) if len(args) == 1 else args
         owner = self._pre_owner
-        return ops.hy_v4_ihc_boundary(
+        out = ops.hy_v4_ihc_boundary(
             residual if residual.is_contiguous() else residual.contiguous(),
             xa if xa is None or xa.is_contiguous() else xa.contiguous(),
             post_gates,
@@ -444,11 +441,7 @@ class CudaIHCPostPre(nn.Module):
             self.hc_eps,
             self.norm_eps,
             self._norm_owner.variance_epsilon,
+            fp8_out=fp8_out,
         )
-
-    def forward(self, *args: torch.Tensor):
-        if len(args) == 1:
-            _, hidden_states, post_gates = self._run(None, args[0], None)
-            return hidden_states, post_gates
-        xa, residual, post_gates = args
-        return self._run(xa, residual, post_gates)
+        out = out[1:] if xa is None else out
+        return out if fp8_out else out[:-1]
