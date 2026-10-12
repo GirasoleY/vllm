@@ -179,10 +179,15 @@ class HYV4MoEFused(nn.Module):
         requested_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        nvfp4 = getattr(quant_config, "store_dtype", None) == "nvfp4"
+        if nvfp4 and (not requested_mega_moe or is_mtp):
+            raise NotImplementedError(
+                "HYV4 NVFP4 currently requires deep_gemm_mega_moe without MTP"
+            )
         fp8_weight_block_size = (
             quant_config.weight_block_size
             if isinstance(quant_config, Fp8Config)
-            and quant_config.store_dtype != "mxfp4"
+            and quant_config.store_dtype not in ("mxfp4", "nvfp4")
             else None
         )
         fp8_mtp = is_mtp and self.tp_size == 1 and fp8_weight_block_size is not None
@@ -222,9 +227,13 @@ class HYV4MoEFused(nn.Module):
         self.moe_swiglu_limit = moe_swiglu_limit
         self.prefix = prefix
         if self.use_mega_moe:
-            if not fp8_mtp and getattr(quant_config, "store_dtype", None) != "mxfp4":
+            if (
+                not nvfp4
+                and not fp8_mtp
+                and getattr(quant_config, "store_dtype", None) != "mxfp4"
+            ):
                 raise ValueError(
-                    "HYV4 MegaMoE requires MXFP4 target or block-FP8 MTP weights."
+                    "HYV4 MegaMoE requires NVFP4/MXFP4 target or block-FP8 MTP weights."
                 )
             parallel_config = vllm_config.parallel_config
             if not parallel_config.enable_expert_parallel:
@@ -251,7 +260,12 @@ class HYV4MoEFused(nn.Module):
             fuse_shared_experts = self.shared_experts is not None and (
                 self.use_sequence_parallel or self.tp_size == 1
             )
-            self.experts = DeepseekV4MegaMoEExperts(
+            experts_cls = DeepseekV4MegaMoEExperts
+            if nvfp4:
+                from .nvfp4_moe import HYV4NVFP4MegaMoEExperts
+
+                experts_cls = HYV4NVFP4MegaMoEExperts
+            self.experts = experts_cls(
                 vllm_config,
                 num_experts=self.n_physical_experts,
                 num_local_experts=self.n_local_physical_experts,

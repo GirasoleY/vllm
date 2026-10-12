@@ -75,7 +75,7 @@ def test_hyv4_real_routing_matches_dequantized_reference(
     torch.manual_seed(1234 + rank)
     h, intermediate, experts, topk = 6144, 2048, 256, 8
     config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=max(32, tokens)),
+        max_num_tokens_per_rank=max(32, tokens),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     with torch.device("cuda"):
@@ -200,3 +200,145 @@ def test_hyv4_real_routing_matches_dequantized_reference(
     for key, value in list(adapter._symm_buffer_cache.items()):
         if value is buffer:
             del adapter._symm_buffer_cache[key]
+
+
+@pytest.mark.parametrize("shared_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("tokens", [17, 129])
+def test_hyv4_nvfp4_megamoe_matches_quantized_reference(
+    monkeypatch, ep_group, shared_dtype, tokens
+):
+    """Check global/block scales, both shared dtypes, padding and graph replay."""
+    from deep_gemm.utils.nvfp4 import cast_back_from_nvfp4, per_token_cast_to_nvfp4
+
+    from vllm.models.hy_v4.nvidia import nvfp4_moe as nv
+
+    monkeypatch.setattr(nv, "get_ep_group", lambda: ep_group)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    rank, world = dist.get_rank(), dist.get_world_size()
+    h, intermediate, experts, topk = 512, 256, 8, 4
+    torch.manual_seed(881 + rank)
+    config = SimpleNamespace(
+        max_num_tokens_per_rank=tokens,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with torch.device("cuda"), torch.no_grad():
+        adapter = nv.HYV4NVFP4MegaMoEExperts(
+            config,
+            num_experts=experts,
+            num_local_experts=experts // world,
+            experts_start_idx=rank * (experts // world),
+            top_k=topk,
+            hidden_size=h,
+            intermediate_size=intermediate,
+            num_shared_experts=1,
+            clamp_shared_experts=False,
+            prefix="model.layers.1.mlp.experts",
+        )
+        adapter.w13_weight.random_(0, 256)
+        adapter.w2_weight.random_(0, 256)
+        adapter.w13_weight_scale.fill_(1)
+        adapter.w2_weight_scale.fill_(1)
+        for e in range(experts // world):
+            adapter.w13_weight_scale_2[e].fill_((rank * 2 + e + 1) / 257)
+            adapter.w2_weight_scale_2[e] = (rank * 2 + e + 1) / 521
+        adapter.w13_input_scale.fill_((rank + 1) / 37)
+        adapter.w2_input_scale.fill_((rank + 1) / 11)
+        w13, w2 = adapter.w13_weight.clone(), adapter.w2_weight.clone()
+        scale13, scale2 = (
+            adapter.w13_weight_scale_2.clone(),
+            adapter.w2_weight_scale_2.clone(),
+        )
+        shared = SimpleNamespace()
+        # Replicated shared weights must be identical on every EP rank.
+        torch.manual_seed(918)
+        for name, n, k in (
+            ("gate_up_proj", 2 * intermediate, h),
+            ("down_proj", h, intermediate),
+        ):
+            raw = torch.randn(n, k) * (0.03 if shared_dtype == torch.bfloat16 else 2)
+            linear = SimpleNamespace(
+                weight=nn.Parameter(raw.to(shared_dtype), requires_grad=False)
+            )
+            if shared_dtype == torch.float8_e4m3fn:
+                linear.weight_block_size = (128, 128)
+                linear.weight_scale_inv = nn.Parameter(
+                    torch.full((n // 128, k // 128), 2**-6), requires_grad=False
+                )
+            setattr(shared, name, linear)
+        shared_weights = [
+            getattr(shared, n).weight.float().clone()
+            for n in ("gate_up_proj", "down_proj")
+        ]
+        if shared_dtype == torch.float8_e4m3fn:
+            shared_weights = [w * 2**-6 for w in shared_weights]
+        torch.manual_seed(713 + rank)
+        x = torch.randn(tokens, h, dtype=torch.bfloat16) * 16
+        scores = torch.randn(tokens, experts).sigmoid()
+        weights, ids = scores.topk(topk, -1)
+        weights = weights / weights.sum(-1, keepdim=True) * 2.827
+        ids[0, 0] = -1
+        weights[0, 0] = 0
+        adapter.finalize_weights(shared)
+
+        def nv_roundtrip(t, scale):
+            return cast_back_from_nvfp4(*per_token_cast_to_nvfp4(t, scale), scale)
+
+        def unpack(packed, scale):
+            values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+            codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+            return (
+                values[(codes & 7).long()]
+                * torch.where((codes & 8) != 0, -1, 1)
+                * scale
+            )
+
+        gathered = []
+        for value in (x, ids, weights):
+            parts = [torch.empty_like(value) for _ in range(world)]
+            dist.all_gather(parts, value)
+            gathered.append(torch.cat(parts))
+        gx, gi, gw = gathered
+        gx = nv_roundtrip(gx, adapter.input_global_scale.item())
+        ref = torch.zeros(world * tokens, h)
+        for e in range(experts // world):
+            rows, slots = torch.where(gi == rank * (experts // world) + e)
+            if not rows.numel():
+                continue
+            first = gx[rows] @ unpack(w13[e], scale13[e, 0]).T
+            gate, up = first.to(torch.bfloat16).float().chunk(2, -1)
+            mid = torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
+            mid = nv_roundtrip(mid * gw[rows, slots, None], adapter.l2_activation_scale)
+            ref.index_add_(
+                0, rows, (mid @ unpack(w2[e], scale2[e]).T).to(torch.bfloat16).float()
+            )
+        dist.all_reduce(ref)
+        ref = ref[rank * tokens : (rank + 1) * tokens]
+        sx = x.float() if shared_dtype == torch.bfloat16 else _fp8_roundtrip(x)
+        gate, up = (sx @ shared_weights[0].T).to(torch.bfloat16).float().chunk(2, -1)
+        mid = torch.nn.functional.silu(gate) * up
+        mid = (
+            mid.to(torch.bfloat16).float()
+            if shared_dtype == torch.bfloat16
+            else _fp8_roundtrip(mid)
+        )
+        ref += (mid @ shared_weights[1].T).to(torch.bfloat16).float()
+        ref = ref.to(torch.bfloat16).float()
+        output = adapter(x, weights, ids, activation_clamp=10)
+        relative_l2 = (output.float() - ref).norm() / ref.norm()
+        print(
+            f"NVFP4 rank={rank} shared={shared_dtype} tokens={tokens} "
+            f"relative_l2={relative_l2.item()}",
+            flush=True,
+        )
+        assert torch.isfinite(output).all()
+        assert relative_l2 < 0.005
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = adapter(x, weights, ids, activation_clamp=10)
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(graph_output, output, rtol=0, atol=0)
+        buffer = adapter.get_symm_buffer()
+        dist.barrier()
+        buffer.destroy()
+        adapter._nvfp4_buffer_cache.clear()

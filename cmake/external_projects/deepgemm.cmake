@@ -32,8 +32,8 @@ else()
   # Pinned to Inferact's hy4-fp8-shared-megamoe branch: vllm-project/DeepGEMM
   # dev (upstream 2.8.0 plus the SM120 port, the SM90 paged-MQA
   # kv_block=32/next_n=4 port, configurable SwiGLU alpha/beta, SiTU and NVFP4
-  # Mega MoE) plus an independent shared-expert clamp for FP8/FP4 Mega MoE.
-  set(_DEEPGEMM_UPSTREAM_TAG "11009aa5138cd0a1bd521377afe4fc6af7a92671")
+  # Mega MoE) plus an independent shared-expert clamp for FP8/MXFP4/NVFP4 Mega MoE.
+  set(_DEEPGEMM_UPSTREAM_TAG "7fd7aba51618666bdc465794d5ad3c7c73b481af")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)

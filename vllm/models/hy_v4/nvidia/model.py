@@ -264,7 +264,7 @@ class HYV4DecoderLayer(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[-1]]
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,

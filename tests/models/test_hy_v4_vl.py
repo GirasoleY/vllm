@@ -701,3 +701,25 @@ def test_hy_v4_encoder_cudagraph_manager_end_to_end(dist_init):
     stats = manager.get_cumulative_stats()
     assert stats["graph_hits"] == 3  # two image items + one video item
     assert stats["graph_misses"] == 1  # oversized video went eager
+
+
+@pytest.mark.parametrize("mrope", [False, True])
+def test_hy_v4_sequence_parallel_attention_uses_all_position_tokens(monkeypatch, mrope):
+    from vllm.models.hy_v4.nvidia import model
+
+    positions = torch.arange(7)
+    if mrope:
+        positions = positions.repeat(3, 1)
+    gathered = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+
+    def attention(*, positions, hidden_states):
+        assert hidden_states.shape == (7, 4)
+        return hidden_states + 1
+
+    layer = SimpleNamespace(use_sequence_parallel=True, self_attn=attention)
+    monkeypatch.setattr(model, "sp_all_gather", lambda _: gathered)
+    scatter = Mock(side_effect=lambda x: x[:2])
+    monkeypatch.setattr(model, "sp_reduce_scatter", scatter)
+    output = model.HYV4DecoderLayer._run_self_attn(layer, positions, gathered[:2])
+    torch.testing.assert_close(scatter.call_args.args[0], gathered[:7] + 1)
+    torch.testing.assert_close(output, gathered[:2] + 1)

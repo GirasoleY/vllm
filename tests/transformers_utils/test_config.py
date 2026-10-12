@@ -420,3 +420,35 @@ def test_mrope_num_dims_from_nested_rope_parameters():
 
 def test_mrope_num_dims_without_mrope():
     assert mrope_num_dims(PretrainedConfig()) == 0
+
+
+@pytest.mark.parametrize("has_nvfp4", [False, True])
+def test_hy_v4_vl_internal_mixed_quantization_metadata(tmp_path, has_nvfp4):
+    import json
+
+    from vllm.transformers_utils.config import get_config
+
+    config: dict = {
+        "model_type": "hy_v4_vl_internal",
+        "architectures": ["HYV4VLForConditionalGeneration"],
+        "hidden_size": 6144,
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["model.layers.1.mlp.shared_experts.gate_proj"],
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if has_nvfp4:
+        (tmp_path / "hf_quant_config.json.nvfp4").write_text(
+            json.dumps({"quantization": {"quant_algo": "NVFP4", "group_size": 16}})
+        )
+    actual = get_config(str(tmp_path), trust_remote_code=False)
+    q = actual.quantization_config
+    assert q.get("store_dtype") == ("nvfp4" if has_nvfp4 else None)
+    assert q["quant_method"] == "fp8"
+    assert (
+        q["modules_to_not_convert"]
+        == config["quantization_config"]["modules_to_not_convert"]
+    )

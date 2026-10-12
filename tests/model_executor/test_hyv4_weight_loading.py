@@ -450,3 +450,50 @@ def test_mtp_mxfp4_preserves_packed_expert_scale_bytes():
     assert name.endswith(".weight_scale_inv")
     assert scale.dtype == torch.uint8
     torch.testing.assert_close(scale, raw)
+
+
+def test_nvfp4_megamoe_loads_packed_weights_and_both_scale_levels(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import (
+        fused_moe_make_expert_params_mapping,
+    )
+    from vllm.models.hy_v4.nvidia import model
+    from vllm.models.hy_v4.nvidia.nvfp4_moe import HYV4NVFP4MegaMoEExperts
+
+    adapter = HYV4NVFP4MegaMoEExperts(
+        SimpleNamespace(
+            max_num_tokens_per_rank=32,
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        ),
+        num_experts=2,
+        num_local_experts=1,
+        experts_start_idx=1,
+        top_k=1,
+        hidden_size=128,
+        intermediate_size=128,
+    )
+    prefix = "layers.1.mlp.experts."
+    backbone = _backbone(
+        monkeypatch, model, [(prefix + k, p) for k, p in adapter.named_parameters()]
+    )
+    backbone.get_expert_mapping = lambda: fused_moe_make_expert_params_mapping(
+        adapter, "gate_proj", "down_proj", "up_proj", 2, routed_experts_prefix=""
+    )
+    weights = []
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for name, value in (
+            ("weight", torch.full((128, 64), 0x76, dtype=torch.uint8)),
+            ("weight_scale", torch.full((128, 8), 1.5, dtype=torch.float8_e4m3fn)),
+            ("weight_scale_2", torch.tensor(0.03125)),
+            ("input_scale", torch.tensor(0.0625)),
+        ):
+            weights.append((f"{prefix}1.{proj}.{name}", value))
+    loaded = model.HYV4Model.load_weights(backbone, weights)
+    assert loaded == {prefix + k for k, _ in adapter.named_parameters()}
+    assert (adapter.w13_weight == 0x76).all()
+    assert (adapter.w2_weight == 0x76).all()
+    assert (adapter.w13_weight_scale.float() == 1.5).all()
+    assert (adapter.w2_weight_scale.float() == 1.5).all()
+    assert (adapter.w13_weight_scale_2 == 0.03125).all()
+    assert (adapter.w2_weight_scale_2 == 0.03125).all()
+    assert (adapter.w13_input_scale == 0.0625).all()
+    assert (adapter.w2_input_scale == 0.0625).all()

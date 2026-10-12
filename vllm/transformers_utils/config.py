@@ -921,9 +921,26 @@ def get_config(
         )
 
     if quantization_config is not None:
+        if (
+            "HYV4VLForConditionalGeneration" in (config.architectures or [])
+            and quantization_config.get("quant_method") == "fp8"
+            and file_or_path_exists(model, "hf_quant_config.json.nvfp4", revision)
+        ):
+            nvfp4_config = (
+                get_hf_file_to_dict("hf_quant_config.json.nvfp4", model, revision) or {}
+            )
+            recipe = nvfp4_config.get("quantization", {})
+            if recipe.get("quant_algo") == "NVFP4":
+                if recipe.get("group_size") != 16:
+                    raise ValueError("HYV4 NVFP4 requires group_size=16")
+                if quantization_config.get("store_dtype") not in (None, "nvfp4"):
+                    raise ValueError(
+                        "Conflicting HYV4 routed-expert quantization metadata"
+                    )
+                quantization_config = {**quantization_config, "store_dtype": "nvfp4"}
         config.quantization_config = quantization_config
         # auto-enable DeepGEMM UE8M0 if model config requests it
-        scale_fmt = quantization_config.get("scale_fmt", None)
+        scale_fmt = quantization_config.get("scale_fmt")
         if scale_fmt in ("ue8m0",):
             if not envs.is_set("VLLM_USE_DEEP_GEMM_E8M0"):
                 os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "1"
