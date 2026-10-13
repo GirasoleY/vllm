@@ -20,6 +20,8 @@ from vllm.v1.worker.gpu.input_batch import (
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+    from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
 
@@ -140,7 +142,23 @@ class PCPManager:
                 "MRV2 PCP does not support encoder-decoder models yet."
             )
         if supports_mm_inputs:
-            raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
+            # Encoder outputs are merged per local segment and M-RoPE positions
+            # are gathered from the global batch (prepare_model_state_inputs).
+            # These input transforms still assume a request's full query is
+            # local to the rank.
+            if model_config.enable_prompt_embeds:
+                raise NotImplementedError(
+                    "MRV2 PCP does not support prompt embeddings yet."
+                )
+            mm_config = model_config.multimodal_config
+            if mm_config is not None and mm_config.is_multimodal_pruning_enabled():
+                raise NotImplementedError(
+                    "MRV2 PCP does not support multimodal pruning yet."
+                )
+            if model_config.is_mm_prefix_lm:
+                raise NotImplementedError(
+                    "MRV2 PCP does not support multimodal prefix LMs yet."
+                )
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
         speculative_config = vllm_config.speculative_config
@@ -801,6 +819,39 @@ class PCPManager:
     ) -> tuple[torch.Tensor, InputBatch]:
         assert self._global_batch is not None
         return self.restore_hidden_states(hidden_states), self._global_batch
+
+    def prepare_model_state_inputs(
+        self,
+        model_state: "ModelState",
+        input_batch: InputBatch,
+        req_states: "RequestState",
+    ) -> dict[str, torch.Tensor | None]:
+        """Model-state inputs for the PCP-local batch.
+
+        Multi-dimensional (M-RoPE) positions are computed for the global batch,
+        whose rows cover each request's full scheduled range from the GPU
+        request-state cursor, and this rank's columns are then gathered the
+        same way partition_batch gathers the 1-D positions. Model states
+        without M-RoPE are prepared from the local batch directly.
+        """
+        rope_state = getattr(model_state, "rope_state", None)
+        if (
+            rope_state is None
+            or input_batch is not self._local_batch
+            or self._global_batch is None
+        ):
+            return model_state.prepare_inputs(input_batch, req_states)
+
+        inputs = model_state.prepare_inputs(self._global_batch, req_states)
+        assert self._local_gather_idx is not None
+        local_positions = inputs["positions"].index_select(1, self._local_gather_idx)
+        num_tokens = local_positions.shape[1]
+        local_positions.masked_fill_(input_batch.is_padding[:num_tokens], 0)
+        # Return a view of the persistent buffer, as the non-PCP path does.
+        positions = rope_state.get_positions(num_tokens)
+        positions.copy_(local_positions)
+        inputs["positions"] = positions
+        return inputs
 
 
 def maybe_partition_pcp_batch(

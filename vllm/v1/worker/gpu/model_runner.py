@@ -673,6 +673,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.max_num_reqs,
         )
         if self.speculator is not None:
+            if self.pcp_manager is not None and self.speculator.supports_mm_inputs:
+                raise NotImplementedError(
+                    "MRV2 PCP does not support drafters that take multimodal "
+                    "embeddings yet."
+                )
             self.speculator.pcp_manager = self.pcp_manager
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
@@ -1898,7 +1903,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **(
+                self.model_state.prepare_inputs(input_batch, self.req_states)
+                if self.pcp_manager is None
+                else self.pcp_manager.prepare_model_state_inputs(
+                    self.model_state, input_batch, self.req_states
+                )
+            ),
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.

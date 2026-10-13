@@ -36,6 +36,11 @@ def _make_config(cudagraph_mode: CUDAGraphMode):
             use_mla=True,
             is_encoder_decoder=False,
             hf_text_config=SimpleNamespace(),
+            enable_prompt_embeds=False,
+            multimodal_config=SimpleNamespace(
+                is_multimodal_pruning_enabled=lambda: False
+            ),
+            is_mm_prefix_lm=False,
         ),
         lora_config=None,
         speculative_config=None,
@@ -67,6 +72,38 @@ def _make_capture_manager(block_table: torch.Tensor):
 )
 def test_validate_config_accepts_decode_only_full_graphs(cudagraph_mode):
     PCPManager.validate_config(_make_config(cudagraph_mode), supports_mm_inputs=False)
+
+
+def test_validate_config_accepts_mm_inputs():
+    PCPManager.validate_config(
+        _make_config(CUDAGraphMode.NONE), supports_mm_inputs=True
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported,match",
+    [
+        ({"enable_prompt_embeds": True}, "prompt embeddings"),
+        (
+            {
+                "multimodal_config": SimpleNamespace(
+                    is_multimodal_pruning_enabled=lambda: True
+                )
+            },
+            "multimodal pruning",
+        ),
+        ({"is_mm_prefix_lm": True}, "prefix LMs"),
+    ],
+)
+def test_validate_config_rejects_unsupported_mm_inputs(unsupported, match):
+    config = _make_config(CUDAGraphMode.NONE)
+    config.model_config = SimpleNamespace(
+        **{**vars(config.model_config), **unsupported}
+    )
+    with pytest.raises(NotImplementedError, match=match):
+        PCPManager.validate_config(config, supports_mm_inputs=True)
+    # Text-only models do not take these inputs through the MM path.
+    PCPManager.validate_config(config, supports_mm_inputs=False)
 
 
 def test_validate_config_rejects_full_graph_for_prefills():
@@ -605,3 +642,148 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     )
     assert local_batch.dcp_local_seq_lens is not None
     assert torch.equal(local_batch.dcp_local_seq_lens.cpu(), expected)
+
+
+def _make_global_mixed_batch(
+    query_lens: list[int],
+    num_computed_tokens: list[int],
+    prefill_lens: list[int],
+    buffers: InputBuffers,
+    device: torch.device,
+) -> InputBatch:
+    """A global batch of prefills and decodes as `prepare_inputs` would build it."""
+    num_reqs = len(query_lens)
+    query_lens_np = np.asarray(query_lens, dtype=np.int32)
+    num_computed_np = np.asarray(num_computed_tokens, dtype=np.int32)
+    num_tokens = int(query_lens_np.sum())
+    query_start_loc_np = np.zeros(num_reqs + 1, dtype=np.int32)
+    np.cumsum(query_lens_np, out=query_start_loc_np[1:])
+    seq_lens_np = num_computed_np + query_lens_np
+    positions_np = np.concatenate(
+        [np.arange(c, c + q) for c, q in zip(num_computed_np, query_lens_np)]
+    )
+
+    base = InputBatch.make_dummy(num_reqs, num_tokens, buffers)
+    buffers.seq_lens[:num_reqs] = torch.from_numpy(seq_lens_np).to(device)
+    buffers.positions[:num_tokens] = torch.from_numpy(positions_np).to(device)
+    buffers.input_ids[:num_tokens] = torch.arange(num_tokens, device=device)
+    buffers.query_start_loc[: num_reqs + 1] = torch.from_numpy(query_start_loc_np).to(
+        device
+    )
+    buffers.is_padding[:num_tokens] = False
+    return replace(
+        base,
+        req_ids=[f"req_{i}" for i in range(num_reqs)],
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_reqs,
+        idx_mapping=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        idx_mapping_np=np.arange(num_reqs, dtype=np.int32),
+        num_scheduled_tokens=query_lens_np,
+        num_tokens=num_tokens,
+        num_tokens_after_padding=num_tokens,
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=np.zeros(num_reqs, dtype=np.int32),
+        query_start_loc=buffers.query_start_loc[: num_reqs + 1],
+        query_start_loc_np=query_start_loc_np,
+        seq_lens=buffers.seq_lens[:num_reqs],
+        seq_lens_cpu_upper_bound=torch.from_numpy(seq_lens_np),
+        dcp_local_seq_lens=None,
+        num_computed_tokens_np=num_computed_np,
+        prefill_len_np=np.asarray(prefill_lens, dtype=np.int32),
+        num_computed_prefill_tokens_np=np.minimum(
+            num_computed_np, np.asarray(prefill_lens, dtype=np.int32)
+        ),
+        is_prefilling_np=num_computed_np < np.asarray(prefill_lens, dtype=np.int32),
+        input_ids=buffers.input_ids[:num_tokens],
+        positions=buffers.positions[:num_tokens],
+        is_padding=buffers.is_padding[:num_tokens],
+        prompt_lens=None,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU kernels")
+@pytest.mark.parametrize("pcp_rank", [0, 1])
+def test_mrope_positions_follow_local_segments(pcp_rank):
+    """Each local token gets the M-RoPE position of its own global token.
+
+    A split prefill gives a rank chunks from the middle of the prompt, so the
+    positions must not restart at the request's first scheduled token.
+    """
+    from vllm.v1.worker.gpu.mm.rope import RopeState
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    device = torch.device("cuda:0")
+    max_num_reqs, max_num_tokens, max_model_len = 4, 32, 64
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=pcp_rank,
+        device=device,
+        max_num_reqs=max_num_reqs,
+        max_num_tokens=max_num_tokens,
+    )
+    rope_state = RopeState(
+        num_dims=3,
+        max_num_reqs=max_num_reqs,
+        max_num_tokens=max_num_tokens,
+        max_model_len=max_model_len,
+        device=device,
+    )
+    # Request 0 prefills a 16-token prompt that starts with an image-like
+    # (t, h, w) grid; request 1 decodes with an M-RoPE delta.
+    table = torch.stack(
+        [torch.arange(max_model_len) + 1000 * (j + 1) for j in range(3)]
+    ).to(torch.int32)
+    rope_state.prefill_positions.gpu[0:3, :].copy_(table)
+    rope_state.prefill_delta.np[:2] = [0, -5]
+    rope_state.prefill_delta.copy_to_uva()
+    prefill_lens = [16, 10]
+    num_computed = [0, 20]
+    req_states = SimpleNamespace(
+        prefill_len=SimpleNamespace(
+            gpu=torch.tensor(prefill_lens + [0, 0], dtype=torch.int32, device=device)
+        ),
+        num_computed_tokens=SimpleNamespace(
+            gpu=torch.tensor(num_computed + [0, 0], dtype=torch.int32, device=device)
+        ),
+    )
+    model_state = SimpleNamespace(rope_state=rope_state)
+    model_state.prepare_inputs = lambda batch, states: DefaultModelState.prepare_inputs(
+        model_state, batch, states
+    )
+
+    global_buffers = InputBuffers(max_num_reqs, max_num_tokens, device)
+    global_batch = _make_global_mixed_batch(
+        [16, 1], num_computed, prefill_lens, global_buffers, device
+    )
+    local_batch = manager.partition_batch(
+        global_batch, padded_num_tokens=12, padded_num_reqs=max_num_reqs
+    )
+    positions = manager.prepare_model_state_inputs(
+        model_state, local_batch, req_states
+    )["positions"]
+
+    num_tokens = local_batch.num_tokens_after_padding
+    assert positions.shape == (3, num_tokens)
+    assert positions.data_ptr() == rope_state.positions.data_ptr()
+    local_1d = local_batch.positions.cpu()
+    is_padding = local_batch.is_padding.cpu()
+    local_req = torch.repeat_interleave(
+        torch.from_numpy(local_batch.idx_mapping_np[: local_batch.num_reqs]).long(),
+        torch.from_numpy(
+            local_batch.num_scheduled_tokens[: local_batch.num_reqs]
+        ).long(),
+    )
+    expected = torch.zeros(3, num_tokens, dtype=torch.int64)
+    for k in range(local_batch.num_tokens):
+        pos = int(local_1d[k])
+        if local_req[k] == 0:
+            expected[:, k] = table[:, pos]
+        else:
+            expected[:, k] = pos - 5
+    assert not is_padding[: local_batch.num_tokens].any()
+    assert is_padding[local_batch.num_tokens :].all()
+    torch.testing.assert_close(positions.cpu(), expected)
+    # Rank 1 receives the middle of the prompt, so its prefill rows must not
+    # start at position 0.
+    if pcp_rank == 1:
+        assert local_1d[: local_batch.num_tokens][local_req == 0].min() > 0
