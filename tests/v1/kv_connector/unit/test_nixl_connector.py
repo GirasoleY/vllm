@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    compat_backend_name,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_transfer_state import (
@@ -3503,6 +3504,39 @@ def _set_test_speculative_config(
         attention_backend=attention_backend,
         use_eagle=lambda: True,
     )
+
+
+class _IndexerBackend:
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_V32_INDEXER"
+
+
+class _SparseMLABackend:
+    @staticmethod
+    def get_name() -> str:
+        return "FLASHMLA_SPARSE"
+
+
+@pytest.mark.skip_global_cleanup
+def test_compatibility_hash_ignores_backend_order():
+    # HY4 PP4 prefill: the stage holding layer 0 lists the indexer backend
+    # first, the later stages list sparse MLA first, and the PP=1 decode
+    # matches stage 0. All of them must hash alike, or the decode rejects
+    # every handshake with stages 1-3.
+    config = create_vllm_config()
+    stage0 = compat_backend_name([_IndexerBackend, _SparseMLABackend])
+    later_stage = compat_backend_name([_SparseMLABackend, _IndexerBackend])
+
+    assert compute_nixl_compatibility_hash(
+        config, stage0
+    ) == compute_nixl_compatibility_hash(config, later_stage)
+
+
+@pytest.mark.skip_global_cleanup
+def test_compatibility_backend_name_of_single_backend_model():
+    # A single-backend model hashes the bare backend name, as before.
+    assert compat_backend_name([_SparseMLABackend]) == "FLASHMLA_SPARSE"
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionBackend
 
 logger = init_logger(__name__)
 
@@ -48,8 +50,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  10: Add dense virtual transfer pages for compressed MLA caches
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
+#  13: Hash the set of attention backends rather than the first one
 #
-NIXL_CONNECTOR_VERSION: int = 12
+NIXL_CONNECTOR_VERSION: int = 13
 
 
 @dataclass
@@ -91,6 +94,17 @@ class NixlHandshakePayload(KVConnectorHandshakeMetadata):
 
     compatibility_hash: str
     agent_metadata_bytes: bytes  # NixlAgentMetadata encoded
+
+
+def compat_backend_name(attn_backends: Iterable[type[AttentionBackend]]) -> str:
+    """Name a worker's attention backends for the compatibility hash.
+
+    The name does not depend on the backends' order: a pipeline stage lists
+    them in the order of its first layers, so stages of one model (and a
+    PP=1 peer) can disagree on which backend comes first. A single-backend
+    model gets just that backend's name.
+    """
+    return ",".join(sorted({backend.get_name() for backend in attn_backends}))
 
 
 def _get_speculative_compatibility_factors(

@@ -47,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
     ReqMeta,
     TransferHandle,
+    compat_backend_name,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
@@ -1401,7 +1402,7 @@ class NixlBaseConnectorWorker:
         )
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config,
-            self.backend_name,
+            compat_backend_name(self.attn_backends),
             transfer_mode=self._TRANSFER_MODE,
         )
 
