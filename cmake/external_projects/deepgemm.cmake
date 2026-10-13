@@ -132,6 +132,10 @@ if(DEEPGEMM_ARCHS)
     "${deepgemm_SOURCE_DIR}/third-party/deep_jit/include/*.h"
     "${deepgemm_SOURCE_DIR}/third-party/deep_jit/include/*.hpp")
 
+  # The custom command bypasses CMake's compiler rules, so forward the CXX
+  # launcher (sccache/ccache, set by setup.py) for the driver to apply itself.
+  string(REPLACE ";" " " _dg_cxx_launcher "${CMAKE_CXX_COMPILER_LAUNCHER}")
+
   set(_dg_markers)
   set(_dg_seen_soabis)
   foreach(_pybin IN LISTS _dg_pythons)
@@ -150,7 +154,9 @@ if(DEEPGEMM_ARCHS)
     set(_dg_marker "${_dg_dir}/.built")
     add_custom_command(
       OUTPUT "${_dg_marker}"
-      COMMAND "${Python_EXECUTABLE}"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "DEEPGEMM_CXX_LAUNCHER=${_dg_cxx_launcher}"
+              "${Python_EXECUTABLE}"
               "${CMAKE_SOURCE_DIR}/tools/build_deepgemm_C.py"
               "${deepgemm_SOURCE_DIR}" "${_dg_dir}" "${_pybin}"
       COMMAND "${CMAKE_COMMAND}" -E touch "${_dg_marker}"

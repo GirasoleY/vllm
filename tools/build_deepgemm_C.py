@@ -6,11 +6,16 @@ Driven from cmake/external_projects/deepgemm.cmake. The driver runs against
 the build interpreter's torch; <TARGET_PY> is only consulted for INCLUDEPY
 and SOABI, so target venvs don't need torch installed.
 
+The source is compiled to an object file and linked in a separate step so a
+compiler launcher (DEEPGEMM_CXX_LAUNCHER, e.g. sccache or ccache) can cache
+the compilation; launchers cannot cache a combined compile-and-link command.
+
 Usage: python build_deepgemm_C.py <DEEPGEMM_SRC_DIR> <OUTPUT_DIR> <TARGET_PY>
 """
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -54,9 +59,14 @@ includes = [
     *cpp_extension.include_paths(device_type="cuda"),
 ]
 
-cmd = [
-    os.environ.get("CXX", "g++"),
-    "-shared",
+cxx = os.environ.get("CXX", "g++")
+launcher = shlex.split(os.environ.get("DEEPGEMM_CXX_LAUNCHER", ""))
+obj = out / "python_api.o"
+
+compile_cmd = [
+    *launcher,
+    cxx,
+    "-c",
     "-fPIC",
     "-std=c++20",
     "-O3",
@@ -68,6 +78,13 @@ cmd = [
     f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
     *(f"-I{p}" for p in includes),
     str(src / "csrc/python_api.cpp"),
+    "-o",
+    str(obj),
+]
+link_cmd = [
+    cxx,
+    "-shared",
+    str(obj),
     *(f"-L{p}" for p in cpp_extension.library_paths(device_type="cuda")),
     f"-L{cuda_home}/lib64",
     "-ltorch",
@@ -81,5 +98,7 @@ cmd = [
     "-o",
     str(out / f"_C{info['EXT_SUFFIX']}"),
 ]
-print("[build_deepgemm_C] " + " ".join(cmd), flush=True)
-subprocess.check_call(cmd)
+for cmd in (compile_cmd, link_cmd):
+    print("[build_deepgemm_C] " + " ".join(cmd), flush=True)
+    subprocess.check_call(cmd)
+obj.unlink()
