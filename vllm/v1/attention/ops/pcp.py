@@ -75,7 +75,8 @@ class HY4PCPKVExchange(DirectCPWorkspace):
         self.inputs_ready.record()
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(self.inputs_ready)
-            for t in (kv_lora, index_k, positions):
+            # cos/sin may be a per-step M-RoPE table, not a persistent cache.
+            for t in (kv_lora, index_k, positions, cos_sin_cache, index_cos_sin_cache):
                 if t is not None:
                     t.record_stream(self.stream)
             torch.ops._C.hy4_pcp_kv_norm_rope_quant_multicast(

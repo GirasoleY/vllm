@@ -44,7 +44,12 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
+from vllm.model_executor.layers.rotary_embedding import (
+    MRotaryEmbedding,
+    RotaryEmbedding,
+    get_rope,
+)
+from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
@@ -84,6 +89,48 @@ _SPARSE_LAYER_TYPES = (
     "indexed_attention",
 )
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def set_token_rope(
+    rotary_emb: nn.Module, positions: torch.Tensor, x: torch.Tensor
+) -> None:
+    """Build this forward's per-token M-RoPE cos/sin rows once, before the
+    layers run; ``token_rope`` reads them. ``x`` sets the cache dtype."""
+    if positions.ndim == 1:
+        rotary_emb._hy4_token_rope = None
+        return
+    sel = getattr(rotary_emb, "_hy4_mrope_sel", None)
+    if sel is None:
+        # T/H/W position row of each cos/sin channel, via vLLM's M-RoPE layout.
+        sec = rotary_emb.mrope_section
+        ids = torch.arange(3, device=positions.device)[:, None].expand(3, sum(sec))
+        if rotary_emb.mrope_interleaved:
+            sel = apply_interleaved_rope(ids, sec)
+        else:
+            sel = torch.cat([m[i] for i, m in enumerate(ids.split(sec, dim=-1))])
+        sel = rotary_emb._hy4_mrope_sel = sel.repeat(2)
+    num_tokens = positions.shape[1]
+    cache = rotary_emb._match_cos_sin_cache_dtype(x)
+    rows = cache[positions].gather(0, sel.expand(1, num_tokens, -1))[0]
+    arange = torch.arange(num_tokens, device=positions.device)
+    rotary_emb._hy4_token_rope = (arange, rows)
+
+
+def token_rope(
+    rotary_emb: nn.Module, positions: torch.Tensor, cos_sin_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(positions, cos_sin_cache)`` for the 1-D fused RoPE kernels.
+
+    [3, T] M-RoPE positions become ``arange(T)`` into the per-token cos/sin
+    rows built by ``set_token_rope`` for this forward.
+    """
+    if positions.ndim == 1:
+        return positions, cos_sin_cache
+    rows = getattr(rotary_emb, "_hy4_token_rope", None)
+    assert rows is not None and rows[0].shape[0] == positions.shape[1], (
+        "set_token_rope must run before the layers"
+    )
+    return rows
 
 
 def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
@@ -263,23 +310,24 @@ class Indexer(nn.Module):
             and self.scale_fmt == "ue8m0"
             and current_platform.is_cuda()
             and not envs.VLLM_BATCH_INVARIANT
-            # The fused kernels index a 1D cos/sin cache per token; the
-            # multimodal mrope path needs the 2D-positions fallback below.
-            and positions.ndim != 2
         ):
+            rope_pos, cos_sin = token_rope(
+                rotary_emb, positions, rotary_emb.cos_sin_cache
+            )
             k = fused_indexer_k_norm_rope(
                 kw[:, : self.head_dim],
                 self.k_norm,
-                positions,
-                rotary_emb,
+                rope_pos,
+                cos_sin,
+                rotary_emb.is_neox_style,
             )
             if self.use_fp4_kv:
                 # DeepSeek V4 kernel; same trailing interleaved RoPE.
                 assert not rotary_emb.is_neox_style
                 q_fp4, weights = fused_indexer_q_rope_quant_mxfp4(
-                    positions,
+                    rope_pos,
                     q,
-                    rotary_emb.cos_sin_cache,
+                    cos_sin,
                     kw[:, self.head_dim :].contiguous(),
                     self.softmax_scale,
                     self.n_head**-0.5,
@@ -287,9 +335,9 @@ class Indexer(nn.Module):
                 )
                 return q_fp4, k, weights
             q_fp8, weights = fused_indexer_q_rope_quant(
-                positions,
+                rope_pos,
                 q,
-                rotary_emb.cos_sin_cache,
+                cos_sin,
                 kw[:, self.head_dim :],
                 self.softmax_scale,
                 self.n_head**-0.5,
@@ -856,9 +904,6 @@ class HYV4MLAAttention(nn.Module):
             self.kv_exchange
             if self.kv_exchange is not None
             and llama_4_scaling is None
-            # The fused prologue kernels apply RoPE from a 1D cos/sin cache;
-            # multimodal mrope requests fall back to _project_q_and_kv.
-            and positions.ndim != 2
             and self._is_sparse_mla_prefill(kv_lora.shape[0])
             else None
         )
@@ -952,7 +997,8 @@ class HYV4MLAAttention(nn.Module):
             and self.kv_lora_rank == 512
             and self.qk_nope_head_dim == 192
             and self.qk_rope_head_dim == 64
-            and type(self.rotary_emb) is RotaryEmbedding
+            # M-RoPE runs through per-token cos/sin rows (token_rope).
+            and type(self.rotary_emb) in (RotaryEmbedding, MRotaryEmbedding)
             and not self.rotary_emb.is_neox_style
             and self.kv_a_layernorm.weight.dtype == torch.bfloat16
         )
@@ -1015,7 +1061,11 @@ class HYV4MLAAttention(nn.Module):
         indexer's top-k row reset."""
         assert self.q_b_proj is not None and q_c is not None
         # K and Q share the activation dtype, so one cos/sin cache each.
-        cos_sin = self.rotary_emb._match_cos_sin_cache_dtype(kv_lora)
+        rope_pos, cos_sin = token_rope(
+            self.rotary_emb,
+            positions,
+            self.rotary_emb._match_cos_sin_cache_dtype(kv_lora),
+        )
         indexer = self.indexer if indexer_kw is not None else None
         index_k = index_w = index_cos_sin = k_norm = None
         if indexer is not None:
@@ -1024,12 +1074,14 @@ class HYV4MLAAttention(nn.Module):
                 [indexer.head_dim, indexer_kw.shape[-1] - indexer.head_dim], dim=-1
             )
             index_rope = cast(RotaryEmbedding, self.indexer_rope_emb)
-            index_cos_sin = index_rope._match_cos_sin_cache_dtype(kv_lora)
+            _, index_cos_sin = token_rope(
+                index_rope, positions, index_rope._match_cos_sin_cache_dtype(kv_lora)
+            )
             k_norm = indexer.k_norm
         kv_exchange.multicast(
             kv_lora,
             index_k,
-            positions,
+            rope_pos,
             cos_sin,
             index_cos_sin,
             self.kv_a_layernorm.weight,
@@ -1056,7 +1108,7 @@ class HYV4MLAAttention(nn.Module):
         torch.ops._C.hy4_q_rope_indexer_quant(
             q,
             q,
-            positions,
+            rope_pos,
             cos_sin,
             index_q,
             index_w,

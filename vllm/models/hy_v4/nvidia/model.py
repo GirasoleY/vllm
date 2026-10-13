@@ -79,6 +79,7 @@ from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
+    set_token_rope,
 )
 from .hc import CudaIHCPostPre, HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused, use_hyv4_sequence_parallel
@@ -580,6 +581,8 @@ class HYV4Model(nn.Module):
 
         num_layers = self.end_layer - self.start_layer
         first_layer = self.layers[self.start_layer] if num_layers else None
+        if first_layer is not None:
+            set_token_rope(first_layer.self_attn.rotary_emb, positions, hidden_states)
         mode = self.ihc_fusion_mode
         fused_available = (
             self.enable_ihc

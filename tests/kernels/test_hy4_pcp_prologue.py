@@ -85,8 +85,9 @@ def reference_k(x, mla, idx, slots):
     ops.rms_norm(kv_n, x.kv_lora[:, :512], x.kv_w, 1e-6)
     k_pe = x.kv_lora[:, 512:].unsqueeze(1).clone()
     ops.rotary_embedding(x.positions, k_pe.clone(), k_pe, 64, x.cos_sin, False)
-    rope = SimpleNamespace(cos_sin_cache=x.idx_cos_sin, is_neox_style=False)
-    ik = fused_indexer_k_norm_rope(x.kw[:, :128], x.norm, x.positions, rope)
+    ik = fused_indexer_k_norm_rope(
+        x.kw[:, :128], x.norm, x.positions, x.idx_cos_sin, False
+    )
     one = torch.ones(1, device="cuda")
     ops.concat_and_cache_mla(kv_n, k_pe.squeeze(1), mla, slots, "nvfp4_ds_mla", one)
     ops.indexer_k_quant_and_cache(ik, idx, slots, 128, "ue8m0")
@@ -182,3 +183,84 @@ def test_q_rope_indexer_quant_matches_reference(num_tokens, cache_dtype, in_plac
         iq8.view(torch.uint8), iq8_ref.view(torch.uint8), atol=0, rtol=0
     )
     torch.testing.assert_close(iw, iw_ref, atol=0, rtol=0)
+
+
+def _mrope_positions(num_tokens: int, seed: int) -> torch.Tensor:
+    """[3, T] positions: text tokens (equal rows) around an image grid."""
+    g = torch.Generator().manual_seed(seed)
+    pos = torch.arange(num_tokens).repeat(3, 1) + 100
+    img = slice(num_tokens // 4, num_tokens // 4 + num_tokens // 2)
+    n = img.stop - img.start
+    pos[1, img] += torch.randint(0, 64, (n,), generator=g)
+    pos[2, img] += torch.randint(0, 64, (n,), generator=g)
+    return pos.cuda()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 1000])
+@pytest.mark.parametrize("interleaved", [True, False])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float32])
+def test_token_rope_applies_mrope(
+    num_tokens, interleaved, cache_dtype, default_vllm_config
+):
+    """RoPE through token_rope's (arange, per-token rows) equals M-RoPE, and
+    text rows equal the 1-D cache rows."""
+    from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+    from vllm.models.hy_v4.nvidia.attention import set_token_rope, token_rope
+
+    rope = MRotaryEmbedding(
+        64, 64, 4096, 10000, False, cache_dtype, [12, 10, 10], interleaved
+    ).cuda()
+    positions = _mrope_positions(num_tokens, 0)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    q = torch.randn(num_tokens, 4 * 64, generator=g, device="cuda", dtype=cache_dtype)
+    k = torch.randn(num_tokens, 64, generator=g, device="cuda", dtype=cache_dtype)
+    set_token_rope(rope, positions, q)
+    cache = rope.cos_sin_cache
+    rope_pos, rows = token_rope(rope, positions, cache)
+    text = (positions[0] == positions[1]) & (positions[0] == positions[2])
+    torch.testing.assert_close(rows[text], cache[positions[0, text]], atol=0, rtol=0)
+
+    q_ref, k_ref = rope.forward_native(positions, q.clone(), k.clone())
+    q_out, k_out = q.clone(), k.clone()
+    ops.rotary_embedding(rope_pos, q_out, k_out, 64, rows, False)
+    # fp32: forward_native and the CUDA kernel round differently (<= 0.5 ulp).
+    tol = 1e-6 if cache_dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(q_out, q_ref, atol=tol, rtol=tol)
+    torch.testing.assert_close(k_out, k_ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("num_tokens", [7, 1000])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float32])
+def test_prologue_kernels_take_token_rows(num_tokens, cache_dtype):
+    """The prologue kernels read only cache[positions[t]]: (arange, gathered
+    rows) gives exactly the bytes of (positions, cache)."""
+    x = make_inputs(num_tokens, cache_dtype)
+    rows = SimpleNamespace(
+        **{
+            **vars(x),
+            "positions": torch.arange(num_tokens, device="cuda"),
+            "cos_sin": x.cos_sin[x.positions].contiguous(),
+            "idx_cos_sin": x.idx_cos_sin[x.positions].contiguous(),
+        }
+    )
+    mla_ref, idx_ref = empty_caches(x)
+    fused_k(x, mla_ref, idx_ref, x.slots)
+    mla, idx = empty_caches(x)
+    fused_k(rows, mla, idx, x.slots)
+    torch.testing.assert_close(mla, mla_ref, atol=0, rtol=0)
+    torch.testing.assert_close(idx, idx_ref, atol=0, rtol=0)
+
+    outs = []
+    for y in (x, rows):
+        q = y.q.clone()
+        iq8 = torch.empty(num_tokens, IDX_HEADS, 128, dtype=torch.float8_e4m3fn,
+                          device="cuda")  # fmt: skip
+        iw = torch.empty(num_tokens, IDX_HEADS, dtype=torch.float32, device="cuda")
+        topk = torch.zeros(num_tokens, 2048, dtype=torch.int32, device="cuda")
+        torch.ops._C.hy4_q_rope_indexer_quant(
+            q, q, y.positions, y.cos_sin, y.iq, y.kw[:, 128:], y.idx_cos_sin, iq8,
+            iw, topk, SOFTMAX_SCALE, HEAD_SCALE, False,
+        )  # fmt: skip
+        outs.append((q, iq8.view(torch.uint8), iw))
+    for a, b in zip(*outs):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)

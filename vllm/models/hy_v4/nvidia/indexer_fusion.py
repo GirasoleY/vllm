@@ -216,15 +216,15 @@ def _k_norm_rope(
     tl.store(OUT + rows[:, None] * 128 + cols[None, :], out, rows[:, None] < M)
 
 
-def fused_indexer_k_norm_rope(k, norm, positions, rotary_emb):
+def fused_indexer_k_norm_rope(k, norm, positions, cos_sin_cache, is_neox_style):
     """Apply the indexer key LayerNorm and RoPE in one pass.
 
     Args:
         k: ``(tokens, 128)`` BF16 indexer keys with the 64 rotary dims last.
         norm: A ``LayerNorm`` module with ``weight``, ``bias`` and ``eps``.
-        positions: ``(tokens,)`` positions for the RoPE cache lookup.
-        rotary_emb: Rotary module providing ``cos_sin_cache`` and
-            ``is_neox_style``.
+        positions: ``(tokens,)`` row of each token in ``cos_sin_cache``.
+        cos_sin_cache: ``(rows, 64)`` cache holding 32 cosines then 32 sines.
+        is_neox_style: Whether the RoPE pairs are NeoX-style halves.
 
     Returns:
         ``(tokens, 128)`` normalized and rotated keys in the dtype of ``k``.
@@ -237,13 +237,13 @@ def fused_indexer_k_norm_rope(k, norm, positions, rotary_emb):
             norm.weight,
             norm.bias,
             positions,
-            rotary_emb.cos_sin_cache,
+            cos_sin_cache,
             out,
             k.shape[0],
             k.stride(0),
-            rotary_emb.cos_sin_cache.stride(0),
+            cos_sin_cache.stride(0),
             norm.eps,
-            rotary_emb.is_neox_style,
+            is_neox_style,
             enable_fp_fusion=False,
         )
     return out

@@ -44,6 +44,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from .attention import set_token_rope
 from .model import HYV4DecoderLayer, _normalize_hyv4_config
 from .moe import HYV4MoEFused
 
@@ -427,6 +428,7 @@ class HYV4MultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
         )
         hidden_states = self.eh_proj(eh_input)
+        set_token_rope(self.mtp_block.self_attn.rotary_emb, positions, hidden_states)
         hidden_states, residual = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,

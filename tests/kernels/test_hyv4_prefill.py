@@ -173,8 +173,6 @@ def test_gate_projection_fusion_preserves_shards_and_gemm(dynamic):
 @pytest.mark.parametrize("tokens", [1, 17, 8192])
 @pytest.mark.parametrize("neox", [False, True])
 def test_indexer_key_norm_and_trailing_rope(tokens, neox):
-    from types import SimpleNamespace
-
     from vllm.models.hy_v4.nvidia.indexer_fusion import fused_indexer_k_norm_rope
 
     torch.manual_seed(42)
@@ -184,7 +182,6 @@ def test_indexer_key_norm_and_trailing_rope(tokens, neox):
     norm.bias.data.normal_()
     cache = torch.randn(1024, 64, device="cuda")
     positions = torch.randint(1024, (tokens,), device="cuda")
-    rope = SimpleNamespace(cos_sin_cache=cache, is_neox_style=neox)
     ref = norm(k)
     if neox:
         first, second = slice(64, 96), slice(96, 128)
@@ -194,5 +191,5 @@ def test_indexer_key_norm_and_trailing_rope(tokens, neox):
     cos, sin = cache[positions, :32], cache[positions, 32:]
     ref[:, first] = x * cos - y * sin
     ref[:, second] = y * cos + x * sin
-    actual = fused_indexer_k_norm_rope(k, norm, positions, rope)
+    actual = fused_indexer_k_norm_rope(k, norm, positions, cache, neox)
     torch.testing.assert_close(actual, ref, rtol=0.016, atol=0.016)
