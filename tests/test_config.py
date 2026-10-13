@@ -520,6 +520,7 @@ def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
         ("nvidia/GLM-5.2-NVFP4", "GlmMoeDsaForCausalLM"),
         ("zai-org/GLM-5.2-FP8", "GlmMoeDsaForCausalLM"),
         ("nvidia/DeepSeek-V3.2-NVFP4", "DeepseekV32ForCausalLM"),
+        ("Inferact/ty", "HYV4VLForConditionalGeneration"),
     ],
 )
 @pytest.mark.parametrize("with_mtp", [False, True], ids=["no-mtp", "mtp"])
@@ -588,6 +589,8 @@ def test_dsa_models_default_to_mrv2_and_breakable_cudagraph(
         ("Qwen4ExpForConditionalGeneration", True, False),
         ("Qwen4ExpMTP", False, True),
         ("Qwen4ExpMTP", True, False),
+        ("HYV4VLForConditionalGeneration", False, True),
+        ("HYV4VLForConditionalGeneration", True, False),
     ],
 )
 def test_breakable_cudagraph_platform_default(
