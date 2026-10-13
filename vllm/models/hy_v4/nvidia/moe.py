@@ -180,9 +180,9 @@ class HYV4MoEFused(nn.Module):
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
         nvfp4 = getattr(quant_config, "store_dtype", None) == "nvfp4"
-        if nvfp4 and (not requested_mega_moe or is_mtp):
+        if nvfp4 and (not requested_mega_moe or (is_mtp and self.tp_size != 1)):
             raise NotImplementedError(
-                "HYV4 NVFP4 currently requires deep_gemm_mega_moe without MTP"
+                "HYV4 NVFP4 requires deep_gemm_mega_moe (and TP=1 for MTP)"
             )
         fp8_weight_block_size = (
             quant_config.weight_block_size
@@ -191,12 +191,12 @@ class HYV4MoEFused(nn.Module):
             else None
         )
         fp8_mtp = is_mtp and self.tp_size == 1 and fp8_weight_block_size is not None
-        mxfp4_mtp = (
+        fp4_mtp = (
             is_mtp
             and self.tp_size == 1
-            and getattr(quant_config, "store_dtype", None) == "mxfp4"
+            and getattr(quant_config, "store_dtype", None) in ("mxfp4", "nvfp4")
         )
-        self.use_mega_moe = requested_mega_moe and (not is_mtp or fp8_mtp or mxfp4_mtp)
+        self.use_mega_moe = requested_mega_moe and (not is_mtp or fp8_mtp or fp4_mtp)
         self.use_sequence_parallel = (
             self.use_mega_moe and not is_mtp and use_hyv4_sequence_parallel(vllm_config)
         )

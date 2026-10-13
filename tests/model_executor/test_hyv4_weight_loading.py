@@ -25,16 +25,28 @@ import torch
         "self_attn.indexer.wk",
     ],
 )
-def test_mtp_dense_and_expert_scales_decode_ue8m0(projection):
+@pytest.mark.parametrize(
+    "store_dtype,explicit_e8m0",
+    [(None, True), (None, False), ("mxfp4", False), ("nvfp4", False)],
+)
+def test_mtp_dense_and_expert_scales_decode_ue8m0(
+    projection, store_dtype, explicit_e8m0
+):
+    """UE8M0 bytes decode for a dedicated FP8 MTP config and for an inherited
+    backbone config, which never sets ``is_scale_e8m0``."""
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.models.hy_v4.nvidia.mtp import _prepare_mtp_fp8_expert_scale
 
+    if store_dtype is not None and ".experts." in projection:
+        pytest.skip("Packed FP4 routed-expert scales keep their raw bytes")
     config = Fp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=[128, 128],
+        store_dtype=store_dtype,
     )
-    config.is_scale_e8m0 = True
+    if explicit_e8m0:
+        config.is_scale_e8m0 = True
     name = f"model.layers.78.mtp_block.{projection}.scale"
     raw = torch.tensor([116, 117, 127, 128], dtype=torch.uint8)
     mapped, scale = _prepare_mtp_fp8_expert_scale(config, name, raw)
@@ -497,3 +509,154 @@ def test_nvfp4_megamoe_loads_packed_weights_and_both_scale_levels(monkeypatch):
     assert (adapter.w2_weight_scale_2 == 0.03125).all()
     assert (adapter.w13_input_scale == 0.0625).all()
     assert (adapter.w2_input_scale == 0.0625).all()
+
+
+@pytest.mark.parametrize("algorithm", ["NVFP4", "NONE", None])
+def test_mtp_megamoe_uses_nvfp4_experts(monkeypatch, algorithm):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.hy_v4.nvidia import moe
+    from vllm.models.hy_v4.nvidia.mtp import _create_mtp_quant_config
+    from vllm.models.hy_v4.nvidia.nvfp4_moe import HYV4NVFP4MegaMoEExperts
+
+    backbone = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+        store_dtype="nvfp4",
+    )
+    config = SimpleNamespace(
+        mtp_quant_algo=algorithm,
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_hidden_dim=128,
+        hidden_size=128,
+        num_shared_experts=0,
+        route_norm=True,
+        swiglu_limit=10,
+    )
+    quant = _create_mtp_quant_config(config, backbone)
+    assert quant is backbone
+    runtime = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
+        max_num_tokens_per_rank=32,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        moe,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+        ),
+    )
+    monkeypatch.setattr(moe, "GateLinear", lambda *a, **kw: torch.nn.Identity())
+    with set_current_vllm_config(runtime):
+        draft = moe.HYV4MoEFused(config, quant, is_mtp=True)
+    assert draft.use_mega_moe
+    assert isinstance(draft.experts, HYV4NVFP4MegaMoEExperts)
+    assert draft.experts.mma_type == "nvfp4"
+
+
+def test_mtp_nvfp4_rejects_incompatible_backbone():
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.hy_v4.nvidia.mtp import _create_mtp_quant_config
+
+    mxfp4 = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+        store_dtype="mxfp4",
+    )
+    with pytest.raises(ValueError, match="NVFP4 backbone"):
+        _create_mtp_quant_config(SimpleNamespace(mtp_quant_algo="NVFP4"), mxfp4)
+
+
+def test_mtp_nvfp4_loads_packed_weights_and_both_scale_levels():
+    """MTP checkpoint names reach every NVFP4 parameter with exact values."""
+    from vllm.model_executor.layers.fused_moe import (
+        fused_moe_make_expert_params_mapping,
+    )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.hy_v4.nvidia.mtp import HYV4MTP, _prepare_mtp_fp8_expert_scale
+    from vllm.models.hy_v4.nvidia.nvfp4_moe import HYV4NVFP4MegaMoEExperts
+
+    adapter = HYV4NVFP4MegaMoEExperts(
+        SimpleNamespace(
+            max_num_tokens_per_rank=32,
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        ),
+        num_experts=4,
+        num_local_experts=2,
+        experts_start_idx=2,
+        top_k=2,
+        hidden_size=128,
+        intermediate_size=128,
+    )
+    draft = HYV4MTP.__new__(HYV4MTP)
+    torch.nn.Module.__init__(draft)
+    quant = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+        store_dtype="nvfp4",
+    )
+    quant.is_scale_e8m0 = True
+    base = "model.layers.78.mtp_block.mlp"
+    params = {
+        f"{base}.experts.{name}": param for name, param in adapter.named_parameters()
+    }
+    mapping = fused_moe_make_expert_params_mapping(
+        draft, "gate_proj", "down_proj", "up_proj", 4, routed_experts_prefix=""
+    )
+    torch.manual_seed(11)
+    expected = {}
+    weights = []
+    for expert in range(4):
+        for projection, rows, cols in (
+            ("gate_proj", 128, 128),
+            ("up_proj", 128, 128),
+            ("down_proj", 128, 128),
+        ):
+            packed = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+            block = (torch.rand(rows, cols // 16) * 4 + 0.25).to(torch.float8_e4m3fn)
+            scale_2 = torch.tensor(0.01 * (expert + 1))
+            input_scale = torch.tensor(0.1 * (expert + 1))
+            expected[expert, projection] = (packed, block, scale_2, input_scale)
+            prefix = f"{base}.experts.{expert}.{projection}"
+            weights += [
+                (f"{prefix}.weight", packed),
+                (f"{prefix}.weight_scale", block),
+                (f"{prefix}.weight_scale_2", scale_2),
+                (f"{prefix}.input_scale", input_scale),
+            ]
+    loaded: set[str] = set()
+    for name, weight in weights:
+        name, weight = _prepare_mtp_fp8_expert_scale(quant, name, weight)
+        assert draft._load_expert_weight(name, weight, params, loaded, mapping, {}, 4)
+    assert loaded == set(params)
+    for local, expert in enumerate((2, 3)):
+        gate, up, down = (
+            expected[expert, p] for p in ("gate_proj", "up_proj", "down_proj")
+        )
+        torch.testing.assert_close(
+            adapter.w13_weight[local], torch.cat((gate[0], up[0]))
+        )
+        torch.testing.assert_close(adapter.w2_weight[local], down[0])
+        torch.testing.assert_close(
+            adapter.w13_weight_scale[local].float(),
+            torch.cat((gate[1], up[1])).float(),
+        )
+        torch.testing.assert_close(
+            adapter.w2_weight_scale[local].float(), down[1].float()
+        )
+        torch.testing.assert_close(
+            adapter.w13_weight_scale_2[local], torch.stack((gate[2], up[2]))
+        )
+        torch.testing.assert_close(adapter.w2_weight_scale_2[local], down[2])
+        torch.testing.assert_close(
+            adapter.w13_input_scale[local], torch.stack((gate[3], up[3]))
+        )
+        torch.testing.assert_close(adapter.w2_input_scale[local], down[3])

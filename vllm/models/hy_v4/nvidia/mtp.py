@@ -162,13 +162,12 @@ def _prepare_mtp_fp8_expert_scale(
     ):
         if name.endswith(".scale"):
             name = name[: -len(".scale")] + ".weight_scale_inv"
-        if (
-            getattr(quant_config, "is_scale_e8m0", False)
-            and loaded_weight.dtype == torch.uint8
-            and not (quant_config.store_dtype == "mxfp4" and ".mlp.experts." in name)
+        if loaded_weight.dtype == torch.uint8 and not (
+            quant_config.store_dtype in ("mxfp4", "nvfp4") and ".mlp.experts." in name
         ):
-            # UE8M0 scale exponents are stored as raw uint8 bytes: reinterpret
-            # the bits instead of numerically converting them.
+            # Block-FP8 scales stored as uint8 are raw UE8M0 exponents, whether
+            # the MTP config is its own FP8 config or the inherited backbone
+            # config: reinterpret the bits instead of numerically converting them.
             loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
     return name, loaded_weight
 
@@ -181,7 +180,7 @@ def _create_mtp_quant_config(
 
     The MTP quantization algorithm is given by the ``mtp_quant_algo`` field in
     ``config.json``, independently of the backbone's quantization. Supported
-    values are ``"FP8"``, ``"MXFP4"`` (packed backbone format),
+    values are ``"FP8"``, ``"MXFP4"`` / ``"NVFP4"`` (packed backbone format),
     ``"NONE"`` (inherit the backbone) and ``"BF16"`` /
     ``"FP16"`` (unquantized). A missing or ``"NONE"`` value falls back to the
     backbone config.
@@ -213,14 +212,15 @@ def _create_mtp_quant_config(
         )
         return None
 
-    if mtp_quant_algo == "MXFP4":
+    if mtp_quant_algo in ("MXFP4", "NVFP4"):
         from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
         if not isinstance(backbone_quant_config, Fp8Config) or (
-            backbone_quant_config.store_dtype != "mxfp4"
+            backbone_quant_config.store_dtype != mtp_quant_algo.lower()
         ):
             raise ValueError(
-                "MXFP4 MTP requires an MXFP4 backbone quantization config."
+                f"{mtp_quant_algo} MTP requires an {mtp_quant_algo} backbone "
+                "quantization config."
             )
         return backbone_quant_config
 
