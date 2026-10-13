@@ -963,16 +963,12 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 return_valid_counts=True,
             )
         elif num_prefill_tokens > 0:
-            topk_indices, topk_length = triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[: topk_indices.shape[0]],
-                attn_metadata.block_table,
+            topk_indices, topk_length = self._convert_prefill_topk(
                 topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                HAS_PREFILL_WORKSPACE=has_prefill_workspace,
-                prefill_workspace_request_ids=prefill_request_ids,
-                prefill_workspace_starts=prefill_workspace_starts,
-                return_valid_counts=True,
+                attn_metadata,
+                has_prefill_workspace,
+                prefill_request_ids,
+                prefill_workspace_starts,
             )
 
         fp8_metadata = attn_metadata.fp8_extra_metadata
@@ -1332,6 +1328,27 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         output = output[:, :actual_num_heads, :]
         lse = lse[:, :actual_num_heads]
         return output, lse
+
+    def _convert_prefill_topk(
+        self,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        has_prefill_workspace: bool,
+        prefill_request_ids: torch.Tensor | None,
+        prefill_workspace_starts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map request-local top-k indices to prefill workspace / cache rows."""
+        return triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            HAS_PREFILL_WORKSPACE=has_prefill_workspace,
+            prefill_workspace_request_ids=prefill_request_ids,
+            prefill_workspace_starts=prefill_workspace_starts,
+            return_valid_counts=True,
+        )
 
     def forward_mqa(
         self,

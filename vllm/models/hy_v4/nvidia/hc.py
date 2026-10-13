@@ -443,5 +443,5 @@ class CudaIHCPostPre(nn.Module):
             self._norm_owner.variance_epsilon,
             fp8_out=fp8_out,
         )
-        out = out[1:] if xa is None else out
-        return out if fp8_out else out[:-1]
+        result = out[1:] if xa is None else out
+        return result if fp8_out else result[:-1]

@@ -3834,3 +3834,33 @@ def test_sparse_mla_common_impl_resolves_buffer_lazily():
     assert isinstance(SparseMLACommonImpl.topk_indices_buffer, property), (
         "topk_indices_buffer must stay a lazily-resolved property"
     )
+
+
+def test_hyv4_shared_prefill_topk_reuse_and_refresh(monkeypatch):
+    """Followers reuse mappings, but a leader or new metadata refreshes them."""
+    from vllm.models.hy_v4.nvidia import flashmla_sparse as hyv4
+
+    monkeypatch.setattr(hyv4, "_PREFILL_TOPK_CACHE", {})
+    convert = MagicMock(side_effect=lambda *args: (object(), object()))
+    monkeypatch.setattr(FlashMLASparseImpl, "_convert_prefill_topk", convert)
+    leader = object.__new__(hyv4.HYV4FlashMLASparseImpl)
+    follower = object.__new__(hyv4.HYV4FlashMLASparseImpl)
+    leader.index_group_index = 0
+    follower.index_group_index = 1
+    indices = torch.zeros((2, 8), dtype=torch.int32)
+    metadata = object()
+    args = (indices, metadata, True, None, None)
+    first = leader._convert_prefill_topk(*args)
+    assert follower._convert_prefill_topk(*args) is first
+    assert convert.call_count == 1
+    # Graph replay can reuse tensor addresses and metadata objects.
+    indices.fill_(1)
+    second = leader._convert_prefill_topk(*args)
+    assert second is not first
+    assert follower._convert_prefill_topk(*args) is second
+    assert convert.call_count == 2
+    assert (
+        follower._convert_prefill_topk(indices, object(), True, None, None)
+        is not second
+    )
+    assert convert.call_count == 3

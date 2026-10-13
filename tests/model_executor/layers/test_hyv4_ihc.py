@@ -133,3 +133,48 @@ def test_cross_layer_ihc_matches_layer_by_layer_schedule() -> None:
 
     assert carry is None
     torch.testing.assert_close(actual, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("tokens", [1, 17])
+@torch.inference_mode()
+def test_normal_layer_fused_norm_preserves_residual_contract(
+    default_vllm_config, with_residual, tokens
+):
+    """The non-iHC/MTP path returns the pre-MLP residual and normalized output."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.models.hy_v4.nvidia.model import HYV4DecoderLayer
+
+    torch.manual_seed(42)
+    x = torch.randn(tokens, 6144, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x) if with_residual else None
+    norm = RMSNorm(6144, eps=1e-6).to(device="cuda", dtype=x.dtype)
+    norm.weight.data.uniform_(0.8, 1.2)
+    layer = SimpleNamespace(
+        input_layernorm=norm,
+        post_attention_layernorm=norm,
+        _run_self_attn=lambda positions, hidden: hidden * 0.5,
+        mlp=lambda hidden: hidden * 0.75,
+    )
+
+    def reference_norm(value):
+        value = value.float()
+        value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+        return value.to(x.dtype) * norm.weight
+
+    before_attn = x if residual is None else x + residual
+    attn = reference_norm(before_attn) * 0.5
+    expected_residual = attn + before_attn
+    expected = reference_norm(expected_residual) * 0.75
+    output, actual_residual = HYV4DecoderLayer._forward_normal(
+        layer,
+        torch.arange(tokens, device="cuda"),
+        x.clone(),
+        None if residual is None else residual.clone(),
+    )
+    # Fusing removes the intermediate BF16 rounding before the RMS reduction.
+    torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(actual_residual, expected_residual, atol=0.02, rtol=0.02)

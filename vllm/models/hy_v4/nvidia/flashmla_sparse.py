@@ -54,6 +54,9 @@ logger = init_logger(__name__)
 # BF16 sparse prefill supports 64 or 128 heads. TP shards with fewer heads
 # use a head-padded query whose padding stays zero.
 _DIRECT_Q_BUFFERS: dict[tuple, torch.Tensor] = {}
+# Prefill top-k mapping of the last converting layer, reused by the shared
+# layers that follow it in the same forward pass.
+_PREFILL_TOPK_CACHE: dict[str, tuple] = {}
 
 
 def _direct_q_buffer(
@@ -297,6 +300,44 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             lse = lse[:, :actual_num_heads, :]
 
         return out, lse
+
+    def _convert_prefill_topk(
+        self,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        has_prefill_workspace: bool,
+        prefill_request_ids: torch.Tensor | None,
+        prefill_workspace_starts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse the index-group leader's prefill mapping in shared layers.
+
+        The mapping depends only on the top-k indices and the batch metadata, so
+        a shared layer reading the same top-k buffer under the same metadata as
+        the producing layer before it gets an identical result.
+        """
+        key = (
+            attn_metadata,
+            topk_indices.data_ptr(),
+            tuple(topk_indices.shape),
+            has_prefill_workspace,
+        )
+        cached = _PREFILL_TOPK_CACHE.get("last")
+        if (
+            self.index_group_index > 0
+            and cached is not None
+            and cached[0][0] is key[0]
+            and cached[0][1:] == key[1:]
+        ):
+            return cached[1]
+        result = super()._convert_prefill_topk(
+            topk_indices,
+            attn_metadata,
+            has_prefill_workspace,
+            prefill_request_ids,
+            prefill_workspace_starts,
+        )
+        _PREFILL_TOPK_CACHE["last"] = (key, result)
+        return result
 
     def _direct_q_base(self) -> torch.Tensor | None:
         """The buffer the MLA layer writes the absorbed query into (replacing

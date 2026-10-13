@@ -137,8 +137,12 @@ def test_boundary_is_deterministic(num_tokens):
     xa, residual, post, weight, scale, base, norm_weight = _inputs(
         num_tokens, 6144, offset_views=False
     )
-    args = (residual, xa, post, weight, scale, base, norm_weight)
-    args += (MAGNITUDE, HC_EPS, NORM_EPS, VARIANCE_EPS)
+    args = (residual, xa, post, weight, scale, base, norm_weight) + (
+        MAGNITUDE,
+        HC_EPS,
+        NORM_EPS,
+        VARIANCE_EPS,
+    )
     first = ops.hy_v4_ihc_boundary(*args)
     for _ in range(3):
         for a, b in zip(first, ops.hy_v4_ihc_boundary(*args)):
@@ -163,8 +167,12 @@ def test_fp8_out_matches_separate_quant(num_tokens, hidden_size, with_post):
     )
     if not with_post:
         xa = post = None
-    args = (residual, xa, post, weight, scale, base, norm_weight)
-    args += (MAGNITUDE, HC_EPS, NORM_EPS, VARIANCE_EPS)
+    args = (residual, xa, post, weight, scale, base, norm_weight) + (
+        MAGNITUDE,
+        HC_EPS,
+        NORM_EPS,
+        VARIANCE_EPS,
+    )
     plain = ops.hy_v4_ihc_boundary(*args)
     fused = ops.hy_v4_ihc_boundary(*args, fp8_out=True)
     assert plain[3] is None
