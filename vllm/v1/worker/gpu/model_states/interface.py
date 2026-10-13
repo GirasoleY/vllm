@@ -97,6 +97,7 @@ class ModelState(ABC):
                     observability_config
                     and observability_config.enable_mm_processor_stats
                 ),
+                pcp_size=vllm_config.parallel_config.prefill_context_parallel_size,
             )
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
@@ -177,14 +178,16 @@ class ModelState(ABC):
         The encode half of `get_mm_embeddings`, without the gather, for callers
         that run no language model.
         """
-        mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
+        mm_hashes, mm_kwargs, num_embeds = self.encoder_runner.prepare_mm_inputs(
             scheduled_encoder_inputs
         )
         if mm_kwargs:
             with self.encoder_runner.timed_encoder_operation(
                 scheduled_encoder_inputs.keys()
             ):
-                encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
+                encoder_outputs = self.encoder_runner.execute_mm_encoder(
+                    mm_kwargs, num_embeds
+                )
             self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
 
     def gather_mm_embeddings(

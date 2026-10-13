@@ -9,6 +9,7 @@ and tolerated (token-embedding fallback) when it is not, while a miss within
 the processed range still fails loudly.
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -277,10 +278,12 @@ def test_execute_mm_encoder_caches_outputs_without_gathering():
     cache = EncoderCache()
     state = _model_state(cache)
     embedding = torch.ones(2, HIDDEN)
-    # (mm_hashes, [(modality, kwargs item), ...]), as prepare_mm_inputs returns.
+    # (mm_hashes, [(modality, kwargs item), ...], num_embeds), as
+    # prepare_mm_inputs returns.
     state.encoder_runner.prepare_mm_inputs.return_value = (
         ["hash0"],
         [("image", MagicMock())],
+        [2],
     )
     state.encoder_runner.execute_mm_encoder.return_value = [embedding]
 
@@ -294,7 +297,7 @@ def test_execute_mm_encoder_is_a_noop_without_scheduled_items():
     """A step that schedules no encoder input must not touch the encoder."""
     cache = EncoderCache()
     state = _model_state(cache)
-    state.encoder_runner.prepare_mm_inputs.return_value = ([], [])
+    state.encoder_runner.prepare_mm_inputs.return_value = ([], [], [])
 
     ModelState.execute_mm_encoder(state, {})
 
@@ -330,7 +333,7 @@ def test_prepare_mm_inputs_passes_prompt_embeds_through():
         [_pe_feature("hash_pe", prompt_embeds), image_feature], cached=[]
     )
 
-    mm_hashes, mm_kwargs = runner.prepare_mm_inputs({"req0": [0, 1]})
+    mm_hashes, mm_kwargs, _ = runner.prepare_mm_inputs({"req0": [0, 1]})
 
     # Only the image remains for the encoder; the embeds are already cached.
     assert mm_hashes == ["hash_img"]
@@ -345,7 +348,7 @@ def test_prepare_mm_inputs_skips_cached_prompt_embeds():
     runner = _make_runner([feature], cached=[feature])
     sentinel = runner.encoder_cache.encoder_outputs["hash_pe"]
 
-    mm_hashes, mm_kwargs = runner.prepare_mm_inputs({"req0": [0]})
+    mm_hashes, mm_kwargs, _ = runner.prepare_mm_inputs({"req0": [0]})
 
     assert mm_hashes == [] and mm_kwargs == []
     assert runner.encoder_cache.encoder_outputs["hash_pe"] is sentinel
@@ -378,3 +381,75 @@ def test_encoder_timing_stats_registry():
     assert stats["r1"]["num_encoder_calls"] == 2
     assert stats["r1"]["encoder_forward_secs"] >= 0
     assert runner.get_encoder_timing_stats() == {}
+
+
+class _ThreadPCPGroup:
+    """PCP group stand-in: one thread per rank, all_gatherv over a barrier."""
+
+    def __init__(self, world_size: int):
+        self.world_size = world_size
+        self._barrier = threading.Barrier(world_size)
+        self._slots: list[torch.Tensor | None] = [None] * world_size
+        self._local = threading.local()
+
+    @property
+    def rank_in_group(self) -> int:
+        return self._local.rank
+
+    def all_gatherv(self, t: torch.Tensor, dim: int, sizes: list[int]):
+        assert dim == 0 and t.shape[0] == sizes[self.rank_in_group]
+        self._slots[self.rank_in_group] = t
+        self._barrier.wait()
+        out = torch.cat(self._slots)
+        self._barrier.wait()
+        return out
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("num_items", [2, 3, 7])
+def test_pcp_sharded_encoder_matches_local(world_size, num_items):
+    """Each PCP rank encodes a disjoint share, and every rank returns all
+    outputs in the original order, as the unsharded encoder does."""
+    lengths = [5, 1, 9, 3, 2, 8, 4][:num_items]
+    items = [
+        ("image", _embeds_item(torch.full((n, HIDDEN), float(i))))
+        for i, n in enumerate(lengths)
+    ]
+
+    group = _ThreadPCPGroup(world_size)
+    encoded: list[list[float]] = [[] for _ in range(world_size)]
+    results: list[list[torch.Tensor] | None] = [None] * world_size
+
+    def batches(mm_kwargs, **_):
+        # One batch per item; the encoder records which items each rank runs.
+        return [(m, 1, {"x": item["embedding"].data}) for m, item in mm_kwargs]
+
+    def run(rank: int) -> None:
+        group._local.rank = rank
+
+        def embed_multimodal(x):
+            encoded[rank].append(float(x[0, 0]))
+            return [x * 2 + 1]
+
+        runner = _make_runner([], [])
+        runner.model = SimpleNamespace(embed_multimodal=embed_multimodal)
+        runner.pcp_size = world_size
+        results[rank] = runner.execute_mm_encoder(items, lengths)
+
+    mod = "vllm.v1.worker.gpu.mm.encoder_runner"
+    with (
+        patch(f"{mod}.get_pcp_group", return_value=group),
+        patch(f"{mod}.group_and_batch_mm_kwargs", batches),
+    ):
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(world_size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert sorted(sum(encoded, [])) == [float(i) for i in range(num_items)]
+    expected = [item["embedding"].data * 2 + 1 for _, item in items]
+    for out in results:
+        assert out is not None and len(out) == num_items
+        for got, ref in zip(out, expected):
+            torch.testing.assert_close(got, ref, atol=0, rtol=0)

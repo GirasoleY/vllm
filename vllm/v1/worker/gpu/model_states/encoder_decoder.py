@@ -83,7 +83,7 @@ class EncoderDecoderModelState(ModelState):
             req_encoder_inputs = scheduled_encoder_inputs.get(req_id, [])
             if req_encoder_inputs:
                 encoder_inputs[req_id] = req_encoder_inputs
-        _, mm_kwargs = self.encoder_runner.prepare_mm_inputs(encoder_inputs)
+        _, mm_kwargs, _ = self.encoder_runner.prepare_mm_inputs(encoder_inputs)
         if mm_kwargs:
             # Encoder-decoder models consume encoder outputs through the
             # `encoder_outputs` forward kwarg, not `inputs_embeds`. Single modality

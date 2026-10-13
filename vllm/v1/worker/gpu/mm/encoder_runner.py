@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, supports_realtime
+from vllm.model_executor.models.vision import get_load_balance_assignment
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import (
@@ -42,6 +44,7 @@ class EncoderRunner:
         device: torch.device,
         cudagraph_manager: "EncoderCudaGraphManager | None" = None,
         enable_timing: bool = False,
+        pcp_size: int = 1,
     ):
         self.model = model
         self.max_num_tokens = max_num_tokens
@@ -52,6 +55,7 @@ class EncoderRunner:
         self.is_realtime = supports_realtime(model)
         self.cudagraph_manager = cudagraph_manager
         self.enable_timing = enable_timing
+        self.pcp_size = pcp_size
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._timing_lock = threading.Lock()
 
@@ -80,9 +84,11 @@ class EncoderRunner:
 
     def prepare_mm_inputs(
         self, scheduled_encoder_inputs: dict[str, list[int]]
-    ) -> tuple[list[str], list[tuple[str, MultiModalKwargsItem]]]:
+    ) -> tuple[list[str], list[tuple[str, MultiModalKwargsItem]], list[int]]:
+        """Items to encode: their hashes, kwargs and output rows."""
         mm_hashes: list[str] = []
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]] = []
+        num_embeds: list[int] = []
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             mm_features = self.encoder_cache.mm_features[req_id]
             for mm_input_id in encoder_input_ids:
@@ -104,8 +110,9 @@ class EncoderRunner:
                     continue
                 mm_hashes.append(mm_feature.identifier)
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
+                num_embeds.append(mm_feature.mm_position.get_num_embeds())
 
-        return mm_hashes, mm_kwargs
+        return mm_hashes, mm_kwargs, num_embeds
 
     @torch.inference_mode()
     def profile_encoder_cache(
@@ -148,11 +155,31 @@ class EncoderRunner:
 
     @torch.inference_mode()
     def execute_mm_encoder(
-        self, mm_kwargs: list[tuple[str, MultiModalKwargsItem]]
+        self,
+        mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
+        num_embeds: list[int] | None = None,
     ) -> list[torch.Tensor]:
+        # Under PCP, given each item's output rows, each rank encodes a
+        # size-balanced share of the items and one all-gatherv shares the
+        # outputs, so every rank still caches every item.
+        shard = self.pcp_size > 1 and len(mm_kwargs) > 1 and num_embeds is not None
+        pcp = get_pcp_group() if shard else None
+        local_kwargs = mm_kwargs
+        if pcp is not None:
+            # Encoder load proxy: elements of each item's input tensors.
+            sizes = [
+                sum(e.data.numel() for e in item.values() if torch.is_tensor(e.data))
+                for _, item in mm_kwargs
+            ]
+            order, counts, _ = get_load_balance_assignment(sizes, pcp.world_size)
+            starts = np.cumsum([0, *counts])
+            shares = [order[a:b] for a, b in zip(starts[:-1], starts[1:])]
+            local_ids = shares[pcp.rank_in_group]
+            local_kwargs = [mm_kwargs[i] for i in local_ids]
+
         encoder_outputs: list[torch.Tensor] = []
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
+            local_kwargs, device=self.device, pin_memory=PIN_MEMORY
         ):
             cg_manager = self.cudagraph_manager
             cudagraph_output = (
@@ -169,7 +196,28 @@ class EncoderRunner:
             )
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
-        return encoder_outputs
+        if pcp is None:
+            return encoder_outputs
+
+        # Every rank knows each item's rows, so one unpadded all-gatherv in
+        # `order` (the shares back to back) yields every output as a view.
+        assert num_embeds is not None
+        rows = [num_embeds[i] for i in order]
+        assert [(o.shape, o.dtype) for o in encoder_outputs] == [
+            ((num_embeds[i], self.hidden_size), self.dtype) for i in local_ids
+        ]
+        if len(encoder_outputs) == 1:
+            send = encoder_outputs[0]
+        elif encoder_outputs:
+            send = torch.cat(encoder_outputs)
+        else:
+            send = torch.empty(
+                0, self.hidden_size, dtype=self.dtype, device=self.device
+            )
+        rank_rows = [sum(num_embeds[i] for i in idx) for idx in shares]
+        gathered = pcp.all_gatherv(send.contiguous(), dim=0, sizes=rank_rows)
+        views = dict(zip(order, gathered.split(rows)))
+        return [views[i] for i in range(len(mm_kwargs))]
 
     @contextmanager
     def timed_encoder_operation(self, request_ids: Collection[str]):

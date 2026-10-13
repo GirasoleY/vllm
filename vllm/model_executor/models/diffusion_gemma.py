@@ -788,7 +788,7 @@ class DiffusionGemmaModelState(ModelState):
         if not self.supports_mm_inputs:
             return None
 
-        mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
+        mm_hashes, mm_kwargs, _ = self.encoder_runner.prepare_mm_inputs(
             scheduled_encoder_inputs
         )
         if mm_kwargs:
