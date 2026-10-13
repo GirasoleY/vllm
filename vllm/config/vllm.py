@@ -701,10 +701,10 @@ class VllmConfig:
 
         This is `max_num_batched_tokens`, except under PCP without DCP: each
         rank then gets 2 of the `2 * pcp` chunks of each prefill, and all ranks
-        get all decode tokens. Use this to size per-step buffers. The PCP bound
-        is used only where it is proven: no DP, no CUDA graphs (capture sizes
-        go up to `max_num_batched_tokens`), and no speculator or a fixed-length
-        MTP one. `PCPManager.partition_batch` checks it.
+        get all decode tokens. Use this to size per-step buffers; CUDA graph
+        capture sizes are capped at it. The PCP bound is used only where it is
+        proven: no DP, and no speculator or a fixed-length MTP one.
+        `PCPManager.partition_batch` checks it.
         """
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         parallel_config = self.parallel_config
@@ -714,7 +714,6 @@ class VllmConfig:
             pcp <= 1
             or parallel_config.decode_context_parallel_size > 1
             or parallel_config.data_parallel_size > 1
-            or self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             or (spec is not None and (spec.method != "mtp" or spec.parallel_drafting))
         ):
             return max_num_batched_tokens
@@ -2419,7 +2418,8 @@ class VllmConfig:
                     )
                 elif max_num_seqs <= max_cudagraph_capture_size:
                     uniform_decode_sizes = [max_num_seqs]
-            max_num_tokens = self.scheduler_config.max_num_batched_tokens
+            # Capture sizes are per-rank tokens under PCP.
+            max_num_tokens = self.max_num_tokens_per_rank
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
             assert max_cudagraph_capture_size >= 1, (

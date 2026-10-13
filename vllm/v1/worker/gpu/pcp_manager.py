@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
@@ -187,11 +188,15 @@ class PCPManager:
         if (
             is_sparse_mla
             and parallel_config.decode_context_parallel_size == 1
-            and cudagraph_mode != CUDAGraphMode.NONE
+            and cudagraph_mode.has_piecewise_cudagraphs()
+            # Breakable graphs run every metadata-reading op (PCP KV gather,
+            # cache insert, indexer, attention) in an eager break.
+            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
         ):
             raise NotImplementedError(
-                "MRV2 sparse MLA PCP does not support CUDA graphs yet. "
-                "Set -cc.cudagraph_mode=NONE."
+                "MRV2 sparse MLA PCP supports PIECEWISE CUDA graphs only as "
+                "breakable graphs. Set VLLM_USE_BREAKABLE_CUDAGRAPH=1, or use "
+                "-cc.cudagraph_mode=NONE or FULL_DECODE_ONLY."
             )
         if (
             cudagraph_mode.has_full_cudagraphs()
@@ -773,10 +778,10 @@ class PCPManager:
         gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
-    def get_draft_input_buffers(
-        self, input_buffers: InputBuffers
-    ) -> InputBatch | InputBuffers:
-        return self.draft_prefill_batch or input_buffers
+    def get_draft_prefill_input_buffers(self) -> InputBatch | InputBuffers:
+        """Draft prefill inputs: the local batch, else (capture and dummy
+        runs) the persistent PCP buffers it views."""
+        return self.draft_prefill_batch or self.input_buffers
 
     def prepare_draft_prefill(
         self,

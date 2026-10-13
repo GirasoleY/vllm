@@ -538,6 +538,7 @@ def _mock_config_for_cudagraph_sizes(
     )
     config.num_speculative_tokens = VllmConfig.num_speculative_tokens.fget(config)
     config.uniform_decode_query_len = VllmConfig.uniform_decode_query_len.fget(config)
+    config.max_num_tokens_per_rank = max_num_batched_tokens
     return config
 
 
@@ -963,6 +964,25 @@ def test_default_cudagraph_capture_size_still_clamped_by_token_budget():
         == compilation_config.cudagraph_capture_sizes[-1]
     )
     assert 544 not in compilation_config.cudagraph_capture_sizes
+
+
+def test_cudagraph_capture_sizes_capped_at_per_rank_tokens():
+    """Under PCP a rank runs at most `max_num_tokens_per_rank` tokens."""
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.PIECEWISE, max_cudagraph_capture_size=16384
+    )
+    config = _mock_config_for_cudagraph_sizes(
+        max_num_seqs=32,
+        num_speculative_tokens=3,
+        max_num_batched_tokens=32768,
+        compilation_config=compilation_config,
+    )
+    config.max_num_tokens_per_rank = 8384
+
+    VllmConfig._set_cudagraph_sizes(config)
+
+    assert compilation_config.max_cudagraph_capture_size == 8384
+    assert compilation_config.cudagraph_capture_sizes[-1] == 8384
 
 
 @pytest.mark.skipif(

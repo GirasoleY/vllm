@@ -21,6 +21,8 @@ from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.input_batch import InputBuffers
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
@@ -415,6 +417,66 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+class _InputRecorder(torch.nn.Module):
+    def forward(self, input_ids, positions, hidden_states, inputs_embeds):
+        self.input_ids = input_ids
+        return hidden_states
+
+
+def test_pcp_draft_prefill_uses_pcp_buffers(monkeypatch):
+    """Graph replays read capture-time addresses, so draft prefill must read
+    the PCP buffers at both capture and runtime."""
+    speculator = _make_speculator(monkeypatch, torch.zeros(4, 3))
+    speculator.model = recorder = _InputRecorder()
+    speculator.input_buffers = InputBuffers(4, 8, torch.device("cpu"))
+    pcp = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        max_num_reqs=4,
+        max_num_tokens=8,
+    )
+    speculator.pcp_manager = pcp
+    pcp_ptr = pcp.input_buffers.input_ids.data_ptr()
+
+    def input_ptr(draft_prefill: bool) -> int:
+        speculator._run_model(4, None, None, None, draft_prefill=draft_prefill)
+        return recorder.input_ids.data_ptr()
+
+    # Capture: no partitioned batch yet.
+    assert input_ptr(draft_prefill=True) == pcp_ptr
+    # Runtime: the local batch views the PCP buffers.
+    pcp.draft_prefill_batch = SimpleNamespace(
+        input_ids=pcp.input_buffers.input_ids[:4],
+        positions=pcp.input_buffers.positions[:4],
+        is_padding=pcp.input_buffers.is_padding[:4],
+    )
+    assert input_ptr(draft_prefill=True) == pcp_ptr
+    # Draft decodes keep the drafter's buffers.
+    pcp.draft_prefill_batch = None
+    assert (
+        input_ptr(draft_prefill=False) == speculator.input_buffers.input_ids.data_ptr()
+    )
+
+
+def test_pcp_draft_prefill_capture_uses_pcp_buffers():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.last_token_indices = torch.ones(2, dtype=torch.int64)
+    speculator.idx_mapping = torch.ones(2, dtype=torch.int64)
+    speculator.max_num_reqs = 2
+    speculator.num_speculative_steps = 1
+    speculator.model_state = speculator.block_tables = None
+    speculator.target_attn_groups = speculator.kv_cache_config = None
+    speculator.pcp_manager = pcp = SimpleNamespace(input_buffers=object())
+    speculator.prefill_cudagraph_manager = manager = Mock(use_breakable_cg=False)
+
+    speculator.capture()
+
+    args, kwargs = manager.capture.call_args
+    assert args[2] is pcp.input_buffers
+    assert kwargs["pcp_manager"] is pcp
 
 
 @pytest.mark.parametrize(

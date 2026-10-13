@@ -113,6 +113,28 @@ def test_validate_config_rejects_full_graph_for_prefills():
         )
 
 
+@pytest.mark.parametrize("breakable", [True, False])
+@pytest.mark.parametrize(
+    "cudagraph_mode",
+    [
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+    ],
+)
+def test_validate_config_sparse_mla_piecewise_graphs_need_breakable(
+    monkeypatch, breakable, cudagraph_mode
+):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1" if breakable else "0")
+    config = _make_config(cudagraph_mode)
+    config.model_config.hf_text_config = SimpleNamespace(index_topk=2048)
+    if breakable or not cudagraph_mode.has_piecewise_cudagraphs():
+        PCPManager.validate_config(config, supports_mm_inputs=False)
+        return
+    with pytest.raises(NotImplementedError, match="breakable graphs"):
+        PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
 def test_replicated_decode_piecewise_graph_padding(monkeypatch):
     manager = PCPManager(
         pcp_world_size=2,
@@ -527,7 +549,6 @@ def test_per_rank_token_bound_covers_partitioned_batches(pcp_world_size, num_spe
     [
         {"dcp": 2},
         {"dp": 2},
-        {"cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY},
         {"method": "dspark"},
         {"parallel_drafting": True},
     ],
@@ -535,6 +556,11 @@ def test_per_rank_token_bound_covers_partitioned_batches(pcp_world_size, num_spe
 def test_per_rank_token_bound_falls_back_outside_proven_configs(overrides):
     config = _make_bound_config(4, 32768, 32, 3, **overrides)
     assert _max_num_tokens_per_rank(config) == 32768
+
+
+def test_per_rank_token_bound_holds_with_graphs():
+    config = _make_bound_config(4, 32768, 32, 3, cudagraph_mode=CUDAGraphMode.PIECEWISE)
+    assert _max_num_tokens_per_rank(config) == 32768 // 4 + 2 * 32 + 32 * 4
 
 
 def test_per_rank_token_bound_is_noop_without_pcp():

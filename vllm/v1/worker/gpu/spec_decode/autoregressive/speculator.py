@@ -177,14 +177,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if self.prefill_cudagraph_manager.use_breakable_cg:
             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
 
+        # Under PCP the target runs on PCP-local buffers and gathered slot
+        # mappings, and so does draft prefill (see _run_model).
+        target_input_buffers = (
+            self.pcp_manager.input_buffers
+            if self.pcp_manager is not None
+            else self.target_input_buffers
+        )
         self.on_prefill_begin(self.max_num_reqs)
         self.prefill_cudagraph_manager.capture(
             self._prefill,
             self.model_state,
-            self.target_input_buffers,
+            target_input_buffers,
             self.block_tables,
             self.target_attn_groups,
             self.kv_cache_config,
+            pcp_manager=self.pcp_manager,
             progress_bar_desc="Capturing prefill CUDA graphs",
         )
         self.on_prefill_end(self.max_num_reqs)
@@ -413,11 +421,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        draft_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_buffers: InputBatch | InputBuffers = self.input_buffers
         is_padding = None
         if self.pcp_manager is not None:
-            input_buffers = self.pcp_manager.get_draft_input_buffers(self.input_buffers)
+            if draft_prefill:
+                # The same PCP-local buffers at capture and at runtime, so a
+                # graph replay reads this step's inputs.
+                input_buffers = self.pcp_manager.get_draft_prefill_input_buffers()
             is_padding = input_buffers.is_padding[:num_tokens]
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -495,6 +507,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            draft_prefill=True,
         )
         if self.pcp_manager is not None:
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
