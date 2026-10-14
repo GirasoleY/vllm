@@ -11,25 +11,63 @@ from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
-from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
-def _quantize_nvfp4_input(X, GlobalScale, Q, SF, H: tl.constexpr):
-    row = tl.program_id(0)
-    block = tl.program_id(1) * 8 + tl.arange(0, 8)
-    pair = tl.arange(0, 8)
-    offset = block[:, None] * 16 + pair[None, :] * 2
-    x0 = tl.load(X + row * H + offset, offset < H, 0).to(tl.float32)
-    x1 = tl.load(X + row * H + offset + 1, offset < H, 0).to(tl.float32)
-    scale = tl.load(GlobalScale)
-    amax = tl.max(tl.maximum(tl.abs(x0), tl.abs(x1)), 1)
+@triton.jit(do_not_specialize=["num_tokens"])
+def _prepare_nvfp4_megamoe_inputs_kernel(
+    hidden_states,
+    global_scale,
+    x,
+    x_sf,
+    shared_x,
+    shared_x_sf,
+    topk_ids,
+    topk_weights,
+    is_padding,
+    topk_idx_out,
+    topk_weights_out,
+    hidden_stride_m: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_sf_stride_m: tl.constexpr,
+    shared_x_stride_m: tl.constexpr,
+    shared_x_sf_stride_m: tl.constexpr,
+    shared_x_sf_stride_k: tl.constexpr,
+    topk_ids_stride_m: tl.constexpr,
+    topk_weights_stride_m: tl.constexpr,
+    is_padding_stride_m: tl.constexpr,
+    topk_idx_stride_m: tl.constexpr,
+    topk_weights_out_stride_m: tl.constexpr,
+    num_tokens,
+    top_k: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    SHARED_BLOCK_M: tl.constexpr,
+) -> None:
+    BLOCK_K: tl.constexpr = 128
+    token_id = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_mask = token_id < num_tokens
+    k_block_id = tl.program_id(1)
+    k_offsets = k_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
+    hidden_bf16 = tl.load(
+        hidden_states + token_id[:, None] * hidden_stride_m + k_offsets[None, :],
+        mask=token_mask[:, None],
+        # div.rn.f32 takes a slow path for zero dividends.
+        other=1.0,
+    )
+    hidden = hidden_bf16.to(tl.float32)
+
+    # NVFP4: 16-element blocks with E4M3 scales. Exact division preserves
+    # ties-to-even at E2M1 boundaries.
+    scale = tl.load(global_scale)
+    x0, x1 = tl.split(tl.reshape(hidden, [BLOCK_M, BLOCK_K // 2, 2]))
+    pair_amax = tl.maximum(tl.abs(x0), tl.abs(x1))
+    amax = tl.max(tl.reshape(pair_amax, [BLOCK_M, BLOCK_K // 16, 8]), axis=2)
     sf = tl.minimum(448.0, tl.maximum(2.0**-9, tl.div_rn(amax, 6.0 * scale)))
     sf = sf.to(tl.float8e4nv).to(tl.float32)
-    denom = sf[:, None] * scale
-    x0 = tl.div_rn(x0, denom)
-    x1 = tl.div_rn(x1, denom)
+    denom = (sf * scale)[:, :, None]
+    x0 = tl.div_rn(tl.reshape(x0, [BLOCK_M, BLOCK_K // 16, 8]), denom)
+    x1 = tl.div_rn(tl.reshape(x1, [BLOCK_M, BLOCK_K // 16, 8]), denom)
     packed = tl.inline_asm_elementwise(
         "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
         " cvt.u32.u8 $0, tmp; }",
@@ -39,8 +77,170 @@ def _quantize_nvfp4_input(X, GlobalScale, Q, SF, H: tl.constexpr):
         is_pure=True,
         pack=1,
     )
-    tl.store(Q + row * (H // 2) + offset // 2, packed.to(tl.uint8), offset < H)
-    tl.store(SF + row * (H // 16) + block, sf, block < H // 16)
+    packed = tl.reshape(packed, [BLOCK_M, BLOCK_K // 2]).to(tl.uint8)
+    q_offsets = k_block_id * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+    tl.store(
+        x + token_id[:, None] * x_stride_m + q_offsets[None, :],
+        packed,
+        mask=token_mask[:, None],
+    )
+    sf_offsets = k_block_id * (BLOCK_K // 16) + tl.arange(0, BLOCK_K // 16)
+    tl.store(
+        x_sf + token_id[:, None] * x_sf_stride_m + sf_offsets[None, :],
+        sf.to(tl.float8e4nv),
+        mask=token_mask[:, None],
+    )
+
+    if shared_x_sf is not None:
+        # Block-FP8 shared expert: 32-element groups with UE8M0 scales, packed
+        # four per int32 in DeepGEMM's MN-major, BLOCK_M-permuted layout.
+        groups = tl.reshape(hidden, [BLOCK_M, BLOCK_K // 32, 32])
+        group_amax = tl.maximum(tl.max(tl.abs(groups), axis=2), 1.0e-4)
+        scale_bits = (group_amax / 448.0).to(tl.uint32, bitcast=True)
+        scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
+            tl.uint32
+        )
+        scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
+        rounded_scale = (scale_exp << 23).to(tl.float32, bitcast=True)
+        fp8 = tl.reshape(groups * (1.0 / rounded_scale)[:, :, None], [BLOCK_M, BLOCK_K])
+        tl.store(
+            shared_x + token_id[:, None] * shared_x_stride_m + k_offsets[None, :],
+            fp8.to(tl.float8e4nv),
+            mask=token_mask[:, None],
+        )
+        packed_scale = tl.sum(
+            scale_exp << (tl.arange(0, BLOCK_K // 32)[None, :] * 8), axis=1
+        ).to(tl.int32)
+        m_in_block = token_id % SHARED_BLOCK_M
+        aligned_block_m: tl.constexpr = triton.cdiv(SHARED_BLOCK_M, 128) * 128
+        shared_row = (
+            (token_id // SHARED_BLOCK_M) * aligned_block_m
+            + (m_in_block // 128) * 128
+            + (m_in_block % 32) * 4
+            + (m_in_block % 128) // 32
+        )
+        tl.store(
+            shared_x_sf
+            + shared_row * shared_x_sf_stride_m
+            + k_block_id * shared_x_sf_stride_k,
+            packed_scale,
+            mask=token_mask,
+        )
+    elif shared_x is not None:
+        tl.store(
+            shared_x + token_id[:, None] * shared_x_stride_m + k_offsets[None, :],
+            hidden_bf16,
+            mask=token_mask[:, None],
+        )
+
+    if k_block_id == 0:
+        topk_offsets = tl.arange(0, BLOCK_TOPK)
+        topk_mask = token_mask[:, None] & (topk_offsets[None, :] < top_k)
+        token_is_padding = tl.full((BLOCK_M,), False, tl.int1)
+        if is_padding is not None:
+            token_is_padding = tl.load(
+                is_padding + token_id * is_padding_stride_m,
+                mask=token_mask,
+                other=True,
+            )
+        ids = tl.load(
+            topk_ids + token_id[:, None] * topk_ids_stride_m + topk_offsets[None, :],
+            mask=topk_mask,
+            other=0,
+        ).to(tl.int64)
+        ids = tl.where(token_is_padding[:, None], -1, ids)
+        tl.store(
+            topk_idx_out
+            + token_id[:, None] * topk_idx_stride_m
+            + topk_offsets[None, :],
+            ids,
+            mask=topk_mask,
+        )
+        weights = tl.load(
+            topk_weights
+            + token_id[:, None] * topk_weights_stride_m
+            + topk_offsets[None, :],
+            mask=topk_mask,
+            other=0.0,
+        )
+        weights = tl.where(token_is_padding[:, None], 0.0, weights)
+        tl.store(
+            topk_weights_out
+            + token_id[:, None] * topk_weights_out_stride_m
+            + topk_offsets[None, :],
+            weights,
+            mask=topk_mask,
+        )
+
+
+def prepare_nvfp4_megamoe_inputs(
+    hidden_states: torch.Tensor,
+    global_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_idx_out: torch.Tensor,
+    topk_weights_out: torch.Tensor,
+    is_padding: torch.Tensor | None = None,
+    shared_x: torch.Tensor | None = None,
+    shared_x_sf: torch.Tensor | None = None,
+    shared_block_m: int | None = None,
+) -> None:
+    """Stage NVFP4 MegaMoE inputs in one pass over ``hidden_states``.
+
+    Writes the NVFP4 routed-expert activations (``x``: packed E2M1 bytes,
+    ``x_sf``: E4M3 scales), the shared-expert activations (``shared_x``:
+    block-FP8 when ``shared_x_sf`` is given, else a BF16 copy) and the top-k
+    routing with padded tokens masked to expert -1 / weight 0.
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    if num_tokens == 0:
+        return
+    assert hidden_size % 128 == 0
+    assert hidden_states.stride(1) == 1
+    assert topk_weights.shape == topk_ids.shape
+    assert (shared_x_sf is None) == (shared_block_m is None)
+    assert shared_x_sf is None or shared_x is not None
+    top_k = topk_ids.shape[1]
+    if num_tokens < 8:
+        block_m, num_warps = 1, 1
+    elif num_tokens < 128:
+        block_m, num_warps = 4, 4
+    else:
+        block_m, num_warps = 8, 4 if num_tokens < 256 else 2
+    _prepare_nvfp4_megamoe_inputs_kernel[
+        (triton.cdiv(num_tokens, block_m), hidden_size // 128)
+    ](
+        hidden_states,
+        global_scale,
+        x,
+        x_sf,
+        shared_x,
+        shared_x_sf,
+        topk_ids,
+        topk_weights,
+        is_padding,
+        topk_idx_out,
+        topk_weights_out,
+        hidden_states.stride(0),
+        x.stride(0),
+        x_sf.stride(0),
+        shared_x.stride(0) if shared_x is not None else 0,
+        shared_x_sf.stride(0) if shared_x_sf is not None else 0,
+        shared_x_sf.stride(1) if shared_x_sf is not None else 0,
+        topk_ids.stride(0),
+        topk_weights.stride(0),
+        is_padding.stride(0) if is_padding is not None else 0,
+        topk_idx_out.stride(0),
+        topk_weights_out.stride(0),
+        num_tokens,
+        top_k,
+        BLOCK_M=block_m,
+        BLOCK_TOPK=triton.next_power_of_2(top_k),
+        SHARED_BLOCK_M=shared_block_m or 1,
+        num_warps=num_warps,
+    )
 
 
 class HYV4NVFP4MegaMoEExperts(DeepseekV4MegaMoEExperts):
@@ -231,12 +431,6 @@ class HYV4NVFP4MegaMoEExperts(DeepseekV4MegaMoEExperts):
                 shared,
                 shared_dtype=self.shared_dtype,
             )
-            if shared and self.shared_dtype == torch.float8_e4m3fn:
-                buffer.shared_sf_scratch = torch.empty(
-                    (buffer.num_max_tokens_per_rank, self.hidden_size // 128),
-                    dtype=torch.int32,
-                    device=buffer.x.device,
-                )
             self._nvfp4_buffer_cache[key] = buffer
         return self._nvfp4_buffer_cache[key]
 
@@ -260,19 +454,11 @@ class HYV4NVFP4MegaMoEExperts(DeepseekV4MegaMoEExperts):
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
         if m:
-            # Exact division preserves ties-to-even at E2M1 boundaries.
-            _quantize_nvfp4_input[(m, triton.cdiv(self.hidden_size, 128))](
-                hidden_states.contiguous(),
-                self.input_global_scale,
-                buffer.x[:m].view(torch.uint8),
-                buffer.x_sf[:m].view(torch.float8_e4m3fn),
-                self.hidden_size,
-                num_warps=4,
-            )
-            if (
-                self.has_fused_shared_experts
-                and self.shared_dtype == torch.float8_e4m3fn
-            ):
+            shared_x = shared_x_sf = block_m = None
+            if self.has_fused_shared_experts:
+                shared_x = buffer.shared_l1_acts[:m]
+            if shared_x is not None and self.shared_dtype == torch.float8_e4m3fn:
+                shared_x_sf = buffer.shared_l1_acts_sf
                 block_m = dg.get_block_m_for_nvfp4_mega_moe(
                     get_ep_group().world_size,
                     self.num_experts,
@@ -280,26 +466,20 @@ class HYV4NVFP4MegaMoEExperts(DeepseekV4MegaMoEExperts):
                     m,
                     self.top_k,
                 )
-                prepare_megamoe_inputs(
-                    hidden_states,
-                    topk_weights,
-                    topk_ids,
-                    buffer.shared_l1_acts[:m],
-                    buffer.shared_sf_scratch[:m],
-                    buffer.topk_idx[:m],
-                    buffer.topk_weights[:m],
-                    is_padding=padding,
-                    shared_x_sf=buffer.shared_l1_acts_sf,
-                    shared_block_m=block_m,
-                )
-            else:
-                buffer.topk_idx[:m].copy_(topk_ids)
-                buffer.topk_weights[:m].copy_(topk_weights)
-                if padding is not None:
-                    buffer.topk_idx[:m].masked_fill_(padding[:, None], -1)
-                    buffer.topk_weights[:m].masked_fill_(padding[:, None], 0)
-                if self.has_fused_shared_experts:
-                    buffer.shared_l1_acts[:m].copy_(hidden_states)
+            prepare_nvfp4_megamoe_inputs(
+                hidden_states.contiguous(),
+                self.input_global_scale,
+                topk_weights,
+                topk_ids,
+                buffer.x[:m].view(torch.uint8),
+                buffer.x_sf[:m].view(torch.float8_e4m3fn),
+                buffer.topk_idx[:m],
+                buffer.topk_weights[:m],
+                is_padding=padding,
+                shared_x=shared_x,
+                shared_x_sf=shared_x_sf,
+                shared_block_m=block_m,
+            )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         dg.nvfp4_mega_moe(
             y,
