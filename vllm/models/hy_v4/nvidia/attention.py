@@ -206,6 +206,36 @@ def is_skip_topk_indexer_weight(weight_name: str, skip_topk_layers: set[int]) ->
     return match is not None and int(match.group(1)) in skip_topk_layers
 
 
+def check_pp_stage_topk_sharing(
+    config: PretrainedConfig, start_layer: int, end_layer: int
+) -> None:
+    """Reject a PP stage whose first sparse layer is "shared", for models that
+    do not pass top-k indices between stages."""
+    layer_types = getattr(config, "layer_types", None) or []
+    first_sparse = next(
+        (
+            layer_idx
+            for layer_idx in range(start_layer, min(end_layer, len(layer_types)))
+            if layer_types[layer_idx] in _SPARSE_LAYER_TYPES
+        ),
+        None,
+    )
+    skip_layers = compute_skip_topk_layers(config)
+    if first_sparse not in skip_layers:
+        return
+    valid_starts = [
+        layer_idx
+        for layer_idx in range(1, config.num_hidden_layers)
+        if layer_idx not in skip_layers
+    ]
+    raise ValueError(
+        f"The PP stage starting at layer {start_layer} would begin on a layer "
+        "that reuses top-k indices computed on the previous stage. Set "
+        "VLLM_PP_LAYER_PARTITION so that every stage after the first starts on "
+        f"one of layers {valid_starts}."
+    )
+
+
 class Indexer(nn.Module):
     """Lightning indexer selecting the top-k tokens for sparse MLA."""
 

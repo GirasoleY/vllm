@@ -66,6 +66,7 @@ from vllm.sequence import IntermediateTensors
 
 from ..nvidia.attention import (
     HYV4MLAAttention,
+    check_pp_stage_topk_sharing,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
 )
@@ -260,6 +261,8 @@ class HYV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        if get_pp_group().world_size > 1:
+            check_pp_stage_topk_sharing(config, self.start_layer, self.end_layer)
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         else:

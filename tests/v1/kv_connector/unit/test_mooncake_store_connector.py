@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -1058,3 +1059,29 @@ def test_shutdown_scheduler_role_is_noop():
     # Scheduler role holds no store handle, so shutdown must be a safe no-op.
     assert connector.connector_worker is None
     connector.shutdown()
+
+
+def test_pp_prefill_handshake_passes_through_multi_connector():
+    """A PP prefill running MultiConnector(NixlConnector, MooncakeStoreConnector)
+    hands every sub-connector handshake metadata keyed by (pp_rank, tp_rank). The
+    store uses none of it, so pp_rank > 0 must not fail engine init, and the NIXL
+    side must still receive every stage's metadata."""
+    vllm_config = _make_vllm_config()
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "connector.MooncakeStoreScheduler"
+        ),
+    ):
+        store = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, _make_kv_cache_config()
+        )
+    nixl = MagicMock()
+    multi = object.__new__(MultiConnector)
+    multi._connectors = [nixl, store]
+    metadata = {(0, 0): MagicMock(), (1, 0): MagicMock()}
+
+    multi.set_xfer_handshake_metadata_pp_aware(metadata)
+
+    nixl.set_xfer_handshake_metadata_pp_aware.assert_called_once_with(metadata)

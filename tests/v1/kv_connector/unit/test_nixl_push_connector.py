@@ -784,6 +784,7 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     # _cleanup_remote_engine touches these when reaping an engine.
     w.nixl_wrapper = MagicMock()
     w.dst_xfer_side_handles = {}
+    w._remote_pp_stages = {}
     w.kv_caches_base_addr = {}
     w.dst_num_blocks = {}
     w.tp_mappings = {}

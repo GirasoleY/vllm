@@ -1397,3 +1397,174 @@ def test_ring_scratch_without_mamba_registers_and_addresses_its_own_regions():
     )
     # Paged block 1 in both regions; ring block 0 only in its scratch region.
     assert sorted(desc_ids.tolist()) == sorted([0 * 2 + 1, 1 * 2 + 1, 1 * 2 + 0])
+
+
+_PP_TARGET_LAYERS = [f"model.layers.{i}.self_attn.attn" for i in range(4)]
+# A speculative draft's layer, held by the last prefill PP stage.
+_PP_DRAFT_LAYER = "model.layers.4.self_attn.attn"
+
+
+def _make_fa_worker(engine_id, layer_names, num_blocks=8):
+    """Pull worker with one full-attention KV region per layer."""
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    page = spec.page_size_bytes
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * page,
+                layers=[name],
+                layer_stride=num_blocks * page,
+                block_stride=page,
+            )
+            for name in layer_names
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(list(layer_names), spec)],
+    )
+    vllm_config = create_vllm_config(block_size=4)
+    vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+    fake_backend = MagicMock()
+    fake_backend.get_supported_kernel_block_sizes.return_value = [4]
+    fake_backend.get_name.return_value = "TEST_ATTN"
+    fake_backend.full_cls_name.return_value = "test.AttentionBackend"
+    fake_platform = MagicMock()
+    fake_platform.device_type = "cuda"
+    fake_platform.get_nixl_memory_type.return_value = "VRAM"
+
+    with (
+        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
+        patch.object(bw, "current_platform", fake_platform),
+        set_current_vllm_config(vllm_config),
+    ):
+        worker = NixlConnectorWorker(vllm_config, engine_id, kv_cache_config)
+        worker.register_kv_caches(
+            {
+                name: torch.zeros((num_blocks, page), dtype=torch.uint8)
+                for name in layer_names
+            }
+        )
+    return worker
+
+
+def _pp_stage_metadata(stage_worker, pp_rank):
+    """The handshake metadata one prefill PP stage advertises."""
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    metadata = msgspec.msgpack.decode(
+        stage_worker.xfer_handshake_metadata.agent_metadata_bytes,
+        type=NixlAgentMetadata,
+    )
+    metadata.agent_metadata = f"prefill-pp{pp_rank}".encode()
+    return metadata
+
+
+@pytest.mark.cpu_test
+def test_pull_from_pp_stages_reads_each_layer_from_its_stage():
+    """A PP=1 decoder reads each layer, the draft's included, from the prefill
+    PP stage holding it into the same local layer and blocks."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    decode = _make_fa_worker("decode", [*_PP_TARGET_LAYERS, _PP_DRAFT_LAYER])
+    stages = [
+        _make_fa_worker("prefill", _PP_TARGET_LAYERS[:2]),
+        _make_fa_worker("prefill", [*_PP_TARGET_LAYERS[2:], _PP_DRAFT_LAYER]),
+    ]
+    decode.nixl_wrapper.add_remote_agent = bytes.decode
+    decode._remote_agents["prefill"] = {
+        (pp_rank, 0): decode.add_remote_agent(
+            _pp_stage_metadata(stage, pp_rank),
+            remote_pp_rank=pp_rank,
+            remote_pp_size=len(stages),
+        )
+        for pp_rank, stage in enumerate(stages)
+    }
+
+    local_ids, remote_ids = [1, 5], [2, 6]
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="req",
+        local_block_ids=(local_ids,),
+        kv_transfer_params={
+            "remote_block_ids": (remote_ids,),
+            "remote_engine_id": "prefill",
+            "remote_request_id": "prefill-req",
+            "remote_host": "prefill-host",
+            "remote_port": 1234,
+            "tp_size": 1,
+            "pp_size": len(stages),
+        },
+    )
+    meta = metadata.reqs_to_recv["req"]
+    decode._recving_metadata["req"] = meta
+    decode._read_blocks_for_req("req", meta)
+
+    def block_at(worker, addr):
+        for name, cache in worker.device_kv_caches.items():
+            offset = addr - cache.data_ptr()
+            if 0 <= offset < cache.nbytes:
+                return name, offset // cache.stride(0)
+        raise AssertionError(f"{addr:#x} is outside every KV cache")
+
+    nixl = decode.nixl_wrapper
+    assert len(nixl.xfers) == len(stages)
+    pairs = set()
+    for pp_rank, xfer in enumerate(nixl.xfers):
+        _, local_handle, local_descs, remote_handle, remote_descs = xfer
+        pp_stage = decode._remote_pp_stages["prefill"][pp_rank]
+        assert remote_handle == pp_stage.xfer_side_handles[0]
+        for local_desc, remote_desc in zip(local_descs, remote_descs, strict=True):
+            local_addr = int(nixl.dlists[local_handle][local_desc, 0])
+            remote_addr = int(nixl.dlists[remote_handle][remote_desc, 0])
+            pairs.add(
+                (
+                    pp_rank,
+                    block_at(decode, local_addr),
+                    block_at(stages[pp_rank], remote_addr),
+                )
+            )
+    assert pairs == {
+        (pp_rank, (name, local_block), (name, remote_block))
+        for pp_rank, stage in enumerate(stages)
+        for name in stage.device_kv_caches
+        for local_block, remote_block in zip(local_ids, remote_ids)
+    }
+
+
+@pytest.mark.cpu_test
+def test_pull_from_pp_stages_rejects_a_layer_no_stage_holds():
+    """A local layer no prefill PP stage holds would keep stale KV."""
+    decode = _make_fa_worker("decode", _PP_TARGET_LAYERS)
+    stages = [
+        _make_fa_worker("prefill", _PP_TARGET_LAYERS[:1]),
+        _make_fa_worker("prefill", _PP_TARGET_LAYERS[2:]),
+    ]
+    decode.add_remote_agent(
+        _pp_stage_metadata(stages[0], 0), remote_pp_rank=0, remote_pp_size=2
+    )
+    with pytest.raises(RuntimeError, match="exactly once"):
+        decode.add_remote_agent(
+            _pp_stage_metadata(stages[1], 1), remote_pp_rank=1, remote_pp_size=2
+        )

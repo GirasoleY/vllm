@@ -106,6 +106,14 @@ By default, a **compatibility hash** is checked during handshake. P and D instan
 
 ### Pipeline parallelism
 
+The default (pull) NixlConnector supports a PP-sharded prefiller
+(`pipeline-parallel-size > 1`) feeding a `PP=1` decoder when the KV cache
+is not hybrid (e.g. `--disable-hybrid-kv-cache-manager`). The decoder
+handshakes with every prefill stage and reads each stage's layers, paired
+by layer name, into its own; this includes a speculative draft's layers on
+the last stage. Decode-side PP, DCP and Mamba layouts are not supported
+there.
+
 The default (pull) NixlConnector does **not** support
 `pipeline-parallel-size > 1` together with a hybrid KV cache (HMA)
 layout: region indices are not a stable identity across the

@@ -454,6 +454,12 @@ class HYV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # The top-k buffer travels with the hidden states, so a stage that starts
+        # on a "shared" indexer layer reuses the previous stage's indices.
+        pp_group = get_pp_group()
+        has_topk = self.topk_indices_buffer is not None
+        self.recv_topk = has_topk and not pp_group.is_first_rank
+        self.send_topk = has_topk and not pp_group.is_last_rank
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         else:
@@ -481,6 +487,23 @@ class HYV4Model(nn.Module):
                     ["hidden_states", "residual"], config.hidden_size
                 )
             )
+        if self.recv_topk:
+            make_hidden_tensors = self.make_empty_intermediate_tensors
+
+            def make_empty_intermediate_tensors(
+                batch_size: int, dtype: torch.dtype, device: torch.device
+            ) -> IntermediateTensors:
+                tensors = make_hidden_tensors(batch_size, dtype, device)
+                # -1 is an invalid index, so dummy batches never read the cache.
+                tensors["topk_indices"] = torch.full(
+                    (batch_size, config.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                return tensors
+
+            self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
 
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
@@ -574,6 +597,10 @@ class HYV4Model(nn.Module):
             # previous PP stage is reshaped back to 3D by the first layer's
             # prepare_input, and residual is unused.
             residual = None if self.enable_ihc else intermediate_tensors["residual"]
+            if self.recv_topk:
+                assert self.topk_indices_buffer is not None
+                topk_indices = intermediate_tensors["topk_indices"]
+                self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
 
         num_tokens = hidden_states.shape[0]
         if self.use_sequence_parallel:
@@ -617,10 +644,15 @@ class HYV4Model(nn.Module):
             if self.enable_ihc:
                 # hidden_states is [num_tokens, hc, h]; flatten the channel dim
                 # for PP transfer (matches the 2D receive buffer).
-                return IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                tensors = {"hidden_states": hidden_states.flatten(1)}
+            else:
+                tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.send_topk:
+                assert self.topk_indices_buffer is not None
+                # Cloned: the next micro-batch rewrites the buffer while this
+                # send may still be in flight.
+                tensors["topk_indices"] = self.topk_indices_buffer[:num_tokens].clone()
+            return IntermediateTensors(tensors)
         if self.enable_ihc:
             hidden_states = self.hc_head(hidden_states)
         else:
