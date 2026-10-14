@@ -991,6 +991,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
+# nvshmem4py for moe_backend=flashinfer_moe_ep_mega_cutedsl; NVSHMEM itself comes with torch.
+ARG NVSHMEM4PY_VERSION=0.4.0
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system --no-deps \
+        nvshmem4py-cu$(echo $CUDA_VERSION | cut -d. -f1)==${NVSHMEM4PY_VERSION}
+
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
 # Pre-install these to avoid reinstalling on every vLLM wheel rebuild

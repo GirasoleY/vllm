@@ -173,6 +173,9 @@ FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
         "DeepseekV41ForCausalLM",
+        "HYV4ForCausalLM",
+        "HYV4MTPModel",
+        "HYV4VLForConditionalGeneration",
     }
 )
 
@@ -186,7 +189,7 @@ def validate_flashinfer_moe_ep_model(
     if not any(arch in FLASHINFER_MOE_EP_ARCHITECTURES for arch in architectures):
         raise ValueError(
             f"moe_backend={moe_backend!r} is only supported for DeepSeek-V4 "
-            f"models ({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
+            f"and HY4 models ({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
             f"model is {list(architectures)}."
         )
 

@@ -53,6 +53,7 @@ class _FakeNvfp4CutedslMegaMoeConfig:
     top_k: int
     activation_clamp: float | None
     fast_math: bool
+    combine_dtype: str = "bf16"
 
 
 @dataclass
@@ -109,8 +110,17 @@ def test_fi_moe_ep_backend_rejected_for_non_dsv4(moe_backend):
 
 
 @pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
-def test_fi_moe_ep_backend_accepted_for_dsv4(moe_backend):
-    validate_flashinfer_moe_ep_model(moe_backend, ["DeepseekV4ForCausalLM"])
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "DeepseekV4ForCausalLM",
+        "HYV4ForCausalLM",
+        "HYV4MTPModel",
+        "HYV4VLForConditionalGeneration",
+    ],
+)
+def test_fi_moe_ep_backend_accepted(moe_backend, architecture):
+    validate_flashinfer_moe_ep_model(moe_backend, [architecture])
 
 
 @pytest.mark.parametrize(
@@ -216,6 +226,7 @@ def test_build_fi_mega_config_selects_kernel_config(fake_flashinfer):
         megakernel="nvfp4_cutedsl",
     )
     assert isinstance(cd.megakernel, _FakeNvfp4CutedslMegaMoeConfig)
+    assert cd.megakernel.combine_dtype == "bf16"
 
     with pytest.raises(ValueError, match="Unsupported fi_moe_ep megakernel"):
         build_fi_mega_config(
@@ -237,6 +248,12 @@ def test_ckpt_uses_nvfp4_experts_reads_moe_quant_algo():
 
     no_algo = SimpleNamespace(quant_config=SimpleNamespace())
     assert not ckpt_uses_nvfp4_experts(no_algo)
+
+    hyv4 = SimpleNamespace(quant_config=SimpleNamespace(store_dtype="nvfp4"))
+    assert ckpt_uses_nvfp4_experts(hyv4)
+
+    hyv4_mxfp4 = SimpleNamespace(quant_config=SimpleNamespace(store_dtype="mxfp4"))
+    assert not ckpt_uses_nvfp4_experts(hyv4_mxfp4)
 
 
 def test_dequant_fp4_ue8m0_gran32_decodes_lut_and_scales():

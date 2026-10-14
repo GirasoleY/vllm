@@ -511,10 +511,14 @@ def test_nvfp4_megamoe_loads_packed_weights_and_both_scale_levels(monkeypatch):
     assert (adapter.w2_input_scale == 0.0625).all()
 
 
+@pytest.mark.parametrize(
+    "moe_backend", ["deep_gemm_mega_moe", "flashinfer_moe_ep_mega_cutedsl"]
+)
 @pytest.mark.parametrize("algorithm", ["NVFP4", "NONE", None])
-def test_mtp_megamoe_uses_nvfp4_experts(monkeypatch, algorithm):
+def test_mtp_megamoe_uses_nvfp4_experts(monkeypatch, algorithm, moe_backend):
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.models.deepseek_v4.nvidia.fi_moe import DeepseekV4MegaMoEExpertsFI
     from vllm.models.hy_v4.nvidia import moe
     from vllm.models.hy_v4.nvidia.mtp import _create_mtp_quant_config
     from vllm.models.hy_v4.nvidia.nvfp4_moe import HYV4NVFP4MegaMoEExperts
@@ -537,7 +541,7 @@ def test_mtp_megamoe_uses_nvfp4_experts(monkeypatch, algorithm):
     quant = _create_mtp_quant_config(config, backbone)
     assert quant is backbone
     runtime = SimpleNamespace(
-        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
         parallel_config=SimpleNamespace(
             enable_expert_parallel=True,
             enable_eplb=False,
@@ -545,6 +549,7 @@ def test_mtp_megamoe_uses_nvfp4_experts(monkeypatch, algorithm):
         ),
         max_num_tokens_per_rank=32,
         compilation_config=SimpleNamespace(static_forward_context={}),
+        quant_config=quant,
     )
     monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(
@@ -558,8 +563,11 @@ def test_mtp_megamoe_uses_nvfp4_experts(monkeypatch, algorithm):
     with set_current_vllm_config(runtime):
         draft = moe.HYV4MoEFused(config, quant, is_mtp=True)
     assert draft.use_mega_moe
-    assert isinstance(draft.experts, HYV4NVFP4MegaMoEExperts)
-    assert draft.experts.mma_type == "nvfp4"
+    if moe_backend == "deep_gemm_mega_moe":
+        assert isinstance(draft.experts, HYV4NVFP4MegaMoEExperts)
+    else:
+        assert isinstance(draft.experts, DeepseekV4MegaMoEExpertsFI)
+    assert draft.experts.w13_weight_scale.dtype == torch.float8_e4m3fn
 
 
 def test_mtp_nvfp4_rejects_incompatible_backbone():

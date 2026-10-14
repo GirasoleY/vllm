@@ -260,11 +260,14 @@ def build_fi_mega_config(
             fast_math=True,
         )
     elif megakernel == "nvfp4_cutedsl":
+        import vllm.envs as envs
+
         mk = Nvfp4CutedslMegaMoeConfig(
             intermediate_size=intermediate_size,
             top_k=top_k,
             activation_clamp=activation_clamp,
             fast_math=True,
+            combine_dtype=envs.VLLM_FI_MOE_EP_COMBINE_DTYPE,
         )
     else:
         raise ValueError(f"Unsupported fi_moe_ep megakernel {megakernel!r}")

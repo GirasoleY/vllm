@@ -35,9 +35,13 @@ def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
 
     DeepSeek-V4 NVFP4-expert checkpoints declare ``moe_quant_algo: NVFP4`` in
     their ``quantization_config``, which DeepseekV4FP8Config surfaces as
-    ``moe_quant_algo``.
+    ``moe_quant_algo``; HYV4 ones set ``store_dtype: nvfp4``.
     """
-    return getattr(vllm_config.quant_config, "moe_quant_algo", "") == "NVFP4"
+    quant_config = vllm_config.quant_config
+    return (
+        getattr(quant_config, "moe_quant_algo", "") == "NVFP4"
+        or getattr(quant_config, "store_dtype", None) == "nvfp4"
+    )
 
 
 def resolve_mega_moe_is_padding(num_tokens: int) -> torch.Tensor | None:

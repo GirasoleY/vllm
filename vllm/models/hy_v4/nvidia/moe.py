@@ -11,6 +11,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
+from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -29,6 +30,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
 )
 from vllm.models.hy_v4.nvidia.prefill import fp8_linear, packed_fp8_kernel
+from vllm.utils.flashinfer_moe_ep import (
+    is_fi_moe_ep_backend,
+    validate_fi_moe_ep_config,
+)
 
 logger = init_logger(__name__)
 
@@ -42,7 +47,7 @@ def use_hyv4_sequence_parallel(vllm_config: VllmConfig) -> bool:
     """
     parallel_config = vllm_config.parallel_config
     return (
-        vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
@@ -176,13 +181,17 @@ class HYV4MoEFused(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        requested_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
+        moe_backend = vllm_config.kernel_config.moe_backend
+        requested_mega_moe = moe_backend in MEGA_MOE_BACKENDS
+        validate_fi_moe_ep_config(vllm_config)
         nvfp4 = getattr(quant_config, "store_dtype", None) == "nvfp4"
+        # FlashInfer runs NVFP4 experts only; other MTP formats keep their path.
+        use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend) and nvfp4
+        if is_fi_moe_ep_backend(moe_backend) and not nvfp4 and not is_mtp:
+            raise ValueError(f"moe_backend={moe_backend} requires NVFP4 experts.")
         if nvfp4 and (not requested_mega_moe or (is_mtp and self.tp_size != 1)):
             raise NotImplementedError(
-                "HYV4 NVFP4 requires deep_gemm_mega_moe (and TP=1 for MTP)"
+                "HYV4 NVFP4 requires a MegaMoE backend (and TP=1 for MTP)"
             )
         fp8_weight_block_size = (
             quant_config.weight_block_size
@@ -257,16 +266,28 @@ class HYV4MoEFused(nn.Module):
 
             # Shared experts hold full weights on every rank (replicated under
             # sequence parallel), so they can run inside the MegaMoE kernel.
-            fuse_shared_experts = self.shared_experts is not None and (
-                self.use_sequence_parallel or self.tp_size == 1
+            # FlashInfer has no shared-expert fusion: forward runs them serially.
+            fuse_shared_experts = (
+                self.shared_experts is not None
+                and not use_fi_mega_moe
+                and (self.use_sequence_parallel or self.tp_size == 1)
             )
             experts_cls = DeepseekV4MegaMoEExperts
-            if nvfp4:
+            expert_kwargs: dict = {}
+            if use_fi_mega_moe:
+                from vllm.models.deepseek_v4.nvidia.fi_moe import (
+                    DeepseekV4MegaMoEExpertsFI,
+                )
+
+                experts_cls = DeepseekV4MegaMoEExpertsFI
+                expert_kwargs = {"activation_clamp": moe_swiglu_limit}
+            elif nvfp4:
                 from .nvfp4_moe import HYV4NVFP4MegaMoEExperts
 
                 experts_cls = HYV4NVFP4MegaMoEExperts
             self.experts = experts_cls(
                 vllm_config,
+                **expert_kwargs,
                 num_experts=self.n_physical_experts,
                 num_local_experts=self.n_local_physical_experts,
                 experts_start_idx=self.physical_expert_start,
@@ -296,9 +317,10 @@ class HYV4MoEFused(nn.Module):
                 e_score_correction_bias=self.expert_bias,
             )
             logger.info_once(
-                "HYV4 %s routed experts use DeepGEMM MegaMoE (%s).",
+                "HYV4 %s routed experts use %s MegaMoE (%s).",
                 "MTP" if is_mtp else "target",
-                self.experts.mma_type,
+                "FlashInfer" if use_fi_mega_moe else "DeepGEMM",
+                "nvfp4" if use_fi_mega_moe else self.experts.mma_type,
             )
             return
 
