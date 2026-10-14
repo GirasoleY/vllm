@@ -87,6 +87,7 @@ from vllm.v1.kv_cache_interface import (
     group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.gpu.generic_kvp import get_generic_kvp_rank, get_generic_kvp_size
 
 from .metrics import MooncakeStoreConnectorStats
 
@@ -1444,6 +1445,13 @@ class MooncakeStoreWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        # DCP gather: rank r stores page r of every scheduler block.
+        self.generic_kvp = get_generic_kvp_size() > 1
+        if self.generic_kvp:
+            self.dcp_size, self.dcp_rank = (
+                get_generic_kvp_size(),
+                get_generic_kvp_rank(),
+            )
 
         assert vllm_config.kv_transfer_config is not None
         kv_role = vllm_config.kv_transfer_config.kv_role
@@ -1780,9 +1788,16 @@ class MooncakeStoreWorker:
     def _init_lookup_key_prefixes(self) -> None:
         def rank_namespaces(factor: int) -> tuple[tuple[int, int, int, int], ...]:
             if self.dcp_size > 1:
-                # DCP is a TP subdivision: dcp_rank == tp_rank % dcp_size.
+                # DCP is a TP subdivision: dcp_rank == tp_rank % dcp_size. DCP
+                # gather shards over PCP x TP instead, with TP innermost.
+                pcp_stride = self.tp_size if self.generic_kvp else 0
                 return tuple(
-                    (tp_rank, pcp_rank, tp_rank % self.dcp_size, pp_rank)
+                    (
+                        tp_rank,
+                        pcp_rank,
+                        (pcp_rank * pcp_stride + tp_rank) % self.dcp_size,
+                        pp_rank,
+                    )
                     for pcp_rank in range(self.pcp_size)
                     for tp_rank in range(self.tp_size)
                     for pp_rank in range(self.pp_size)

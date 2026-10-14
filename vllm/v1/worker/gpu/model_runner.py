@@ -63,6 +63,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+from vllm.v1.core.kv_cache_utils import dcp_world_size_for_kv_cache_spec
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -110,6 +111,11 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu.generic_kvp import (
+    GenericKVP,
+    get_generic_kvp_size,
+    maybe_build_generic_kvp,
+)
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -287,6 +293,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
         self.pcp_manager: pcp.PCPManager | None = None
+        self.generic_kvp: GenericKVP | None = None
 
         # Pooling models.
         self.is_pooling_model = self.model_config.runner_type == "pooling"
@@ -584,7 +591,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
-            block_sizes.append(spec.block_size)
+            # A sharded block spans one block-sized page per generic-KVP rank.
+            block_sizes.append(
+                spec.block_size
+                * dcp_world_size_for_kv_cache_spec(spec, get_generic_kvp_size())
+            )
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
@@ -745,6 +756,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        self.generic_kvp = maybe_build_generic_kvp(self, kv_caches_dict)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -1983,6 +1995,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
+                if self.generic_kvp is not None:
+                    self.generic_kvp.prepare(
+                        batch_req_state, self.req_states.num_computed_tokens_np
+                    )
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     model_output = self.ubatch_runner.run(
@@ -2074,6 +2090,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
 
             # Post-step KV connector related operations.
+            if self.generic_kvp is not None:
+                self.generic_kvp.wait_writes()
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -2224,6 +2242,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         # Post-step KV connector related operations.
+        if self.generic_kvp is not None:
+            self.generic_kvp.wait_writes()
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
@@ -2247,6 +2267,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
+        if self.generic_kvp is not None:
+            self.generic_kvp.wait_writes()
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
 
         if not self.is_last_pp_rank:

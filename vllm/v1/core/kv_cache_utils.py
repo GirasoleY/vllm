@@ -746,8 +746,10 @@ def resolve_kv_cache_block_sizes(
       Returns the scheduler block size (i.e. disables finer hashing) if block
       hashing is inactive or a mamba group is not using cache mode "align".
     """
+    from vllm.v1.worker.gpu.generic_kvp import get_kv_cache_dcp_size
+
     cache_config = vllm_config.cache_config
-    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    dcp = get_kv_cache_dcp_size(vllm_config.parallel_config)
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:

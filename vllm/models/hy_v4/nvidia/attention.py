@@ -79,6 +79,7 @@ from vllm.v1.attention.ops.pcp import (
     init_hy4_pcp_kv_exchange,
 )
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.worker.gpu.generic_kvp import get_generic_kvp
 
 logger = init_logger(__name__)
 
@@ -1268,6 +1269,9 @@ class HYV4MLAAttention(nn.Module):
         # The exchange fills the caches; skip the layers' own inserts.
         cache_filled = kv_exchange is not None
         if kv_exchange is not None:
+            # The exchange writes the caches before the layers' own acquires.
+            if (generic_kvp := get_generic_kvp()) is not None:
+                generic_kvp.acquire(self.mla_attn.layer_name)
             forward_context = get_forward_context()
             attn_metadata = forward_context.attn_metadata
             slot_mappings = forward_context.slot_mapping

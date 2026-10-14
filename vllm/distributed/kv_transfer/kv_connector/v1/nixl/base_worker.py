@@ -685,7 +685,9 @@ class NixlBaseConnectorWorker:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        from vllm.v1.worker.gpu.generic_kvp import get_kv_cache_dcp_size
+
+        self.dcp_size = get_kv_cache_dcp_size(vllm_config.parallel_config)
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
 
         # TP1 PCP+DCP owns distinct KV shards; replicated PCP uses rank zero.

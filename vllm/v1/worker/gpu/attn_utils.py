@@ -31,6 +31,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.generic_kvp import (
+    get_generic_kvp_size,
+    symmetric_kv_cache_allocation,
+)
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
@@ -339,6 +343,8 @@ def init_kv_cache(
     block_tables: "BlockTables | None" = None,
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
+    if get_generic_kvp_size() > 1:
+        allocation_context = symmetric_kv_cache_allocation(device)
     with allocation_context:
         if vllm_config.attention_config.hisparse_config is not None:
             assert block_tables is not None
