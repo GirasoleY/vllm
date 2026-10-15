@@ -73,6 +73,7 @@ class HYV4VLForConditionalGeneration(
     """NVIDIA HYV4 VL composition using the existing HYV4 text model."""
 
     supports_mm_device_do_normalize = True
+    mrope_accepts_token_array = True
 
     packed_modules_mapping = {
         **HYV4ForCausalLM.packed_modules_mapping,
@@ -246,11 +247,11 @@ class HYV4VLForConditionalGeneration(
 
     def get_mrope_input_positions(
         self,
-        input_tokens: list[int],
+        input_tokens: list[int] | np.ndarray,
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
         positions = torch.arange(len(input_tokens)).repeat(3, 1)
-        if not input_tokens or not mm_features:
+        if len(input_tokens) == 0 or not mm_features:
             return positions, 0
         tokens = torch.from_numpy(np.asarray(input_tokens, dtype=np.int64))
         data = MultiModalFeatureSpec.gather_kwargs(

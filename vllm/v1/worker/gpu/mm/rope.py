@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -59,10 +60,14 @@ class RopeState:
         self,
         req_idx: int,
         model: nn.Module,
-        prefill_token_ids: list[int],
+        prefill_token_ids: list[int] | np.ndarray,
         mm_features: list,
     ) -> None:
         mrope_model = cast(SupportsMRoPE, model)
+        if isinstance(prefill_token_ids, np.ndarray) and not getattr(
+            model, "mrope_accepts_token_array", False
+        ):
+            prefill_token_ids = prefill_token_ids.tolist()
         prefill_positions, delta = mrope_model.get_mrope_input_positions(
             prefill_token_ids, mm_features
         )

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -54,6 +54,18 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # v2 model runner only: int32 (prompt, prefill) token arrays sent in place
+    # of the lists when pickled (out of band, no per-int cost).
+    token_arrays: "tuple[np.ndarray, np.ndarray] | None" = field(
+        default=None, compare=False, repr=False
+    )
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        if self.token_arrays is not None:
+            state["prompt_token_ids"], state["prefill_token_ids"] = self.token_arrays
+            state["token_arrays"] = None
+        return state
 
     @classmethod
     def from_request(

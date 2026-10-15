@@ -321,7 +321,9 @@ class LongcatNgramModelState(DefaultModelState):
         # the prompt alone would be too short when resuming after decode.
         ctx = [-1] * self.ctx_len
         ncomp = new_req_data.num_computed_tokens
-        toks_src = new_req_data.prefill_token_ids or new_req_data.prompt_token_ids
+        toks_src = new_req_data.prefill_token_ids
+        if toks_src is None:
+            toks_src = new_req_data.prompt_token_ids
         if ncomp > 0 and toks_src is not None:
             lo = max(0, ncomp - self.ctx_len)
             toks = self._neg_eos(list(toks_src[lo:ncomp]))

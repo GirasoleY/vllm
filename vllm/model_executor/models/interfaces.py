@@ -1751,6 +1751,12 @@ class SupportsMRoPE(Protocol):
         MRO of your model class.
     """
 
+    mrope_accepts_token_array: ClassVar[bool] = False
+    """
+    If True, `get_mrope_input_positions` may receive `input_tokens` as an
+    int32 numpy array (v2 model runner) instead of a list.
+    """
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],

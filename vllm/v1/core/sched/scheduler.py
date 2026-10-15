@@ -1366,15 +1366,18 @@ class Scheduler(SchedulerInterface):
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
-            new_reqs_data = [
-                NewRequestData.from_request(
+            new_reqs_data = []
+            for req in scheduled_new_reqs:
+                new_req_data = NewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
                     uses_mrope=self.model_uses_mrope,
                 )
-                for req in scheduled_new_reqs
-            ]
+                prompt_arr = req.prompt_token_array()
+                if prompt_arr is not None:
+                    new_req_data.token_arrays = (prompt_arr, req.all_token_array())
+                new_reqs_data.append(new_req_data)
         else:
             new_reqs_data = [
                 NewRequestData.from_request(

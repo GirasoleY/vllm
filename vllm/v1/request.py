@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -144,6 +145,7 @@ class Request:
             prompt_token_ids, prompt_embeds
         )
         self._output_token_ids: list[int] = []
+        self._prompt_token_array: np.ndarray | None = None
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
         elif self.prompt_is_token_ids is None:
@@ -281,6 +283,28 @@ class Request:
             self._all_token_ids.extend(token_ids)
 
         self.update_block_hashes()
+
+    def prompt_token_array(self) -> np.ndarray | None:
+        """Cached int32 copy of `prompt_token_ids`."""
+        if self.prompt_token_ids is None:
+            return None
+        arr = self._prompt_token_array
+        if arr is None or len(arr) != len(self.prompt_token_ids):
+            arr = np.asarray(self.prompt_token_ids, dtype=np.int32)
+            self._prompt_token_array = arr
+        return arr
+
+    def all_token_array(self) -> np.ndarray:
+        """int32 copy of `_all_token_ids`, sharing the prompt cache if equal."""
+        if (
+            self.prompt_is_token_ids is None
+            and not self._output_token_ids
+            and len(self._all_token_ids) == self.num_prompt_tokens
+        ):
+            arr = self.prompt_token_array()
+            if arr is not None and len(arr) == len(self._all_token_ids):
+                return arr
+        return np.asarray(self._all_token_ids, dtype=np.int32)
 
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""

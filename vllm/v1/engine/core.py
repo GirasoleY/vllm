@@ -1068,6 +1068,9 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if self.vllm_config.use_v2_model_runner:
+            # Build the token array here, off the busy loop.
+            req.prompt_token_array()
         hook = getattr(self, "_kv_preprocessed_hook", None)
         if hook is not None:
             try:
