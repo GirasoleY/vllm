@@ -1234,7 +1234,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if dummy_run:
             # Dummy batches are uniform by construction.
             return None, get_uniform_decode_token_count(
-                num_reqs, num_toks, max_query_len, has_prefill=False
+                num_reqs, num_toks, max_query_len, decode_graph_eligible=True
             )
 
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1254,55 +1254,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
+        has_prefill = bool(is_prefilling_np.any())
 
-        if self.adaptive_verification is not None and draft_tokens:
-            num_toks = self.adaptive_verification.get_num_tokens(
-                num_tokens_per_req, draft_tokens
+        num_draft_tokens_np = None
+        if draft_tokens:
+            num_drafts_iter = (len(draft_tokens.get(req_id, ())) for req_id in req_ids)
+            num_draft_tokens_np = np.fromiter(
+                num_drafts_iter, dtype=np.int32, count=num_reqs
+            )
+            if self.adaptive_verification is not None:
+                num_toks = self.adaptive_verification.get_num_tokens(
+                    num_tokens_per_req, draft_tokens
+                )
+
+        prefill_runs_as_decode_np = None
+        decode_graph_eligible = not has_prefill
+        if has_prefill and self.pcp_manager is None:
+            # One new prompt token over existing context (possibly padded with
+            # placeholder drafts) runs as a decode. PCP partitions prefill rows.
+            num_new_tokens = num_scheduled_tokens
+            if num_draft_tokens_np is not None:
+                num_new_tokens = num_new_tokens - num_draft_tokens_np
+            one_token_ext = (num_new_tokens == 1) & (num_computed_prefill_tokens_np > 0)
+            prefill_runs_as_decode_np = is_prefilling_np & one_token_ext
+            decode_graph_eligible = bool(
+                (prefill_runs_as_decode_np | ~is_prefilling_np).all()
             )
 
         batch_state = BatchReqState(
             req_ids=req_ids,
             num_scheduled_tokens=num_scheduled_tokens,
             num_tokens=num_toks,
+            num_draft_tokens_np=num_draft_tokens_np,
             idx_mapping_np=idx_mapping_np,
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
             max_seq_len_np=max_seq_len_np,
-            has_prefill=bool(is_prefilling_np.any()),
+            has_prefill=has_prefill,
+            prefill_runs_as_decode_np=prefill_runs_as_decode_np,
+            decode_graph_eligible=decode_graph_eligible,
         )
-        supports_padded_prompt_tail_graph = (
-            self.speculative_config is not None
-            and self.speculator is not None
-            and self.speculator.supports_padded_prompt_tail_graph
-            and not self.model_config.is_hybrid
-            and not self.model_config.is_attention_free
-            and not self.is_encoder_decoder
-            and not self.supports_mm_inputs
-            and self.adaptive_verification is None
-            and self.pcp_manager is None
-            and self.parallel_config.pipeline_parallel_size == 1
-            and self.model_state.num_new_sampled_tokens_per_step == 1
-        )
-        # The scheduler gives prefilling requests draft slots only when padding
-        # their final token. Require that complete verifier layout on every row.
-        is_padded_prompt_tail = (
-            batch_state.has_prefill
-            and supports_padded_prompt_tail_graph
-            and self.decode_query_len > 1
-            and all(
-                n == self.decode_query_len
-                and len(draft_tokens.get(req_id, ())) == n - 1
-                for req_id, n in num_tokens_per_req.items()
-            )
-        )
-        batch_state = batch_state._replace(is_padded_prompt_tail=is_padded_prompt_tail)
         return batch_state, get_uniform_decode_token_count(
-            num_reqs,
-            num_toks,
-            max_query_len,
-            batch_state.has_prefill,
-            is_padded_prompt_tail=is_padded_prompt_tail,
+            num_reqs, num_toks, max_query_len, decode_graph_eligible
         )
 
     def _prepare_padding_mask(
@@ -1351,11 +1345,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs, dtype=torch.int32, device=self.device
             )
         else:
-            num_draft_tokens_per_req = np.fromiter(
-                (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
-                dtype=np.int32,
-                count=num_reqs,
-            )
+            num_draft_tokens_per_req = batch_req_state.num_draft_tokens_np
+            if num_draft_tokens_per_req is None:
+                num_draft_tokens_per_req = np.zeros(num_reqs, dtype=np.int32)
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
@@ -1495,6 +1487,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_prefilling_np=batch_req_state.is_prefilling_np,
             max_seq_len_np=batch_req_state.max_seq_len_np,
             has_prefill=batch_req_state.has_prefill,
+            prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
+            decode_graph_eligible=batch_req_state.decode_graph_eligible,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=is_padding,
@@ -1769,7 +1763,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
-            input_batch.is_padded_prompt_tail = batch_req_state.is_padded_prompt_tail
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -2397,13 +2390,15 @@ class BatchReqState(NamedTuple):
     # May be less than scheduler_output.total_num_scheduled_tokens:
     # adaptive verification trims the draft budget before running.
     num_tokens: int
+    num_draft_tokens_np: np.ndarray | None  # [num_reqs], None if no drafts
     idx_mapping_np: np.ndarray  # [num_reqs]
     prefill_len_np: np.ndarray  # [num_reqs]
     num_computed_prefill_tokens_np: np.ndarray  # [num_reqs]
     is_prefilling_np: np.ndarray  # [num_reqs]
     max_seq_len_np: np.ndarray  # [num_reqs]
     has_prefill: bool
-    is_padded_prompt_tail: bool = False
+    prefill_runs_as_decode_np: np.ndarray | None  # [num_reqs]
+    decode_graph_eligible: bool
 
 
 def sort_batch_req_ids(

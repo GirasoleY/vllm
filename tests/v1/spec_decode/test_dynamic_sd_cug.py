@@ -5,7 +5,6 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 import torch
 
@@ -16,20 +15,10 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 pytestmark = pytest.mark.cpu_test
-
-
-@pytest.fixture(autouse=True)
-def _no_device_graph_pool(monkeypatch):
-    # These tests exercise dispatch metadata without allocating CUDA graphs.
-    monkeypatch.setattr(
-        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
-    )
 
 
 def _create_vllm_config_for_dsd(
@@ -94,144 +83,6 @@ def _create_vllm_config_for_dsd(
     return vllm_config
 
 
-@pytest.mark.parametrize(
-    ("k", "mixed", "case", "expected_full"),
-    [
-        pytest.param(k, mixed, "padded-tail", True, id=f"tail-k{k}-mixed{mixed}")
-        for k in (1, 2, 3, 5, 8)
-        for mixed in (False, True)
-    ]
-    + [
-        pytest.param(3, True, "real-prefill", False, id="same-shape-real-prefill"),
-        pytest.param(3, True, "recurrent", False, id="recurrent-target"),
-        pytest.param(3, True, "partial-tail-drafts", False, id="partial-tail-drafts"),
-        pytest.param(
-            3, True, "missing-decode-drafts", False, id="missing-decode-drafts"
-        ),
-        pytest.param(
-            3, True, "partial-decode-drafts", False, id="partial-decode-drafts"
-        ),
-        pytest.param(3, True, "ragged", False, id="nonuniform-verifier-layout"),
-        pytest.param(3, True, "async-decode", True, id="tail-with-async-decode"),
-        pytest.param(
-            3, True, "async-real-prefill", False, id="sentinels-are-not-padding"
-        ),
-        pytest.param(3, True, "uncached-tail", True, id="one-token-prompt-with-decode"),
-        pytest.param(0, False, "padded-tail", False, id="no-speculation"),
-    ],
-)
-def test_model_runner_dispatches_prompt_tail_and_preserves_draft_classification(
-    monkeypatch,
-    k,
-    mixed,
-    case,
-    expected_full,
-):
-    """Exercise actual request gathering and graph dispatch before GPU preparation."""
-    monkeypatch.setattr(
-        gpu_cudagraph_utils,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
-    width = 1 + k
-    config = _create_vllm_config_for_dsd(
-        2,
-        k,
-        cudagraph_mode="FULL_DECODE_ONLY",
-        use_dynamic_sd=False,
-    )
-    manager = gpu_cudagraph_utils.CudaGraphManager(
-        config,
-        torch.device("cpu"),
-        CUDAGraphMode.FULL_DECODE_ONLY,
-        decode_query_len=width,
-    )
-    manager._graphs_captured = True
-
-    output = SchedulerOutput.make_empty()
-    output.num_scheduled_tokens = {
-        "tail": width,
-        **({"decode": width} if mixed else {}),
-    }
-    output.scheduled_spec_decode_tokens = {
-        "tail": [-1] * k,
-        **({"decode": list(range(k))} if mixed else {}),
-    }
-    remaining_prompt_tokens = 1
-    if case in ("real-prefill", "async-real-prefill"):
-        remaining_prompt_tokens = width
-        del output.scheduled_spec_decode_tokens["tail"]
-    if case in ("async-decode", "async-real-prefill"):
-        output.scheduled_spec_decode_tokens["decode"] = [-1] * k
-    elif case == "partial-tail-drafts":
-        output.scheduled_spec_decode_tokens["tail"].pop()
-    elif case == "missing-decode-drafts":
-        del output.scheduled_spec_decode_tokens["decode"]
-    elif case == "partial-decode-drafts":
-        output.scheduled_spec_decode_tokens["decode"].pop()
-    elif case == "ragged":
-        output.num_scheduled_tokens["decode"] -= 1
-        output.scheduled_spec_decode_tokens["decode"].pop()
-    output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
-    prompt_len = 1 if case == "uncached-tail" else 4096
-
-    runner = object.__new__(GPUModelRunner)
-    for method in (
-        "update_pp_decode_requests",
-        "finish_requests",
-        "free_states",
-        "add_requests",
-        "update_requests",
-    ):
-        setattr(runner, method, MagicMock())
-    runner.block_tables = MagicMock()
-    runner.aux_output_connector = None
-    runner.req_states = SimpleNamespace(
-        req_id_to_index={"tail": 0, "decode": 1},
-        prefill_len=SimpleNamespace(np=np.array([prompt_len, 100])),
-        num_computed_prefill_tokens=np.array(
-            [prompt_len - remaining_prompt_tokens, 100]
-        ),
-    )
-    runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
-    runner.speculator = SimpleNamespace(supports_padded_prompt_tail_graph=True)
-    runner.model_config = SimpleNamespace(
-        is_hybrid=case == "recurrent", is_attention_free=False
-    )
-    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
-    runner.parallel_config = config.parallel_config
-    runner.observability_config = SimpleNamespace(cudagraph_metrics=False)
-    runner.decode_query_len = width
-    runner.dp_size, runner.dp_rank = 1, 0
-    runner.cudagraph_manager = manager
-    runner.pcp_manager = runner.lora_config = runner.adaptive_verification = None
-    runner.ubatch_runner = None
-    runner.is_encoder_decoder = runner.supports_mm_inputs = False
-    prepared_batch = SimpleNamespace(has_prefill=True, is_padded_prompt_tail=False)
-
-    def prepare_inputs(scheduled, state, desc, num_active_loras):
-        assert scheduled is output
-        assert state.has_prefill
-        assert state.is_prefilling_np[state.req_ids.index("tail")]
-        expected_mode = CUDAGraphMode.FULL if expected_full else CUDAGraphMode.NONE
-        assert desc.cg_mode == expected_mode
-        return prepared_batch
-
-    class ReachedAttentionPreparation(Exception):
-        pass
-
-    def prepare_attn(batch):
-        assert batch is prepared_batch
-        assert batch.has_prefill
-        assert batch.is_padded_prompt_tail is expected_full
-        raise ReachedAttentionPreparation
-
-    runner.prepare_inputs = prepare_inputs
-    runner.prepare_attn = prepare_attn
-    with pytest.raises(ReachedAttentionPreparation):
-        runner.execute_model(output)
-
-
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):
     """Dynamic SD should create FULL decode candidates for every k in [1, K+1].
 
@@ -275,7 +126,7 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
                 num_reqs,
                 num_tokens,
                 max_query_len,
-                has_prefill=False,
+                decode_graph_eligible=True,
             )
 
             # The scheduler should mark every one of these shapes as a uniform
@@ -411,14 +262,14 @@ def test_prompt_chunks_shaped_like_spec_decode_miss_the_full_graph(monkeypatch):
     # The batch shape is indistinguishable from a full batch of spec decodes.
     assert (
         get_uniform_decode_token_count(
-            num_reqs, num_tokens, decode_query_len, has_prefill=False
+            num_reqs, num_tokens, decode_query_len, decode_graph_eligible=True
         )
         == decode_query_len
     )
 
     # Two of the requests are decode_query_len tokens into a longer prompt.
     uniform_tok_count = get_uniform_decode_token_count(
-        num_reqs, num_tokens, decode_query_len, has_prefill=True
+        num_reqs, num_tokens, decode_query_len, decode_graph_eligible=False
     )
     assert uniform_tok_count is None
     desc = manager.dispatch(
@@ -432,7 +283,7 @@ def test_prompt_chunks_shaped_like_spec_decode_miss_the_full_graph(monkeypatch):
 
     # The same shape with every request decoding still gets its FULL graph.
     uniform_tok_count = get_uniform_decode_token_count(
-        num_reqs, num_tokens, decode_query_len, has_prefill=False
+        num_reqs, num_tokens, decode_query_len, decode_graph_eligible=True
     )
     assert uniform_tok_count == decode_query_len
     desc = manager.dispatch(
@@ -485,7 +336,7 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
                 num_reqs,
                 num_tokens,
                 max_query_len,
-                has_prefill=False,
+                decode_graph_eligible=True,
             )
             assert uniform_tok_count == max_query_len
 
@@ -550,7 +401,7 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 num_reqs,
                 num_tokens,
                 max_query_len,
-                has_prefill=False,
+                decode_graph_eligible=True,
             )
             assert uniform_tok_count == max_query_len
 
