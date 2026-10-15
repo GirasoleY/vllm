@@ -83,7 +83,6 @@ from .attention import (
 )
 from .hc import CudaIHCPostPre, HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused, use_hyv4_sequence_parallel
-from .prefill import packed_fp8_kernel
 
 logger = init_logger(__name__)
 
@@ -337,8 +336,7 @@ class HYV4DecoderLayer(nn.Module):
         if (
             isinstance(boundary, CudaIHCPostPre)
             and not self.use_sequence_parallel
-            and packed_fp8_kernel(self.self_attn.fused_qkv_a_proj, args[0].shape[0])
-            is not None
+            and self.self_attn.takes_fp8_input(args[0].shape[0])
         ):
             return boundary(*args, fp8_out=True)
         return (*boundary(*args), None)

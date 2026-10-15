@@ -723,6 +723,17 @@ class HYV4MLAAttention(nn.Module):
         )
         replace_parameter(self.linear_gate, "weight", self._qkv_gate_weight[split:])
 
+    def takes_fp8_input(self, num_tokens: int) -> bool:
+        """Whether ``forward`` uses ``hidden_states_quant`` at this batch size:
+        the q/kv projection or the separate gate runs on packed-FP8 DeepGEMM."""
+        if packed_fp8_kernel(self.fused_qkv_a_proj, num_tokens) is not None:
+            return True
+        return (
+            self.linear_gate is not None
+            and not self.use_hpc_gated_mla
+            and packed_fp8_kernel(self.linear_gate, num_tokens) is not None
+        )
+
     @property
     def topk_indices_buffer(self) -> torch.Tensor | None:
         """The sparse top-k index buffer this layer reads from.
@@ -904,11 +915,20 @@ class HYV4MLAAttention(nn.Module):
                 else qkv_kernel.quant_fp8(hidden_states)
             )
 
+        # A BF16 q/kv projection with an FP8 gate still lets the gate take the
+        # boundary's FP8 output.
+        gate_input = shared_input
+        if (
+            hidden_states_quant is not None
+            and packed_fp8_kernel(linear_gate, hidden_states.shape[0]) is not None
+        ):
+            gate_input = hidden_states_quant
+
         def side_projections() -> tuple[torch.Tensor | None, torch.Tensor | None]:
             indexer_kw = (
                 indexer.project_k_and_weights(hidden_states) if indexer else None
             )
-            gate_score = fp8_linear(linear_gate, shared_input) if linear_gate else None
+            gate_score = fp8_linear(linear_gate, gate_input) if linear_gate else None
             return indexer_kw, gate_score
 
         # The prefill projection includes the gate; decode can overlap its
