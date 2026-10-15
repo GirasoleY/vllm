@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Copy CTAs per rank; more starve the overlapped GEMMs of SMs.
+_COPY_CTAS = 32
+
 # Ranks each KV cache block is sharded across (1: off).
 _size = 1
 _active: "GenericKVP | None" = None
@@ -298,10 +301,10 @@ class GenericKVP:
                     if (n := positions[pull].numel()) == 0:
                         continue
                     self.epoch += 1
-                    _copy_pages[(n, _size if pull else 1)](
+                    _copy_pages[(min(n, _COPY_CTAS), _size if pull else 1)](
                         rows, rows.stride(0), rows.shape[1], peers, row_stride,
                         0 if pull else self.handle.rank, _size, table,
-                        positions[pull], self.claims, self.epoch, PULL=pull,
+                        positions[pull], n, self.claims, self.epoch, PULL=pull,
                         BLOCK=triton.next_power_of_2(rows.shape[1]), num_warps=8,
                     )  # fmt: skip
             self.event = self.stream.record_event()
@@ -316,21 +319,23 @@ class GenericKVP:
 @triton.jit(do_not_specialize=["epoch"])
 def _copy_pages(
     scratch_ptr, scratch_stride, row_len, peers_ptr, row_stride,
-    first_rank, size, table_ptr, positions_ptr, claims_ptr, epoch,
+    first_rank, size, table_ptr, positions_ptr, num_positions, claims_ptr, epoch,
     PULL: tl.constexpr, BLOCK: tl.constexpr,
 ):  # fmt: skip
     # Rank r's page of block b is row b of its cache (at peers_ptr[r]) and row
     # b * size + r of the scratch cache.
     rank = first_rank + tl.program_id(1)
-    position = tl.load(positions_ptr + tl.program_id(0))
-    block = (tl.load(table_ptr + position) // size).to(tl.int64)
-    row = block * size + rank
-    if tl.atomic_xchg(claims_ptr + row, epoch) != epoch:
-        offs = tl.arange(0, BLOCK)
-        mask = offs < row_len
-        scratch = scratch_ptr + row * scratch_stride + offs
-        page = _load_ptr(peers_ptr + rank, tl.int64) + block * row_stride + offs
-        if PULL:
-            tl.store(scratch, tl.load(page, mask=mask), mask=mask)
-        else:
-            tl.store(page, tl.load(scratch, mask=mask), mask=mask)
+    base = _load_ptr(peers_ptr + rank, tl.int64)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < row_len
+    for i in range(tl.program_id(0), num_positions, tl.num_programs(0)):
+        position = tl.load(positions_ptr + i)
+        block = (tl.load(table_ptr + position) // size).to(tl.int64)
+        row = block * size + rank
+        if tl.atomic_xchg(claims_ptr + row, epoch) != epoch:
+            scratch = scratch_ptr + row * scratch_stride + offs
+            page = base + block * row_stride + offs
+            if PULL:
+                tl.store(scratch, tl.load(page, mask=mask), mask=mask)
+            else:
+                tl.store(page, tl.load(scratch, mask=mask), mask=mask)

@@ -23,7 +23,8 @@ class _Layer(SimpleNamespace):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_layers_see_all_pages_and_persist_new_writes(monkeypatch):
+@pytest.mark.parametrize("copy_ctas", [1, 32])
+def test_layers_see_all_pages_and_persist_new_writes(monkeypatch, copy_ctas):
     names = ["model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn"]
     # Like the real KV cache: every layer's cache is a view into one allocation.
     backing = torch.zeros(NUM_BLOCKS, len(names), 4, 8, dtype=torch.uint8).cuda()
@@ -42,6 +43,7 @@ def test_layers_see_all_pages_and_persist_new_writes(monkeypatch):
         barrier=lambda: None,
     )
     monkeypatch.setattr(kvp, "_size", SIZE)
+    monkeypatch.setattr(kvp, "_COPY_CTAS", copy_ctas)
     monkeypatch.setattr(kvp.torch.distributed, "get_rank", lambda: RANK)
     monkeypatch.setattr(kvp.torch.distributed, "new_group", lambda *a, **k: None)
     monkeypatch.setattr(kvp.symm_mem, "rendezvous", lambda *a: handle)
