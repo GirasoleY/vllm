@@ -70,6 +70,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
     compute_layer_kv_cache_shape_bytes,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -544,6 +545,8 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         self.src_xfer_handles_by_block_size = {self.block_size: 1}
         self.src_blocks_data = np.empty((0, 3), dtype=np.uint64)
         rep_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if isinstance(rep_spec, UniformTypeKVCacheSpecs):
+            rep_spec = next(iter(rep_spec.kv_cache_specs.values()))
         test_shape = compute_layer_kv_cache_shape_bytes(rep_spec, 1)
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -2419,6 +2422,87 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
         assert blocks_data.tolist() == [
             [raw.data_ptr() + block_idx * packed_block_len, packed_block_len, 0]
             for block_idx in range(num_blocks)
+        ]
+
+
+@pytest.mark.parametrize("gap", [0, 64])
+def test_register_packed_mixed_page_mla_cache_as_single_region(
+    default_vllm_config, dist_init, gap
+):
+    """BLHNC MLA latent + indexer pages (DSv3.2-style) collapse to one region,
+    unless the pages leave a gap in the block."""
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+    nixl_worker = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
+    with (
+        patch(f"{nixl_worker}.NixlWrapper") as mock_nixl_wrapper,
+        patch(f"{nixl_worker}.threading.Event"),
+        patch(f"{nixl_worker}.threading.Thread") as mock_thread,
+        patch(f"{nixl_worker}.get_current_attn_backends") as mock_backends,
+    ):
+        mock_backends.return_value = [TritonAttentionBackend]
+        num_blocks, block_size = 3, 64
+        latent = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=352, dtype=torch.uint8
+        )
+        indexer = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=132, dtype=torch.uint8
+        )
+        specs = {
+            "layers.0.indexer": indexer,
+            "layers.0.attn": latent,
+            "layers.1.attn": latent,
+        }
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(list(specs), UniformTypeKVCacheSpecs.from_specs(specs))
+            ],
+        )
+        vllm_config = create_vllm_config(attention_backend="TRITON_ATTN")
+        vllm_config.cache_config.block_size = block_size
+        vllm_config.cache_config.kv_cache_layout = "BLHNC"
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config,
+            connector.engine_id,
+            hand_shake_latency=0,
+            kv_cache_layout="BLHNC",
+            kv_cache_config=kv_cache_config,
+        )
+        wrapper = mock_nixl_wrapper.return_value
+        connector.connector_worker.nixl_wrapper = wrapper
+        wrapper.get_agent_metadata.return_value = b"fake_agent_metadata"
+        mock_thread.return_value.is_alive.return_value = False
+
+        # Block-major slab: [indexer page | latent page | latent page] per block.
+        pages = [spec.page_size_bytes for spec in specs.values()]
+        block_stride = sum(pages) + gap
+        raw = torch.zeros(
+            block_stride * num_blocks,
+            dtype=torch.uint8,
+            device=current_platform.device_type,
+        )
+        offsets = np.cumsum([0, pages[0] + gap, *pages[1:-1]]).tolist()
+        views = {
+            name: raw.as_strided(
+                (num_blocks, 1, block_size, spec.head_size),
+                (block_stride, spec.head_size, spec.head_size, 1),
+                off,
+            )
+            for (name, spec), off in zip(specs.items(), offsets)
+        }
+        connector.register_kv_caches(views)
+
+        blocks_data, _ = wrapper.get_xfer_descs.call_args[0]
+        if gap:
+            assert connector.connector_worker.num_regions == len(specs)
+            return
+        assert connector.connector_worker.num_regions == 1
+        assert blocks_data.tolist() == [
+            [raw.data_ptr() + block * block_stride, block_stride, 0]
+            for block in range(num_blocks)
         ]
 
 

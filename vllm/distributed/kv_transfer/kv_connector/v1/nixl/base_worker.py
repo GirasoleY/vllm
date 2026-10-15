@@ -1472,6 +1472,43 @@ class NixlBaseConnectorWorker:
             ):
                 compressed_region_owners.setdefault(cache.data_ptr(), cache)
 
+        # Block-major packed MLA (e.g. BLHNC) whose pages exactly fill the block:
+        # one descriptor per block covers every layer, instead of one per layer.
+        collapse_packed_mla = False
+        if (
+            packed_storage
+            and layer_specs
+            and not self._has_mamba
+            and self._physical_blocks_per_logical_kv_block == 1
+            and not any(g.host_resident for g in self.kv_cache_config.transfer_groups)
+            and all(
+                isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                and xfer_buffers[name].ndim > 1
+                for name, spec in layer_specs.items()
+            )
+        ):
+            first = next(iter(xfer_buffers.values()))
+            base = first.untyped_storage().data_ptr()
+            block_stride = first.stride(0) * first.element_size()
+            pages = sorted(
+                (xfer_buffers[name].data_ptr() - base, xfer_buffers[name][0].nbytes)
+                for name in layer_specs
+            )
+            # The pages must tile [0, block_stride) exactly: no gaps or overlaps.
+            end = 0
+            for offset, nbytes in pages:
+                if offset != end:
+                    break
+                end += nbytes
+            else:
+                collapse_packed_mla = end == block_stride
+        if collapse_packed_mla:
+            logger.info_once(
+                "NIXL: packed block-major MLA KV (%d layers) registered as one "
+                "region, one descriptor per block.",
+                len(layer_specs),
+            )
+
         track_region_layers = (
             self._supports_pp_hma and self._is_hma_required and not self._has_mamba
         )
@@ -1620,7 +1657,7 @@ class NixlBaseConnectorWorker:
                         (cache.data_ptr(), physical_page_size, physical_page_size)
                     ]
                 elif storage_is_block_major and (
-                    not page_contiguous
+                    (not page_contiguous or collapse_packed_mla)
                     and ((packed_storage and is_mla_region) or not self._is_csa_linear)
                 ):
                     # TODO(Lucas): handle TP slicing for packed_storage; for now
