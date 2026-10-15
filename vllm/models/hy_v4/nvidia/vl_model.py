@@ -5,6 +5,7 @@
 from collections.abc import Iterable
 from typing import Annotated
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -248,10 +249,10 @@ class HYV4VLForConditionalGeneration(
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
-        tokens = torch.tensor(input_tokens, dtype=torch.long)
         positions = torch.arange(len(input_tokens)).repeat(3, 1)
         if not input_tokens or not mm_features:
             return positions, 0
+        tokens = torch.from_numpy(np.asarray(input_tokens, dtype=np.int64))
         data = MultiModalFeatureSpec.gather_kwargs(
             mm_features, {"image_grid_thw", "video_grid_thw"}
         )
@@ -264,18 +265,22 @@ class HYV4VLForConditionalGeneration(
         ends = torch.where(tokens == config.image_end_token_id)[0].tolist()
         if len(starts) != len(ends):
             raise ValueError("HYV4 image/frame start and end tokens must be paired")
-        start_pos = start_index = mm_index = scan = 0
+        # Last video start/end at or before each index; -1 if none.
+        idx = torch.arange(len(input_tokens))
+        last_video_start = torch.where(
+            tokens == config.video_start_token_id, idx, -1
+        ).cummax(0)[0]
+        last_video_end = torch.where(
+            tokens == config.video_end_token_id, idx, -1
+        ).cummax(0)[0]
+        start_pos = start_index = mm_index = 0
         image_index = video_index = -1
-        inside_video = False
         while mm_index < len(starts):
             marker = starts[mm_index]
             pos = marker + 1 + extra
-            while scan < marker:
-                if input_tokens[scan] == config.video_start_token_id:
-                    inside_video = True
-                elif input_tokens[scan] == config.video_end_token_id:
-                    inside_video = False
-                scan += 1
+            inside_video = marker > 0 and bool(
+                last_video_start[marker - 1] > last_video_end[marker - 1]
+            )
             is_video = inside_video or (
                 image_index + 1 >= len(image_grids)
                 and video_index + 1 < len(video_grids)

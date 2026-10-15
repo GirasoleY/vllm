@@ -165,6 +165,9 @@ class StagedWriteTensor:
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
         self._staged_write_contents: list[int | float] = []
+        # Numpy writes; pending list contents are flushed here to keep order.
+        self._staged_write_chunks: list[np.ndarray] = []
+        self._staged_len = 0
         self._staged_write_cu_lens: list[int] = []
 
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
@@ -175,23 +178,50 @@ class StagedWriteTensor:
         self.write_contents = new_buffer(1, dtype=dtype) if uva_instead_of_gpu else None
 
     def stage_write(
-        self, index: int, start: int, x: Iterable[int] | Iterable[float]
+        self,
+        index: int,
+        start: int,
+        x: Iterable[int] | Iterable[float] | np.ndarray,
     ) -> None:
+        """Stage x for row index from start. Numpy arrays are kept by reference
+        until apply_write; do not modify them before then."""
         assert index >= 0
         assert start >= 0
-        if not x:
-            return
+        if isinstance(x, np.ndarray):
+            if x.size == 0:
+                return
+            self._flush_staged_list()
+            self._staged_write_chunks.append(x)
+            self._staged_len += x.size
+        else:
+            if not x:
+                return
+            n = len(self._staged_write_contents)
+            self._staged_write_contents.extend(x)
+            self._staged_len += len(self._staged_write_contents) - n
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
-        self._staged_write_contents.extend(x)
-        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+        self._staged_write_cu_lens.append(self._staged_len)
 
     def stage_write_elem(self, index: int, x: int) -> None:
         assert index >= 0
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(0)
         self._staged_write_contents.append(x)
-        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+        self._staged_len += 1
+        self._staged_write_cu_lens.append(self._staged_len)
+
+    def _flush_staged_list(self) -> None:
+        if self._staged_write_contents:
+            self._staged_write_chunks.append(np.asarray(self._staged_write_contents))
+            self._staged_write_contents.clear()
+
+    def _staged_contents(self) -> list[int | float] | np.ndarray:
+        if not self._staged_write_chunks:
+            return self._staged_write_contents
+        self._flush_staged_list()
+        np_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype
+        return np.concatenate(self._staged_write_chunks).astype(np_dtype, copy=False)
 
     def apply_write(self) -> None:
         n = len(self._staged_write_indices)
@@ -202,14 +232,13 @@ class StagedWriteTensor:
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
+        contents = self._staged_contents()
         if self.write_contents is None:
             write_contents = async_tensor_h2d(
-                self._staged_write_contents, device=self.device, dtype=self.dtype
+                contents, device=self.device, dtype=self.dtype
             )
         else:
-            write_contents = self.write_contents.copy_to_uva(
-                self._staged_write_contents
-            )
+            write_contents = self.write_contents.copy_to_uva(contents)
 
         # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](
@@ -230,6 +259,8 @@ class StagedWriteTensor:
         self._staged_write_indices.clear()
         self._staged_write_starts.clear()
         self._staged_write_contents.clear()
+        self._staged_write_chunks.clear()
+        self._staged_len = 0
         self._staged_write_cu_lens.clear()
 
 
@@ -269,6 +300,7 @@ class FusedStagedWriter:
             group_ids.extend([group_id] * n)
             indices.extend(t._staged_write_indices)
             starts.extend(t._staged_write_starts)
+            assert not t._staged_write_chunks, "numpy writes are not fused"
             content_base = len(contents)
             contents.extend(t._staged_write_contents)
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
