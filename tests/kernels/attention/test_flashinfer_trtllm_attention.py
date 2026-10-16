@@ -658,10 +658,7 @@ def test_flashinfer_dcp_prefill_trtllm_context(
     """The trtllm-gen DCP prefill context pass matches the native one for
     requests with DCP-local context, and writes zeros for requests without
     it (the DCP combine masks their LSE)."""
-    from vllm.v1.attention.backends.flashinfer import (
-        BatchDCPPrefillWrapper,
-        TrtllmDCPContextParams,
-    )
+    from vllm.v1.attention.backends.flashinfer import BatchDCPPrefillWrapper
 
     set_random_seed(42)
     device = "cuda"
@@ -704,7 +701,7 @@ def test_flashinfer_dcp_prefill_trtllm_context(
     layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
     workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 
-    def make_wrapper(trtllm_context):
+    def make_wrapper(trtllm_block_tables):
         wrapper = BatchDCPPrefillWrapper("HND", workspace)
         wrapper.plan(
             qo_indptr_cpu=qo_indptr,
@@ -725,19 +722,11 @@ def test_flashinfer_dcp_prefill_trtllm_context(
             prefill_fixed_split_size=-1,
             # Split-KV scratch for the native pass would not fit the workspace.
             disable_split_kv=True,
-            trtllm_context=trtllm_context,
+            trtllm_block_tables=trtllm_block_tables,
         )
         return wrapper
 
-    trtllm_wrapper = make_wrapper(
-        TrtllmDCPContextParams.from_cpu(
-            block_tables=block_tables,
-            qo_indptr_cpu=qo_indptr,
-            context_lens_cpu=ctx_lens,
-            page_size=block_size,
-            sm_scale=sm_scale,
-        )
-    )
+    trtllm_wrapper = make_wrapper(block_tables)
     output, lse = trtllm_wrapper._run_trtllm_context(layer, query, kv_cache_tuple)
 
     has_context = torch.repeat_interleave(ctx_lens > 0, q_lens).to(device)
