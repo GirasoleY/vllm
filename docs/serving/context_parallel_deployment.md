@@ -51,6 +51,12 @@ In short, for decode context parallel, try to increase `-tp` size until you get 
 
 Decode context parallel is supported in vLLM, for both MLA and GQA models. Some attention backends also support the combination of decode context parallel and MTP (multi-token prediction) to further accelerate the decoding phase.
 
+## Gather based DCP
+
+`--dcp-gather` retains DCP-sharded KV storage and gathers one layer at a time
+into scratch memory, so attention runs with DCP=1. The scheduler and KV cache
+specifications retain the physical cache shard count.
+
 ## Technical Discussions
 
 The main discussions happen in the `#sig-context-parallel` channel of [vLLM Slack](https://slack.vllm.ai/).

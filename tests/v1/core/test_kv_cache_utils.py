@@ -4848,3 +4848,41 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+@pytest.mark.parametrize(
+    "block_sizes,sharded,expected",
+    [((16,), True, (64, 64)), ((16, 32), True, (128, 64)), ((16,), False, (16, 16))],
+)
+def test_gather_retains_scheduler_and_hash_block_sizes(
+    monkeypatch, block_sizes, sharded, expected
+):
+    import vllm.v1.worker.gpu.generic_kvp as kvp
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    monkeypatch.setattr(kvp, "_size", 4)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16, enable_prefix_caching=True, prefix_match_unit=None
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=object(),
+    )
+    cache = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"layer{i}"],
+                MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=16,
+                    dtype=torch.bfloat16,
+                    dcp_sharded=sharded,
+                ),
+            )
+            for i, block_size in enumerate(block_sizes)
+        ],
+    )
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(cache, config) == expected

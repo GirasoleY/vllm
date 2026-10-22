@@ -95,6 +95,7 @@ from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.gpu.generic_kvp import (
     generic_kvp_kv_cache_fraction,
     get_generic_kvp_size,
+    get_kv_cache_dcp_size,
     maybe_enter_generic_kvp_mode,
 )
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
@@ -806,7 +807,7 @@ class Worker(WorkerBase):
         parallel_config = self.vllm_config.parallel_config
         if (
             parallel_config.prefill_context_parallel_size > 1
-            and parallel_config.decode_context_parallel_size > 1
+            and get_kv_cache_dcp_size(parallel_config) > 1
         ):
             tp_rank += (
                 get_pcp_group().rank_in_group * parallel_config.tensor_parallel_size

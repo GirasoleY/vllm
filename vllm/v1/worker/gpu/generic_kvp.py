@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -48,6 +48,12 @@ def _layer_index(name: str) -> int:
 
 def get_generic_kvp_size() -> int:
     return _size
+
+
+def get_kv_cache_dcp_size(parallel_config: ParallelConfig) -> int:
+    """DCP size of the KV cache layout, which DCP gather keeps while workers run
+    with DCP 1."""
+    return max(parallel_config.decode_context_parallel_size, _size)
 
 
 def maybe_enter_generic_kvp_mode(vllm_config: VllmConfig) -> None:
