@@ -54,8 +54,8 @@ Decode context parallel is supported in vLLM, for both MLA and GQA models. Some 
 ## Gather based DCP
 
 `--dcp-gather` retains DCP-sharded KV storage and gathers one layer at a time
-into scratch memory, so attention runs with DCP=1. The scheduler and KV cache
-specifications retain the physical cache shard count.
+into scratch memory, so attention runs with DCP=1. The scheduler and KV connectors
+retain the physical cache shard count, including per-shard Mooncake namespaces.
 
 ## Technical Discussions
 

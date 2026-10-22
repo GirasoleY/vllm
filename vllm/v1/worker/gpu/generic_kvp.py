@@ -56,6 +56,11 @@ def get_kv_cache_dcp_size(parallel_config: ParallelConfig) -> int:
     return max(parallel_config.decode_context_parallel_size, _size)
 
 
+def get_generic_kvp_rank() -> int:
+    """The page of each KV cache block this rank stores."""
+    return torch.distributed.get_rank() % _size if _size > 1 else 0
+
+
 def maybe_enter_generic_kvp_mode(vllm_config: VllmConfig) -> None:
     """With ``--dcp-gather``, shard the KV cache across the DCP group but run
     attention unsharded. Call on every rank before distributed init."""

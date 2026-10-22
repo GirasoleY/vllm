@@ -3561,6 +3561,7 @@ def _make_bare_worker(
     worker._kv_cache_groups = [group]
     worker.pcp_size = 1
     worker.dcp_size = 1
+    worker.generic_kvp = False
     worker.hash_block_size = block_size
     # Pre-build a single-group token_dbs so lookup-only tests don't have to
     # call register_kv_caches.
@@ -4856,3 +4857,17 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+@pytest.mark.parametrize("tp_size,pcp_size,dcp_size", [(1, 4, 4), (2, 2, 4)])
+def test_gather_lookup_namespaces_cover_pcp_and_tp_shards(tp_size, pcp_size, dcp_size):
+    worker = _make_bare_worker()
+    worker.tp_size, worker.pcp_size, worker.dcp_size = tp_size, pcp_size, dcp_size
+    worker.generic_kvp = True
+    _refresh_group_tp_replication_factors(worker)
+
+    assert worker._lookup_key_prefixes[0] == tuple(
+        f"test-model@tp_rank:{tp}@pcp{pcp}@dcp{pcp * tp_size + tp}@pp_rank:0@group:0"
+        for pcp in range(pcp_size)
+        for tp in range(tp_size)
+    )

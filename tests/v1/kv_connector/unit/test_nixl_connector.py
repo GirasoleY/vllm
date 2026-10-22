@@ -656,6 +656,7 @@ class TestNixlHandshake:
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
+    @pytest.mark.parametrize("gather_dcp", [False, True])
     def test_pcp_producer_exposes_dcp_shards_or_canonical_replica(
         self,
         default_vllm_config,
@@ -664,13 +665,19 @@ class TestNixlHandshake:
         pcp_size,
         dcp_size,
         expected_tracked,
+        gather_dcp,
+        monkeypatch,
     ):
-        """Replicated PCP is canonicalized; PCP-DCP publishes every shard."""
+        """Native and gathered PCP-DCP publish every physical KV shard."""
+        import vllm.v1.worker.gpu.generic_kvp as generic_kvp
         from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
         vllm_config = create_vllm_config(kv_role="kv_producer")
         vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
-        vllm_config.parallel_config.decode_context_parallel_size = dcp_size
+        vllm_config.parallel_config.decode_context_parallel_size = (
+            1 if gather_dcp else dcp_size
+        )
+        monkeypatch.setattr(generic_kvp, "_size", dcp_size if gather_dcp else 1)
         with (
             patch(
                 "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
@@ -692,6 +699,7 @@ class TestNixlHandshake:
         worker = connector.connector_worker
         assert worker is not None
         assert worker.pcp_rank == pcp_rank
+        assert worker.dcp_size == dcp_size
         assert worker.pcp_dcp_sharded is (dcp_size > 1)
         assert worker.transfer_tp_rank == (pcp_rank if dcp_size > 1 else 0)
         assert worker.transfer_tp_size == (pcp_size if dcp_size > 1 else 1)
