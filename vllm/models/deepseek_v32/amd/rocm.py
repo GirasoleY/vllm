@@ -88,10 +88,12 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        if self.o_proj_tp is not None:
+            self.o_proj_tp.pre_attention_hook()
         self._fused_attention(
             positions, q_c, kv_c, k_pe, index_k, index_weights, output
         )
-        return self.o_proj(output)[0]
+        return self.project_output(output)
 
     def _compute_ql_nope(self, q_c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)

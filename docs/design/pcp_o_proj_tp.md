@@ -64,73 +64,30 @@ is reduced to `1/P` of the standard TP layout.
 
 ## Module structure
 
-The feature is split into three layers so attention implementations, linear
-layers, and quantization methods each stay unaware of the others' PCP details:
+`PCPOProjTP` owns the PCP communication policy around an ordinary
+`RowParallelLinear`. Attention registers the linear under `o_proj`, constructs
+the optional controller under `o_proj_tp`, and calls its `pre_attention_hook()`
+before attention and its forward method for the projection. The controller is
+an `nn.Module` with a weak reference to the original linear, preserving its
+checkpoint parameter names without registering the linear twice.
 
-```text
-attention impl  --(o_proj(x), pre_attention_hook)-->  PCPOProjTP
-PCPOProjTP      --(quant_method.apply)-->             RowParallelLinear
-PCPOProjTP      --(gather / switch)-->                TPWeightSwitchMixin
-```
+The generic MLA wrapper receives the controller through `MLAModules.o_proj`.
+Both NVIDIA and ROCm DeepSeek-V3.2 attention explicitly use the controller
+when enabled.
 
-`PCPOProjTP` (`vllm/model_executor/layers/pcp_o_proj_tp.py`) is the
-intermediate layer between the attention implementation and the O-Proj linear
-layer. It owns all O-Proj split and restore logic and exposes:
+Quantization methods declare `TPWeightGatherSpec` descriptors through
+`get_tp_weight_switch_specs(layer)`. An empty declaration rejects unsupported
+methods. `TPWeightSwitch` owns the gather state and restores local tensor
+storage when its full-weight context exits, including after an exception.
+The original quantization method is never replaced or wrapped.
 
-- `linear_shard_kwargs(vllm_config)` and `maybe_create(linear, vllm_config)`:
-  enable sharding. The first returns the `tp_rank`/`tp_size` overrides that
-  build a plain `RowParallelLinear` over the flattened TP-by-PCP grid; the
-  second wraps that linear and returns `None` when the feature is disabled.
-- `enable_weight_switch()`: builds the local/full weight aliases. It runs
-  automatically after post-load processing through a delegating linear method.
-- `select_path(has_prefill)`: chooses `PCPOProjPath.WEIGHT_ALL_GATHER` for
-  batches with prefill and `PCPOProjPath.TOKEN_EXCHANGE` for decode-only
-  batches.
-- `pre_attention_hook(attn_metadata=None, *, layer_name=None)`: selects the
-  path for the current forward and launches the asynchronous weight gather
-  when needed.
-- `__call__(x)`: a drop-in replacement for `RowParallelLinear.__call__` with
-  the same input and `(output, bias)`/`output` return convention.
-
-Attention implementations therefore keep calling `o_proj(x)`. The MLA wrapper
-receives the `PCPOProjTP` instance through `MLAModules.o_proj`; DeepSeek-V3.2
-attention selects it in place of the linear layer. The linear layer remains
-registered under its original `o_proj` name, so checkpoint loading and
-post-load processing are unchanged.
-
-## Weight-switch scope
-
-The implementation follows the vllm-ascend `TPWeightSwitchMixin` mechanism.
-Each compatible linear method only declares a `TPWeightGatherSpec` descriptor
-for every post-load tensor consumed by its kernel and the corresponding
-input-shard dimension. The mixin owns the reusable buffers, asynchronous
-collective handles, and local/full tensor aliases. Tensors whose post-load
-layout is not directly concatenative attach a reusable `TPWeightGatherLayout`
-to their descriptor instead of overriding mixin internals.
-
-`UnquantizedLinearMethod` declares only `weight`. The ModelOpt W4A4 NVFP4
-adapter is the quantized example: it declares the packed `weight` and per-block
-`weight_scale`. Packed weights concatenate directly on dimension 1. CUTLASS
-block scales do not: every local scale is already stored in a 128x4 swizzled
-layout, so the scale descriptor uses the shared
-`NVFP4_SWIZZLED_BLOCK_SCALE_LAYOUT`. The layout exposes a logical unswizzled view to the collective and,
-after the asynchronous gather completes, assembles the full swizzled scale in a
-shared buffer before switching both layer attributes. Scale payloads use
-`uint8` views so the collective preserves FP8 bits without requiring an FP8
-reduction datatype. Replicated global scales
-(`input_global_scale_inv`, `weight_global_scale`, and `alpha`) remain unchanged.
-
-The adapter validates the concrete kernel layout before allocating state.
-Marlin repacking, TensorRT-LLM shuffling, Humming renaming, FBGEMM flattening,
-and local input-axis padding are not treated as concatenative and fail closed.
-This keeps the mixin extension representation-specific rather than claiming
-support for every backend selected by the `modelopt_fp4` configuration name.
-
-This boundary matches the quantized model coverage already present for PCP.
-The upstream PCP GSM8K matrix contains GLM-5.2-NVFP4, whose ModelOpt
-configuration excludes every `self_attn` module from NVFP4 quantization. Its
-O-Proj therefore uses the same unquantized method as a BF16 checkpoint; it does
-not exercise the quantized O-Proj adapter.
+Unquantized O-Proj declares only `weight`. ModelOpt W4A4 NVFP4 declares packed
+`weight` and block `weight_scale`. Packed weights concatenate on dimension 1;
+the scale descriptor supplies `create_nvfp4_scale_gather_part` from
+`nvfp4_utils.py` to unswizzle, gather through uint8 aliases, and reswizzle the
+CUTLASS 128x4 scales. Replicated global scales remain unchanged. The ModelOpt
+method validates the concrete kernel and rejects incompatible layouts and
+input-axis padding before allocating buffers.
 
 ## Runtime paths
 
@@ -171,48 +128,36 @@ reached, then applies `W_tp[t]` to the local tokens on the current PCP rank.
 This path does not perform a PCP output reduction because different PCP ranks
 process different tokens. The existing TP reduction remains unchanged.
 
-Because the weight-sharded axis is not dimension 0, the mixin moves that axis
+Because the weight-sharded axis is not dimension 0, `TPWeightSwitch` moves that axis
 to the front and makes a contiguous collective input for
 `all_gather_into_tensor`. If the target kernel accepts the resulting moved-dim
 view, the collective output is used directly. Kernels that require a contiguous
 post-load layout request a shared assembly buffer and copy the gathered view
 into it after the asynchronous handle completes.
 
-## Buffer lifecycle
+## Buffer lifecycle and forward contract
 
-Full TP buffers are shared by vLLM config scope, method, tensor attribute,
-device, dtype, and shape and are allocated during model construction. All
-compatible layers hold the same shared full-weight buffer, so its cost is
-included before profiling and KV-cache sizing. Each layer also retains a local
-contiguous staging tensor for the dimension-1 collective input. With normal
-sequential layer execution, one layer waits for and consumes the shared gathered
-weight before the next layer reuses the full-weight buffer.
+After quantization and attention post-processing, the model loader calls
+`PCPOProjTP.process_weights_after_loading(model)`. It builds one
+`TPWeightBufferPool` shared by that model's controllers. Buffers are keyed by
+attribute/layout, device, dtype, and shape, and are allocated before profiling
+and KV-cache sizing. Reloading rebuilds aliases from the current parameters.
+Each dense projection also retains its own contiguous collective input, which
+is refreshed on each gather so in-place weight updates remain visible.
 
-The input to each asynchronous collective is either the local tensor itself or
-a persistent contiguous moved-dim staging tensor. Non-leading staging inputs
-are refreshed before every gather so in-place weight updates are visible. DBO
-is currently disabled to prevent two concurrent microbatches from using the
-shared buffers at the same time.
+Layers consume the shared full-weight buffers sequentially. DBO remains
+disabled because concurrent microbatches cannot reuse the same workspace.
 
-## Explicit triggering and correctness constraints
+Real forwards must provide `ForwardContext.global_has_prefill`; local
+attention metadata is never used to select a collective. The target runner
+sets the flag from the batch before PCP partitioning. MTP uses that same flag
+for its initial pass and `False` for subsequent replicated decode passes.
+Metadata-free profiling uses the decode path.
 
-Both the generic MLA wrapper and the modular DeepSeek-V3.2 attention path
-explicitly call `PCPOProjTP.pre_attention_hook()` after their Q/KV normalization and before the
-remaining query projection and main attention computation. The trigger uses
-the logical pre-partition batch type propagated through `ForwardContext`, so
-all PCP ranks preserve collective ordering.
-`PCPOProjTP.__call__()` requires the hook to have occurred
-before every invocation. A missing trigger raises an error instead of inferring
-the batch type. This guarantees that:
-
-- the prefill/mixed gather avoids contending with Q/KV RMSNorm while retaining
-  the remaining query projection, RoPE, the indexer, and the main attention
-  computation as overlap candidates;
-- decode-only batches do not issue an unnecessary weight gather;
-- O-Proj does not read the shared buffer before the asynchronous gather has
-  completed; and
-- profiling paths without metadata use the decode-sharded calculation, which
-  preserves correctness for zero attention outputs.
+Attention must call `pre_attention_hook()` exactly once before each O-Proj
+invocation. Missing or unconsumed hooks raise an error. Prefill gathers launch
+after Q/KV normalization and are waited on at the projection. The ROCm path
+launches before its fused attention routine.
 
 ## Configuration
 
@@ -235,6 +180,11 @@ vllm serve <model> \
 ```
 
 ## Validation results
+
+The model measurements below predate the controller refactor; they have not
+been rerun for the current implementation. The focused suite uses real
+two-process Gloo collectives for dense and NVFP4 reconstruction, including
+padded scales, weight updates, and exception restoration.
 
 ### GLM-5.2 cropped execution
 

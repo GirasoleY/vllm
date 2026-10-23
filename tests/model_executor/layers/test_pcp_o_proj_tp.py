@@ -1,384 +1,221 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Exercise weight reconstruction with real tensors and Gloo collectives."""
 
-
-from types import SimpleNamespace
+from datetime import timedelta
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-import vllm.model_executor.layers.linear as linear_module
-import vllm.model_executor.layers.pcp_o_proj_tp as pcp_o_proj_module
-import vllm.model_executor.parameter as parameter_module
-from vllm.config.quantization import QuantSpec
-from vllm.model_executor.kernels.linear import (
-    CutlassNvFp4LinearKernel,
-    MarlinNvFp4LinearKernel,
+from tests.kernels.quantization.nvfp4_utils import convert_swizzled_to_linear
+from vllm.config import (
+    DeviceConfig,
+    ParallelConfig,
+    VllmConfig,
+    set_current_vllm_config,
 )
-from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
-from vllm.model_executor.layers.pcp_o_proj_tp import PCPOProjPath, PCPOProjTP
+from vllm.config.quantization import QuantSpec
+from vllm.distributed import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.linear import RowParallelLinear
+from vllm.model_executor.layers.pcp_o_proj_tp import PCPOProjTP
 from vllm.model_executor.layers.quantization.modelopt import (
     CkptCtx,
     ModelOptLinearMethod,
+)
+from vllm.model_executor.layers.quantization.tp_weight_switch import (
+    TPWeightBufferPool,
+    TPWeightGatherSpec,
+    TPWeightSwitch,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.platforms import current_platform
 
 
-class _FakeWork:
-    def __init__(self) -> None:
-        self.waited = False
-
-    def wait(self) -> None:
-        self.waited = True
-
-
-class _FakePCPGroup:
-    def __init__(self, rank: int) -> None:
-        self.rank_in_group = rank
-        self.world_size = 2
-        self.device_group = object()
-        self.other_output: torch.Tensor | None = None
-
-    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        assert self.other_output is not None
-        return tensor + self.other_output
-
-
-class _UnsupportedLinearMethod(LinearMethodBase):
-    def create_weights(self, *args, **kwargs) -> None:
-        raise AssertionError("weights are installed by the test")
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        del layer
-
-    def apply(self, layer, x, bias=None):
-        raise AssertionError("unsupported method must fail during post-load")
-
-
-def _make_layer(monkeypatch, pcp_rank: int) -> tuple[PCPOProjTP, _FakePCPGroup]:
-    pcp_group = _FakePCPGroup(pcp_rank)
-    config_scope = object()
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(enable_pcp_o_proj_tp=True)
-    )
-    for module in (linear_module, pcp_o_proj_module, parameter_module):
-        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
-        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(pcp_o_proj_module, "get_pcp_group", lambda: pcp_group)
-    monkeypatch.setattr(
-        pcp_o_proj_module, "get_current_vllm_config", lambda: config_scope
-    )
-
-    def _apply(_self, layer, x, bias=None):
-        assert layer.input_size_per_partition == x.shape[-1]
-        return F.linear(x, layer.weight, bias)
-
-    monkeypatch.setattr(linear_module.UnquantizedLinearMethod, "apply", _apply)
-    linear = RowParallelLinear(
-        input_size=4,
-        output_size=3,
-        bias=False,
-        params_dtype=torch.float32,
-        reduce_results=False,
-        **PCPOProjTP.linear_shard_kwargs(vllm_config),
-    )
-    o_proj = PCPOProjTP.maybe_create(linear, vllm_config)
-    assert o_proj is not None
-    return o_proj, pcp_group
-
-
-def test_disabled_feature_keeps_plain_linear():
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(enable_pcp_o_proj_tp=False)
-    )
-    assert PCPOProjTP.linear_shard_kwargs(vllm_config) == {}
-    assert PCPOProjTP.maybe_create(None, vllm_config) is None
-
-
-@pytest.mark.parametrize(
-    ("has_prefill", "expected"),
-    [
-        (True, PCPOProjPath.WEIGHT_ALL_GATHER),
-        (False, PCPOProjPath.TOKEN_EXCHANGE),
-    ],
-)
-def test_select_path(has_prefill, expected):
-    assert PCPOProjTP.select_path(has_prefill) is expected
-
-
-def test_prefill_waits_for_async_full_weight_gather(monkeypatch):
-    o_proj, _ = _make_layer(monkeypatch, pcp_rank=1)
-    layer = o_proj.linear
-    assert layer.quant_method.supports_pre_processed_weights
-    full_weight = torch.arange(12, dtype=torch.float32).view(3, 4)
-    layer.weight_loader_v2(layer.weight, full_weight)
-    torch.testing.assert_close(layer.weight, full_weight[:, 2:])
-
-    work = _FakeWork()
-
-    def _all_gather_into_tensor(output, input_, group, async_op):
-        torch.testing.assert_close(input_, full_weight[:, 2:].transpose(0, 1))
-        output.copy_(full_weight.transpose(0, 1))
-        assert group is o_proj.pcp_group.device_group
-        assert async_op
-        return work
-
-    monkeypatch.setattr(
-        torch.distributed, "all_gather_into_tensor", _all_gather_into_tensor
-    )
-
-    input_ = torch.arange(8, dtype=torch.float32).view(2, 4)
-    monkeypatch.setattr(
-        pcp_o_proj_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(global_has_prefill=True),
-    )
-    assert o_proj.pre_attention_hook() is PCPOProjPath.WEIGHT_ALL_GATHER
-    assert not work.waited
-
-    output, output_bias = o_proj(input_)
-    assert work.waited
-    assert output_bias is None
-    torch.testing.assert_close(output, F.linear(input_, full_weight))
-    assert layer.input_size_per_partition == 2
-
-
-def test_forward_requires_explicit_attention_prefetch(monkeypatch):
-    o_proj, _ = _make_layer(monkeypatch, pcp_rank=0)
-
-    with pytest.raises(RuntimeError, match="Attention must call"):
-        o_proj(torch.zeros(1, 4))
-
-
-@pytest.mark.parametrize(
-    ("global_has_prefill", "local_num_prefills", "expected"),
-    [(True, 0, True), (False, 1, False), (None, 1, True), (None, 0, False)],
-)
-def test_prefetch_decision_uses_global_pcp_batch_type(
-    monkeypatch, global_has_prefill, local_num_prefills, expected
-):
-    monkeypatch.setattr(
-        pcp_o_proj_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(global_has_prefill=global_has_prefill),
-    )
-    metadata = SimpleNamespace(num_prefills=local_num_prefills)
-
-    assert pcp_o_proj_module.get_pcp_batch_has_prefill(metadata) is expected
-
-
-def test_decode_slices_features_and_reduces_over_pcp(monkeypatch):
-    o_proj, pcp_group = _make_layer(monkeypatch, pcp_rank=1)
-    layer = o_proj.linear
-    full_weight = torch.arange(12, dtype=torch.float32).view(3, 4)
-    layer.weight_loader_v2(layer.weight, full_weight)
-
-    input_ = torch.arange(8, dtype=torch.float32).view(2, 4)
-    pcp_group.other_output = F.linear(input_[:, :2], full_weight[:, :2])
-
-    def _no_gather(*args, **kwargs):
-        raise AssertionError("decode must not gather O-Proj weights")
-
-    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", _no_gather)
-    monkeypatch.setattr(
-        pcp_o_proj_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(global_has_prefill=False),
-    )
-    assert o_proj.pre_attention_hook() is PCPOProjPath.TOKEN_EXCHANGE
-    output, output_bias = o_proj(input_)
-
-    assert output_bias is None
-    torch.testing.assert_close(output, F.linear(input_, full_weight))
-
-
-def test_quantized_o_proj_method_is_rejected(monkeypatch):
-    o_proj, _ = _make_layer(monkeypatch, pcp_rank=0)
-    layer = o_proj.linear
-    layer.quant_method.quant_method = _UnsupportedLinearMethod()  # type: ignore[attr-defined]
-
-    with pytest.raises(RuntimeError, match="does not support the selected O-Proj"):
-        layer.quant_method.process_weights_after_loading(layer)
-
-
-def _swizzle_nvfp4_scale(scale: torch.Tensor) -> torch.Tensor:
-    output_size, scale_cols = scale.shape
-    padded_output_size = (output_size + 127) // 128 * 128
-    padded_scale_cols = (scale_cols + 3) // 4 * 4
-    padded = torch.zeros((1, padded_output_size, padded_scale_cols), dtype=scale.dtype)
-    padded[0, :output_size, :scale_cols] = scale
-    return (
-        padded.view(
-            1,
-            padded_output_size // 128,
-            4,
-            32,
-            padded_scale_cols // 4,
-            4,
+def _check_dense(rank: int, contiguous: bool) -> None:
+    buffers = TPWeightBufferPool()
+    weight = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    x = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    # Sequential layers share the full-weight workspace, but retain independent
+    # resident parameters. Updating a resident parameter must refresh staging.
+    layers = [torch.nn.Linear(4, 3, bias=False) for _ in range(2)]
+    switches = [
+        TPWeightSwitch(
+            layer,
+            (
+                TPWeightGatherSpec(
+                    "weight", gather_dim=1, make_full_contiguous=contiguous
+                ),
+            ),
+            2,
+            buffers,
         )
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .view(padded_output_size, padded_scale_cols)
-    )
-
-
-def test_modelopt_nvfp4_switches_packed_weight_and_swizzled_scale(monkeypatch):
-    output_size = 256
-    local_input_size = 64
-    pcp_size = 2
-    full_weight = (
-        torch.arange(
-            output_size * local_input_size,
-            dtype=torch.int64,
-        )
-        .to(torch.uint8)
-        .view(output_size, local_input_size)
-    )
-    full_scale = (
-        (
-            torch.arange(
-                output_size * local_input_size // 8,
-                dtype=torch.int64,
+        for layer in layers
+    ]
+    for index, (layer, switch) in enumerate(zip(layers, switches)):
+        local = (weight + index)[:, rank * 4 : (rank + 1) * 4]
+        with torch.no_grad():
+            layer.weight.copy_(local)
+        switch.gather(dist.group.WORLD)
+        with switch.full_weight(layer):
+            torch.testing.assert_close(
+                layer(x), F.linear(x, weight + index), rtol=0, atol=0
             )
-            % 64
-        )
-        .to(torch.uint8)
-        .view(torch.float8_e4m3fn)
-        .view(output_size, 8)
-    )
+            if contiguous:
+                assert layer.weight.is_contiguous()
+        torch.testing.assert_close(layer.weight, local, rtol=0, atol=0)
 
+    layer, switch = layers[0], switches[0]
+    with torch.no_grad():
+        layer.weight.add_(2)
+    local = layer.weight.clone()
+    switch.gather(dist.group.WORLD)
+    with (
+        pytest.raises(RuntimeError, match="consumer failed"),
+        switch.full_weight(layer),
+    ):
+        torch.testing.assert_close(layer(x), F.linear(x, weight + 2), rtol=0, atol=0)
+        raise RuntimeError("consumer failed")
+    torch.testing.assert_close(layer.weight, local, rtol=0, atol=0)
+
+
+def _check_nvfp4(rank: int, output_size: int, scale_cols: int) -> None:
+    # Use the existing test oracle to decode the gathered swizzled scales.
+    padded_n = (output_size + 127) // 128 * 128
+    padded_k = (scale_cols + 3) // 4 * 4
+    local = (torch.arange(padded_n * padded_k) % 64 + rank * 64).to(torch.uint8)
     layer = torch.nn.Module()
+    layer.input_size_per_partition = scale_cols * 16
     layer.output_size_per_partition = output_size
-    layer.input_size_per_partition = local_input_size
-    layer.weights_padding_cols = 0
-    layer.register_parameter(
-        "weight",
-        torch.nn.Parameter(full_weight[:, :32], requires_grad=False),
-    )
-    local_swizzled_scale = _swizzle_nvfp4_scale(full_scale[:, :4])
     layer.register_parameter(
         "weight_scale",
-        torch.nn.Parameter(local_swizzled_scale, requires_grad=False),
+        torch.nn.Parameter(
+            local.view(torch.float8_e4m3fn).reshape(padded_n, padded_k),
+            requires_grad=False,
+        ),
     )
-    layer.register_parameter(
-        "input_global_scale_inv",
-        torch.nn.Parameter(torch.tensor(2.0), requires_grad=False),
+    before = layer.weight_scale.view(torch.uint8).clone()
+    logical = convert_swizzled_to_linear(
+        layer.weight_scale, output_size, scale_cols * 16, 16
+    )[:, :scale_cols]
+    expected = [torch.empty_like(logical.view(torch.uint8)) for _ in range(2)]
+    dist.all_gather(expected, logical.contiguous().view(torch.uint8))
+    switch = TPWeightSwitch(
+        layer,
+        (ModelOptLinearMethod.tp_weight_gather_specs[1],),
+        2,
+        TPWeightBufferPool(),
     )
-    layer.register_parameter(
-        "alpha",
-        torch.nn.Parameter(torch.tensor(3.0), requires_grad=False),
+    switch.gather(dist.group.WORLD)
+    with switch.full_weight(layer):
+        full = convert_swizzled_to_linear(
+            layer.weight_scale, output_size, scale_cols * 32, 16
+        )[:, : scale_cols * 2]
+        assert torch.equal(full.view(torch.uint8), torch.cat(expected, dim=1))
+    assert torch.equal(layer.weight_scale.view(torch.uint8), before)
+
+
+def _gather_worker(rank: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
     )
+    try:
+        for contiguous in (False, True):
+            _check_dense(rank, contiguous)
+        for output_size, scale_cols in ((256, 4), (131, 3), (128, 5)):
+            _check_nvfp4(rank, output_size, scale_cols)
+        _check_controller(rank)
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
-    method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
-    method.spec = QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic)
-    method.ctx = CkptCtx(group_size=16)
-    method.kernel = CutlassNvFp4LinearKernel.__new__(CutlassNvFp4LinearKernel)
-    state = method.enable_tp_weight_switch(layer, pcp_size)
 
-    works: list[_FakeWork] = []
-
-    def _all_gather_into_tensor(output, input_, group, async_op):
-        del group
-        assert async_op
-        if input_.shape[0] == full_weight.shape[1] // pcp_size:
-            output.copy_(full_weight.T)
-        else:
-            torch.testing.assert_close(input_, full_scale[:, :4].view(torch.uint8).T)
-            output.copy_(full_scale.view(torch.uint8).T)
-        work = _FakeWork()
-        works.append(work)
-        return work
-
-    monkeypatch.setattr(
-        torch.distributed, "all_gather_into_tensor", _all_gather_into_tensor
+def _check_controller(rank: int) -> None:
+    device = torch.device(f"cuda:{rank}" if current_platform.is_cuda_alike() else "cpu")
+    if device.type == "cuda":
+        torch.accelerator.set_device_index(rank)
+    config = VllmConfig(
+        device_config=DeviceConfig(device=device),
+        parallel_config=ParallelConfig(
+            prefill_context_parallel_size=2,
+            distributed_executor_backend="mp",
+            disable_custom_all_reduce=True,
+        ),
     )
+    with set_current_vllm_config(config):
+        backend = "nccl" if device.type == "cuda" else "gloo"
+        init_distributed_environment(
+            world_size=2, rank=rank, local_rank=rank, backend=backend
+        )
+        initialize_model_parallel(
+            prefill_context_model_parallel_size=2, backend=backend
+        )
+        owner = torch.nn.Module()
+        with device:
+            owner.o_proj = RowParallelLinear(
+                8,
+                3,
+                bias=False,
+                params_dtype=torch.float32,
+                tp_rank=rank,
+                tp_size=2,
+                reduce_results=False,
+            )
+        owner.o_proj_tp = PCPOProjTP(owner.o_proj)
+        PCPOProjTP.process_weights_after_loading(owner)
+        weight = torch.arange(24, dtype=torch.float32, device=device).reshape(3, 8)
+        owner.o_proj.weight_loader_v2(owner.o_proj.weight, weight)
+        assert list(owner.state_dict()) == ["o_proj.weight"]
+        x = torch.arange(16, dtype=torch.float32, device=device).reshape(2, 8)
+        for has_prefill in (True, False, True):
+            with set_forward_context(None, config, global_has_prefill=has_prefill):
+                owner.o_proj_tp.pre_attention_hook()
+                out, _ = owner.o_proj_tp(x)
+            torch.testing.assert_close(out, F.linear(x, weight), rtol=0, atol=0)
+        with pytest.raises(RuntimeError, match="must call"):
+            owner.o_proj_tp(x)
+        with (
+            set_forward_context({"attention": None}, config),
+            pytest.raises(RuntimeError, match="global prefill decision"),
+        ):
+            owner.o_proj_tp.pre_attention_hook()
 
-    input_global_scale_inv = layer.input_global_scale_inv
-    alpha = layer.alpha
-    method.all_gather_tp_weight(state, group=object())
-    method.wait_tp_weight_all_gather(state)
-    assert all(work.waited for work in works)
 
-    method.switch_tp_weight(layer, state, use_full_weight=True)
-    torch.testing.assert_close(layer.weight, full_weight)
-    torch.testing.assert_close(layer.weight_scale, _swizzle_nvfp4_scale(full_scale))
-    assert layer.input_global_scale_inv is input_global_scale_inv
-    assert layer.alpha is alpha
-
-    method.switch_tp_weight(layer, state, use_full_weight=False)
-    torch.testing.assert_close(layer.weight, full_weight[:, :32])
-    torch.testing.assert_close(layer.weight_scale, local_swizzled_scale)
+def test_weight_switch_reconstructs_dense_and_nvfp4_layouts(tmp_path):
+    mp.spawn(_gather_worker, args=(str(tmp_path / "gloo"),), nprocs=2)
 
 
-def test_modelopt_nvfp4_rejects_non_cutlass_post_load_layout():
-    method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
-    method.spec = QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic)
-    method.ctx = CkptCtx(group_size=16)
-    method.kernel = MarlinNvFp4LinearKernel.__new__(MarlinNvFp4LinearKernel)
-
-    with pytest.raises(RuntimeError, match="CUTLASS-compatible"):
-        method.get_tp_weight_switch_specs(torch.nn.Module())
+@pytest.mark.parametrize("dim", [-3, 2])
+def test_weight_switch_rejects_invalid_shard_axis(dim):
+    with pytest.raises(ValueError, match="Invalid gather dimension"):
+        TPWeightSwitch(
+            torch.nn.Linear(4, 3, bias=False),
+            (TPWeightGatherSpec("weight", gather_dim=dim),),
+            2,
+            TPWeightBufferPool(),
+        )
 
 
 @pytest.mark.parametrize("activation,group_size", [(None, 16), (kNvfp4Dynamic, 32)])
 def test_modelopt_weight_switch_rejects_unsupported_quant_spec(activation, group_size):
-    method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
-    method.spec = QuantSpec(weight=kNvfp4Static, activation=activation)
-    method.ctx = CkptCtx(group_size=group_size)
-    method.kernel = CutlassNvFp4LinearKernel.__new__(CutlassNvFp4LinearKernel)
-
+    method = ModelOptLinearMethod(
+        QuantSpec(weight=kNvfp4Static, activation=activation),
+        CkptCtx(group_size=group_size),
+    )
     with pytest.raises(RuntimeError, match="only ModelOpt W4A4 NVFP4"):
-        method.get_tp_weight_switch_specs(torch.nn.Module())
-
-
-def test_modelopt_nvfp4_rejects_padded_local_weight():
-    method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
-    method.spec = QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic)
-    method.ctx = CkptCtx(group_size=16)
-    method.kernel = CutlassNvFp4LinearKernel.__new__(CutlassNvFp4LinearKernel)
-    layer = torch.nn.Module()
-    layer.input_size_per_partition = 64
-    layer.weight = torch.nn.Parameter(
-        torch.zeros(128, 64, dtype=torch.uint8), requires_grad=False
-    )
-
-    with pytest.raises(RuntimeError, match="no input-axis padding"):
-        method.get_tp_weight_switch_specs(layer)
-
-
-def test_unquantized_method_restores_local_weight_after_kernel_failure(monkeypatch):
-    o_proj, _ = _make_layer(monkeypatch, pcp_rank=0)
-    layer = o_proj.linear
-    full_weight = torch.arange(12, dtype=torch.float32).view(3, 4)
-    layer.weight_loader_v2(layer.weight, full_weight)
-
-    def _raise_on_apply(_self, layer, x, bias=None):
-        assert layer.input_size_per_partition == x.shape[-1]
-        raise RuntimeError("fake linear kernel failure")
-
-    monkeypatch.setattr(linear_module.UnquantizedLinearMethod, "apply", _raise_on_apply)
-
-    def _all_gather_into_tensor(output, input_, group, async_op):
-        output.copy_(full_weight.transpose(0, 1))
-        return _FakeWork()
-
-    monkeypatch.setattr(
-        torch.distributed, "all_gather_into_tensor", _all_gather_into_tensor
-    )
-
-    monkeypatch.setattr(
-        pcp_o_proj_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(global_has_prefill=True),
-    )
-    o_proj.pre_attention_hook()
-    with pytest.raises(RuntimeError, match="fake linear kernel failure"):
-        o_proj(torch.zeros(1, 4))
-
-    assert layer.weight.shape == (3, 2)
-    assert layer.input_size_per_partition == 2
-    assert o_proj._path is None
+        method.get_tp_weight_switch_specs(torch.nn.Linear(4, 3, bias=False))

@@ -220,7 +220,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Keep the weight gather off the Q/KV RMSNorm kernels while retaining
         # Q projection, RoPE, indexer, and attention as overlap candidates.
         if isinstance(self.o_proj, PCPOProjTP):
-            self.o_proj.pre_attention_hook(layer_name=self.mla_attn.layer_name)
+            self.o_proj.pre_attention_hook()
 
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)

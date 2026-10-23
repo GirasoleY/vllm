@@ -68,9 +68,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.tp_weight_switch import (
-    NVFP4_SWIZZLED_BLOCK_SCALE_LAYOUT,
     TPWeightGatherSpec,
-    TPWeightSwitchMixin,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     trtllm_nvfp4_hidden_alignment,
@@ -92,6 +90,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_nvfp4_moe_weights,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    create_nvfp4_scale_gather_part,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP4_DTYPE,
@@ -2556,7 +2557,7 @@ _PCP_TP_NVFP4_CUTLASS_LAYOUT_KERNELS = (
 
 
 @register_weight_loader_v2_supported_method
-class ModelOptLinearMethod(TPWeightSwitchMixin, LinearMethodBase):
+class ModelOptLinearMethod(LinearMethodBase):
     """Generic, format-agnostic ModelOpt linear method. Holds a weight scheme +
     an activation scheme (from the QuantSpec pair) and an optional
     ``FormatScheme``, runs a fixed lifecycle, selects the kernel from the pair,
@@ -2570,7 +2571,7 @@ class ModelOptLinearMethod(TPWeightSwitchMixin, LinearMethodBase):
     tp_weight_gather_specs = (
         TPWeightGatherSpec("weight", gather_dim=1, make_full_contiguous=True),
         TPWeightGatherSpec(
-            "weight_scale", gather_dim=1, layout=NVFP4_SWIZZLED_BLOCK_SCALE_LAYOUT
+            "weight_scale", gather_dim=1, layout=create_nvfp4_scale_gather_part
         ),
     )
 

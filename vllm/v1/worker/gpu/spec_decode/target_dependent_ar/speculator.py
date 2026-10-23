@@ -396,6 +396,12 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
             is_padding=is_padding,
+            global_has_prefill=(
+                self.pcp_manager.global_has_prefill
+                if self.pcp_manager is not None
+                and self.pcp_manager.draft_prefill_batch is not None
+                else False
+            ),
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:

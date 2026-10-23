@@ -31,7 +31,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.tp_weight_switch import (
     TPWeightGatherSpec,
-    TPWeightSwitchMixin,
 )
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
@@ -128,6 +127,14 @@ def adjust_scalar_to_fused_array(
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
+    tp_weight_gather_specs: tuple[TPWeightGatherSpec, ...] = ()
+
+    def get_tp_weight_switch_specs(
+        self, layer: torch.nn.Module
+    ) -> tuple[TPWeightGatherSpec, ...]:
+        """Declare the post-load tensors that can reconstruct a full TP shard."""
+        return self.tp_weight_gather_specs
+
     @abstractmethod
     def create_weights(
         self,
@@ -167,7 +174,7 @@ class LinearMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
-class UnquantizedLinearMethod(TPWeightSwitchMixin, LinearMethodBase):
+class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
     tp_weight_gather_specs = (TPWeightGatherSpec("weight", gather_dim=1),)

@@ -6,6 +6,10 @@ import torch
 from vllm._custom_ops import (
     cutlass_scaled_mm_supports_fp4,
 )
+from vllm.model_executor.layers.quantization.tp_weight_switch import (
+    TPWeightBufferPool,
+    TPWeightGatherPart,
+)
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
@@ -121,3 +125,89 @@ def slice_nvfp4_output(
     if out.shape[-1] != output_size:
         return out[..., :output_size].contiguous()
     return out
+
+
+def create_nvfp4_scale_gather_part(
+    layer: torch.nn.Module,
+    tensor: torch.Tensor,
+    tp_size: int,
+    buffers: TPWeightBufferPool,
+) -> TPWeightGatherPart:
+    """Gather logical NVFP4 block scales and restore the CUTLASS 128x4 layout.
+
+    Persistent buffers avoid allocating during prefetch. The collective uses
+    uint8 aliases to preserve FP8 bits without requiring an FP8 collective.
+    """
+    scale = tensor.detach()
+    output_size = layer.output_size_per_partition
+    local_scale_cols = layer.input_size_per_partition // 16
+    padded_output_size = round_up(output_size, 128)
+    padded_local_scale_cols = round_up(local_scale_cols, 4)
+    expected_shape = (padded_output_size, padded_local_scale_cols)
+    if scale.dtype != torch.float8_e4m3fn or tuple(scale.shape) != expected_shape:
+        raise RuntimeError(
+            "Unexpected CUTLASS-compatible NVFP4 block-scale layout: "
+            f"expected dtype=torch.float8_e4m3fn and shape {expected_shape}, "
+            f"got dtype={scale.dtype} and shape={tuple(scale.shape)}."
+        )
+
+    full_scale_cols = local_scale_cols * tp_size
+    padded_full_scale_cols = round_up(full_scale_cols, 4)
+    name = "weight_scale.nvfp4_swizzled"
+    gather_input = buffers.get(
+        f"{name}.gather_input",
+        (local_scale_cols, output_size),
+        tensor=scale.view(torch.uint8),
+    )
+    gather_output = buffers.get(
+        f"{name}.gather_output",
+        (full_scale_cols, output_size),
+        tensor=scale.view(torch.uint8),
+    )
+    local_padded = buffers.get(
+        f"{name}.local_padded",
+        (1, padded_output_size, padded_local_scale_cols),
+        tensor=scale,
+    )
+    full_padded = buffers.get(
+        f"{name}.full_padded",
+        (1, padded_output_size, padded_full_scale_cols),
+        tensor=scale,
+    )
+    full_tensor = buffers.get(
+        f"{name}.full",
+        (padded_output_size, padded_full_scale_cols),
+        tensor=scale,
+    )
+
+    m_tiles = padded_output_size // 128
+    local_k_tiles = padded_local_scale_cols // 4
+    full_k_tiles = padded_full_scale_cols // 4
+
+    def prepare() -> None:
+        local_padded.view(1, m_tiles, 4, 32, local_k_tiles, 4).copy_(
+            scale.view(1, m_tiles, local_k_tiles, 32, 4, 4).permute(0, 1, 4, 3, 2, 5)
+        )
+        gather_input.copy_(
+            local_padded[0, :output_size, :local_scale_cols].view(torch.uint8).T
+        )
+
+    def finalize() -> None:
+        full_padded.zero_()
+        full_padded[0, :output_size, :full_scale_cols].view(torch.uint8).copy_(
+            gather_output.T
+        )
+        full_tensor.view(1, m_tiles, full_k_tiles, 32, 4, 4).copy_(
+            full_padded.view(1, m_tiles, 4, 32, full_k_tiles, 4).permute(
+                0, 1, 4, 3, 2, 5
+            )
+        )
+
+    return TPWeightGatherPart(
+        tp_tensor=scale,
+        gather_input=gather_input,
+        gather_output=gather_output,
+        full_tensor=full_tensor,
+        prepare=prepare,
+        finalize=finalize,
+    )

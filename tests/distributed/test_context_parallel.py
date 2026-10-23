@@ -316,3 +316,59 @@ def test_cp_generation(
         method="generate",
         is_multimodal=False,
     )
+
+
+@pytest.mark.timeout(600)
+def test_pcp_o_proj_tp_mtp_cached_prefill(vllm_runner):
+    """A cached one-token prefill beside decode must use one PCP collective.
+
+    The first request exhausts the initial token budget. In the next step it
+    decodes while the cached request has one prompt token, owned only by PCP
+    rank zero. MTP must retain the global prefill decision in this step.
+    """
+    from tests.models.utils import check_logprobs_close
+    from vllm import SamplingParams
+
+    prefix = [400] * 128
+    prompts = [{"prompt_token_ids": [500] * 64}, {"prompt_token_ids": prefix + [401]}]
+    sampling = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True, logprobs=5)
+    results = []
+    for enabled in (False, True):
+        with vllm_runner(
+            "zai-org/GLM-4.7-Flash",
+            dtype="bfloat16",
+            enforce_eager=True,
+            max_model_len=256,
+            max_num_batched_tokens=64,
+            max_num_seqs=2,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            prefill_context_parallel_size=2,
+            enable_pcp_o_proj_tp=enabled,
+            enable_expert_parallel=True,
+            distributed_executor_backend="mp",
+            compilation_config={"custom_ops": ["all"]},
+            speculative_config={"method": "mtp", "num_speculative_tokens": 2},
+        ) as runner:
+            runner.model.generate(
+                [{"prompt_token_ids": prefix}],
+                SamplingParams(temperature=0, max_tokens=1),
+            )
+            outputs = runner.model.generate(prompts, sampling)
+            results.append(
+                [
+                    (
+                        out.outputs[0].token_ids,
+                        out.outputs[0].text,
+                        out.outputs[0].logprobs,
+                    )
+                    for out in outputs
+                ]
+            )
+    check_logprobs_close(
+        outputs_0_lst=results[0],
+        outputs_1_lst=results[1],
+        name_0="PCP reference",
+        name_1="PCP O-Proj TP",
+        always_check_logprobs=True,
+    )
