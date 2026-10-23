@@ -3,8 +3,7 @@
 """PCP O-Proj communication policy over an ordinary row-parallel linear."""
 
 import enum
-import weakref
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -19,9 +18,8 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
-from vllm.model_executor.layers.quantization.tp_weight_switch import (
-    TPWeightBufferPool,
-    TPWeightSwitch,
+from vllm.model_executor.layers.weight_gather import (
+    GatheredWeights,
 )
 
 
@@ -32,15 +30,15 @@ class _LinearShardKwargs(TypedDict, total=False):
 
 class PCPOProjPath(enum.Enum):
     WEIGHT_ALL_GATHER = "weight_all_gather"
-    TOKEN_EXCHANGE = "token_exchange"
+    OUTPUT_REDUCE = "output_reduce"
 
 
 class PCPOProjTP(torch.nn.Module):
     """Own weight prefetch and PCP reduction while preserving checkpoint names.
 
     The attention module registers the linear as ``o_proj`` and this controller
-    as ``o_proj_tp``. The controller holds a weak reference to that linear, so
-    it adds no parameter aliases to the model's state dict.
+    as ``o_proj_tp``. Gathered weights reference the linear without registering
+    it again, preserving its parameter names in the model's state dict.
     """
 
     @staticmethod
@@ -66,7 +64,6 @@ class PCPOProjTP(torch.nn.Module):
             raise ValueError(
                 "PCP O-Proj TP requires bias=False and input_is_parallel=True."
             )
-        self._linear = weakref.ref(linear)
         self.pcp_group = get_pcp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
         if self.pcp_group.world_size <= 1:
@@ -74,42 +71,23 @@ class PCPOProjTP(torch.nn.Module):
         if linear.tp_size != self.tp_size * self.pcp_group.world_size:
             raise ValueError("Build the linear with PCPOProjTP.linear_shard_kwargs().")
         self.tp_input_size = divide(linear.input_size, self.tp_size)
-        self._weights: TPWeightSwitch | None = None
+        quant_method = linear.quant_method
+        assert isinstance(quant_method, LinearMethodBase)
+        self.weights = GatheredWeights(
+            linear, quant_method.get_weight_gather_specs, self.pcp_group.world_size
+        )
         self._path: PCPOProjPath | None = None
 
     @property
     def linear(self) -> RowParallelLinear:
-        linear = self._linear()
-        assert linear is not None, "The attention module must own its O-Proj linear."
-        return linear
-
-    @staticmethod
-    def process_weights_after_loading(model: torch.nn.Module) -> None:
-        """Initialize all controllers with a workspace owned by this model."""
-        buffers = TPWeightBufferPool()
-        for module in model.modules():
-            if isinstance(module, PCPOProjTP):
-                module.enable_weight_switch(buffers)
-
-    def enable_weight_switch(self, buffers: TPWeightBufferPool) -> None:
-        if self._path is not None:
-            raise RuntimeError("Cannot rebuild O-Proj weights during a forward.")
-        linear = self.linear
-        quant_method = linear.quant_method
-        assert isinstance(quant_method, LinearMethodBase)
-        self._weights = TPWeightSwitch(
-            linear,
-            quant_method.get_tp_weight_switch_specs(linear),
-            self.pcp_group.world_size,
-            buffers,
-        )
+        return cast(RowParallelLinear, self.weights.layer)
 
     @staticmethod
     def select_path(has_prefill: bool) -> PCPOProjPath:
         return (
             PCPOProjPath.WEIGHT_ALL_GATHER
             if has_prefill
-            else PCPOProjPath.TOKEN_EXCHANGE
+            else PCPOProjPath.OUTPUT_REDUCE
         )
 
     def pre_attention_hook(self) -> None:
@@ -122,10 +100,10 @@ class PCPOProjTP(torch.nn.Module):
             if context.attn_metadata is not None:
                 raise RuntimeError("PCP O-Proj requires a global prefill decision.")
             has_prefill = False  # Metadata-free profiling runs replicated inputs.
-        assert self._weights is not None, "Initialize O-Proj after loading weights."
+        assert self.weights.initialized, "Initialize O-Proj after loading weights."
         path = self.select_path(has_prefill)
         if path is PCPOProjPath.WEIGHT_ALL_GATHER:
-            self._weights.gather(self.pcp_group.device_group)
+            self.weights.gather(self.pcp_group.device_group)
         self._path = path
 
     def forward(
@@ -134,15 +112,15 @@ class PCPOProjTP(torch.nn.Module):
         path, self._path = self._path, None
         if path is None:
             raise RuntimeError("Attention must call PCPOProjTP.pre_attention_hook().")
-        assert self._weights is not None
+        assert self.weights.initialized
         if input_.shape[-1] != self.tp_input_size:
             if path is PCPOProjPath.WEIGHT_ALL_GATHER:
-                self._weights.wait()
+                self.weights.wait()
             raise ValueError(f"PCP O-Proj expected input width {self.tp_input_size}.")
 
         linear = self.linear
         if path is PCPOProjPath.WEIGHT_ALL_GATHER:
-            with self._weights.full_weight(linear):
+            with self.weights.full_weight():
                 local_size = linear.input_size_per_partition
                 linear.input_size_per_partition = self.tp_input_size
                 try:

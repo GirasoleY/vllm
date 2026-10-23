@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reusable gather buffers for linear methods' declared weight layouts."""
+"""Reconstruct sharded weights using model-owned collective workspaces."""
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ import torch
 
 
 @dataclass
-class TPWeightBufferPool:
+class WeightGatherWorkspace:
     """Full-weight workspace shared by sequential projections in one model."""
 
     buffers: dict[tuple[Any, ...], torch.Tensor] = field(default_factory=dict)
@@ -30,10 +31,10 @@ class TPWeightBufferPool:
 
 
 @dataclass
-class TPWeightGatherPart:
+class WeightGatherPart:
     """Local/full aliases and persistent collective storage for one tensor."""
 
-    tp_tensor: torch.Tensor
+    local_tensor: torch.Tensor
     gather_input: torch.Tensor
     gather_output: torch.Tensor
     full_tensor: torch.Tensor
@@ -41,23 +42,23 @@ class TPWeightGatherPart:
     finalize: Callable[[], None]
 
 
-TPWeightGatherLayout = Callable[
-    [torch.nn.Module, torch.Tensor, int, TPWeightBufferPool], TPWeightGatherPart
+WeightGatherLayout = Callable[
+    [torch.nn.Module, torch.Tensor, int, WeightGatherWorkspace], WeightGatherPart
 ]
 
 
 @dataclass(frozen=True)
-class TPWeightGatherSpec:
+class WeightGatherSpec:
     """A tensor attribute and its input-shard axis or layout-specific factory."""
 
     attr_name: str
     gather_dim: int = 0
     make_full_contiguous: bool = False
-    layout: TPWeightGatherLayout | None = None
+    layout: WeightGatherLayout | None = None
 
     def create_part(
-        self, layer: torch.nn.Module, size: int, buffers: TPWeightBufferPool
-    ) -> TPWeightGatherPart:
+        self, layer: torch.nn.Module, size: int, buffers: WeightGatherWorkspace
+    ) -> WeightGatherPart:
         tensor = getattr(layer, self.attr_name).detach()
         if self.layout is not None:
             return self.layout(layer, tensor, size, buffers)
@@ -86,31 +87,62 @@ class TPWeightGatherSpec:
             if full.data_ptr() != full_view.data_ptr():
                 full.copy_(full_view)
 
-        return TPWeightGatherPart(
-            tensor, gather_input, gathered, full, prepare, finalize
-        )
+        return WeightGatherPart(tensor, gather_input, gathered, full, prepare, finalize)
 
 
-class TPWeightSwitch:
-    """Gather and temporarily expose the full tensors required by a linear kernel."""
+class GatheredWeights(torch.nn.Module):
+    """Prefetch full weights and restore local storage after their consumer exits.
+
+    This parameter-free module references its owning layer without registering
+    it twice. Specs are resolved after loading, when quantization layouts are
+    final. Sequential consumers in one model share the same workspace.
+    """
 
     def __init__(
         self,
         layer: torch.nn.Module,
-        specs: tuple[TPWeightGatherSpec, ...],
+        specs: Callable[[torch.nn.Module], tuple[WeightGatherSpec, ...]],
         size: int,
-        buffers: TPWeightBufferPool,
     ) -> None:
-        if not specs:
-            raise RuntimeError(
-                "The linear method does not support TP weight switching."
-            )
-        self.parts = {
-            spec.attr_name: spec.create_part(layer, size, buffers) for spec in specs
-        }
+        super().__init__()
+        self._layer = weakref.ref(layer)
+        self._specs = specs
+        self.size = size
+        self.parts: dict[str, WeightGatherPart] | None = None
         self.handles: list[Any] = []
 
-    def gather(self, group: Any) -> None:
+    @property
+    def layer(self) -> torch.nn.Module:
+        layer = self._layer()
+        assert layer is not None, "The model must retain the layer owning its weights."
+        return layer
+
+    @property
+    def initialized(self) -> bool:
+        return self.parts is not None
+
+    @staticmethod
+    def initialize_model(model: torch.nn.Module) -> None:
+        """Refresh post-load aliases using one workspace for this model."""
+        workspace = WeightGatherWorkspace()
+        for module in model.modules():
+            if isinstance(module, GatheredWeights):
+                module.initialize(workspace)
+
+    def initialize(self, workspace: WeightGatherWorkspace) -> None:
+        if self.handles:
+            raise RuntimeError("Cannot initialize weights while a gather is pending.")
+        layer = self.layer
+        specs = self._specs(layer)
+        if not specs:
+            raise RuntimeError("The linear method does not support weight gathering.")
+        self.parts = {
+            spec.attr_name: spec.create_part(layer, self.size, workspace)
+            for spec in specs
+        }
+
+    def gather(self, group: torch.distributed.ProcessGroup) -> None:
+        assert self.parts is not None, "Initialize gathered weights after loading."
         if self.handles:
             raise RuntimeError(
                 "Wait for the pending weight gather before launching another."
@@ -131,6 +163,7 @@ class TPWeightSwitch:
             raise
 
     def wait(self) -> None:
+        assert self.parts is not None, "Initialize gathered weights after loading."
         try:
             for handle in self.handles:
                 handle.wait()
@@ -140,8 +173,10 @@ class TPWeightSwitch:
             self.handles.clear()
 
     @contextmanager
-    def full_weight(self, layer: torch.nn.Module) -> Iterator[None]:
+    def full_weight(self) -> Iterator[None]:
         self.wait()
+        assert self.parts is not None
+        layer = self.layer
         with torch.no_grad():
             for name, part in self.parts.items():
                 getattr(layer, name).set_(part.full_tensor)
@@ -149,4 +184,4 @@ class TPWeightSwitch:
                 yield
             finally:
                 for name, part in self.parts.items():
-                    getattr(layer, name).set_(part.tp_tensor)
+                    getattr(layer, name).set_(part.local_tensor)

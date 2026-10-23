@@ -6,9 +6,9 @@ import torch
 from vllm._custom_ops import (
     cutlass_scaled_mm_supports_fp4,
 )
-from vllm.model_executor.layers.quantization.tp_weight_switch import (
-    TPWeightBufferPool,
-    TPWeightGatherPart,
+from vllm.model_executor.layers.weight_gather import (
+    WeightGatherPart,
+    WeightGatherWorkspace,
 )
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
@@ -131,8 +131,8 @@ def create_nvfp4_scale_gather_part(
     layer: torch.nn.Module,
     tensor: torch.Tensor,
     tp_size: int,
-    buffers: TPWeightBufferPool,
-) -> TPWeightGatherPart:
+    buffers: WeightGatherWorkspace,
+) -> WeightGatherPart:
     """Gather logical NVFP4 block scales and restore the CUTLASS 128x4 layout.
 
     Persistent buffers avoid allocating during prefetch. The collective uses
@@ -203,8 +203,8 @@ def create_nvfp4_scale_gather_part(
             )
         )
 
-    return TPWeightGatherPart(
-        tp_tensor=scale,
+    return WeightGatherPart(
+        local_tensor=scale,
         gather_input=gather_input,
         gather_output=gather_output,
         full_tensor=full_tensor,

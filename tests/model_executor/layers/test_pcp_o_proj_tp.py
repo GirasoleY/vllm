@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exercise weight reconstruction with real tensors and Gloo collectives."""
 
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -31,44 +32,40 @@ from vllm.model_executor.layers.quantization.modelopt import (
     CkptCtx,
     ModelOptLinearMethod,
 )
-from vllm.model_executor.layers.quantization.tp_weight_switch import (
-    TPWeightBufferPool,
-    TPWeightGatherSpec,
-    TPWeightSwitch,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
+)
+from vllm.model_executor.layers.weight_gather import (
+    GatheredWeights,
+    WeightGatherSpec,
+    WeightGatherWorkspace,
 )
 from vllm.platforms import current_platform
 
 
 def _check_dense(rank: int, contiguous: bool) -> None:
-    buffers = TPWeightBufferPool()
+    buffers = WeightGatherWorkspace()
     weight = torch.arange(24, dtype=torch.float32).reshape(3, 8)
     x = torch.arange(16, dtype=torch.float32).reshape(2, 8)
     # Sequential layers share the full-weight workspace, but retain independent
     # resident parameters. Updating a resident parameter must refresh staging.
     layers = [torch.nn.Linear(4, 3, bias=False) for _ in range(2)]
-    switches = [
-        TPWeightSwitch(
-            layer,
-            (
-                TPWeightGatherSpec(
-                    "weight", gather_dim=1, make_full_contiguous=contiguous
-                ),
-            ),
-            2,
-            buffers,
-        )
-        for layer in layers
-    ]
+    specs = (WeightGatherSpec("weight", gather_dim=1, make_full_contiguous=contiguous),)
+    switches = [GatheredWeights(layer, lambda _: specs, 2) for layer in layers]
+    for switch in switches:
+        switch.initialize(buffers)
+    assert switches[0].parts is not None and switches[1].parts is not None
+    assert (
+        switches[0].parts["weight"].full_tensor.data_ptr()
+        == switches[1].parts["weight"].full_tensor.data_ptr()
+    )
     for index, (layer, switch) in enumerate(zip(layers, switches)):
         local = (weight + index)[:, rank * 4 : (rank + 1) * 4]
         with torch.no_grad():
             layer.weight.copy_(local)
         switch.gather(dist.group.WORLD)
-        with switch.full_weight(layer):
+        with switch.full_weight():
             torch.testing.assert_close(
                 layer(x), F.linear(x, weight + index), rtol=0, atol=0
             )
@@ -83,7 +80,7 @@ def _check_dense(rank: int, contiguous: bool) -> None:
     switch.gather(dist.group.WORLD)
     with (
         pytest.raises(RuntimeError, match="consumer failed"),
-        switch.full_weight(layer),
+        switch.full_weight(),
     ):
         torch.testing.assert_close(layer(x), F.linear(x, weight + 2), rtol=0, atol=0)
         raise RuntimeError("consumer failed")
@@ -111,14 +108,14 @@ def _check_nvfp4(rank: int, output_size: int, scale_cols: int) -> None:
     )[:, :scale_cols]
     expected = [torch.empty_like(logical.view(torch.uint8)) for _ in range(2)]
     dist.all_gather(expected, logical.contiguous().view(torch.uint8))
-    switch = TPWeightSwitch(
+    switch = GatheredWeights(
         layer,
-        (ModelOptLinearMethod.tp_weight_gather_specs[1],),
+        lambda _: (ModelOptLinearMethod.weight_gather_specs[1],),
         2,
-        TPWeightBufferPool(),
     )
+    switch.initialize(WeightGatherWorkspace())
     switch.gather(dist.group.WORLD)
-    with switch.full_weight(layer):
+    with switch.full_weight():
         full = convert_swizzled_to_linear(
             layer.weight_scale, output_size, scale_cols * 32, 16
         )[:, : scale_cols * 2]
@@ -126,7 +123,9 @@ def _check_nvfp4(rank: int, output_size: int, scale_cols: int) -> None:
     assert torch.equal(layer.weight_scale.view(torch.uint8), before)
 
 
-def _gather_worker(rank: int, init_file: str) -> None:
+def _gather_worker(
+    rank: int, init_file: str, check: Callable[..., None], args: tuple
+) -> None:
     dist.init_process_group(
         "gloo",
         init_method=f"file://{init_file}",
@@ -135,14 +134,14 @@ def _gather_worker(rank: int, init_file: str) -> None:
         timeout=timedelta(seconds=30),
     )
     try:
-        for contiguous in (False, True):
-            _check_dense(rank, contiguous)
-        for output_size, scale_cols in ((256, 4), (131, 3), (128, 5)):
-            _check_nvfp4(rank, output_size, scale_cols)
-        _check_controller(rank)
+        check(rank, *args)
     finally:
         destroy_model_parallel()
         destroy_distributed_environment()
+
+
+def _run_distributed(tmp_path, check: Callable[..., None], *args) -> None:
+    mp.spawn(_gather_worker, args=(str(tmp_path / "gloo"), check, args), nprocs=2)
 
 
 def _check_controller(rank: int) -> None:
@@ -177,7 +176,7 @@ def _check_controller(rank: int) -> None:
                 reduce_results=False,
             )
         owner.o_proj_tp = PCPOProjTP(owner.o_proj)
-        PCPOProjTP.process_weights_after_loading(owner)
+        GatheredWeights.initialize_model(owner)
         weight = torch.arange(24, dtype=torch.float32, device=device).reshape(3, 8)
         owner.o_proj.weight_loader_v2(owner.o_proj.weight, weight)
         assert list(owner.state_dict()) == ["o_proj.weight"]
@@ -196,26 +195,37 @@ def _check_controller(rank: int) -> None:
             owner.o_proj_tp.pre_attention_hook()
 
 
-def test_weight_switch_reconstructs_dense_and_nvfp4_layouts(tmp_path):
-    mp.spawn(_gather_worker, args=(str(tmp_path / "gloo"),), nprocs=2)
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_dense_gather_shares_workspace_and_restores_local_weights(tmp_path, contiguous):
+    _run_distributed(tmp_path, _check_dense, contiguous)
+
+
+@pytest.mark.parametrize("output_size,scale_cols", [(256, 4), (131, 3), (128, 5)])
+def test_nvfp4_gather_preserves_scale_bits_and_padding(
+    tmp_path, output_size, scale_cols
+):
+    _run_distributed(tmp_path, _check_nvfp4, output_size, scale_cols)
+
+
+def test_pcp_projection_transitions_preserve_output_and_checkpoint_names(tmp_path):
+    _run_distributed(tmp_path, _check_controller)
 
 
 @pytest.mark.parametrize("dim", [-3, 2])
-def test_weight_switch_rejects_invalid_shard_axis(dim):
+def test_weight_gather_rejects_invalid_shard_axis(dim):
     with pytest.raises(ValueError, match="Invalid gather dimension"):
-        TPWeightSwitch(
-            torch.nn.Linear(4, 3, bias=False),
-            (TPWeightGatherSpec("weight", gather_dim=dim),),
-            2,
-            TPWeightBufferPool(),
+        layer = torch.nn.Linear(4, 3, bias=False)
+        weights = GatheredWeights(
+            layer, lambda _: (WeightGatherSpec("weight", gather_dim=dim),), 2
         )
+        weights.initialize(WeightGatherWorkspace())
 
 
 @pytest.mark.parametrize("activation,group_size", [(None, 16), (kNvfp4Dynamic, 32)])
-def test_modelopt_weight_switch_rejects_unsupported_quant_spec(activation, group_size):
+def test_modelopt_weight_gather_rejects_unsupported_quant_spec(activation, group_size):
     method = ModelOptLinearMethod(
         QuantSpec(weight=kNvfp4Static, activation=activation),
         CkptCtx(group_size=group_size),
     )
     with pytest.raises(RuntimeError, match="only ModelOpt W4A4 NVFP4"):
-        method.get_tp_weight_switch_specs(torch.nn.Linear(4, 3, bias=False))
+        method.get_weight_gather_specs(torch.nn.Linear(4, 3, bias=False))

@@ -209,9 +209,9 @@ def process_weights_after_loading(
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
 
-    from vllm.model_executor.layers.pcp_o_proj_tp import PCPOProjTP
+    from vllm.model_executor.layers.weight_gather import GatheredWeights
 
-    PCPOProjTP.process_weights_after_loading(model)
+    GatheredWeights.initialize_model(model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

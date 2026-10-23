@@ -95,9 +95,9 @@ def reload_weights(
         loaded_weights = model.load_weights(weights_iterator)
         finalize_layerwise_reload(model, model_config)
 
-        from vllm.model_executor.layers.pcp_o_proj_tp import PCPOProjTP
+        from vllm.model_executor.layers.weight_gather import GatheredWeights
 
-        PCPOProjTP.process_weights_after_loading(model)
+        GatheredWeights.initialize_model(model)
 
     else:
         # load weights from kernel format

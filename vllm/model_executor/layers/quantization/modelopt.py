@@ -67,9 +67,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.layers.quantization.tp_weight_switch import (
-    TPWeightGatherSpec,
-)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     trtllm_nvfp4_hidden_alignment,
 )
@@ -115,6 +112,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.layers.weight_gather import (
+    WeightGatherSpec,
 )
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
@@ -2568,16 +2568,16 @@ class ModelOptLinearMethod(LinearMethodBase):
     legacy shape-assert path.
     """
 
-    tp_weight_gather_specs = (
-        TPWeightGatherSpec("weight", gather_dim=1, make_full_contiguous=True),
-        TPWeightGatherSpec(
+    weight_gather_specs = (
+        WeightGatherSpec("weight", gather_dim=1, make_full_contiguous=True),
+        WeightGatherSpec(
             "weight_scale", gather_dim=1, layout=create_nvfp4_scale_gather_part
         ),
     )
 
-    def get_tp_weight_switch_specs(
+    def get_weight_gather_specs(
         self, layer: torch.nn.Module
-    ) -> tuple[TPWeightGatherSpec, ...]:
+    ) -> tuple[WeightGatherSpec, ...]:
         """Validate the NVFP4 post-load layout used by PCP O-Proj TP.
 
         CUTLASS-compatible kernels keep packed weights concatenative on the
@@ -2602,7 +2602,7 @@ class ModelOptLinearMethod(LinearMethodBase):
                 "ModelOpt NVFP4 PCP O-Proj TP requires each local packed "
                 "weight shard to need no input-axis padding."
             )
-        return self.tp_weight_gather_specs
+        return self.weight_gather_specs
 
     def __init__(
         self,

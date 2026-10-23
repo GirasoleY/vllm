@@ -26,7 +26,7 @@ class MLAModules:
     kv_a_layernorm: torch.nn.Module
     kv_b_proj: torch.nn.Module
     rotary_emb: torch.nn.Module | None
-    o_proj: torch.nn.Module | PCPOProjTP
+    o_proj: torch.nn.Module
     fused_qkv_a_proj: torch.nn.Module | None
     kv_a_proj_with_mqa: torch.nn.Module | None
     q_a_layernorm: torch.nn.Module | None

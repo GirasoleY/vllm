@@ -322,15 +322,16 @@ def test_cp_generation(
 def test_pcp_o_proj_tp_mtp_cached_prefill(vllm_runner):
     """A cached one-token prefill beside decode must use one PCP collective.
 
-    The first request exhausts the initial token budget. In the next step it
-    decodes while the cached request has one prompt token, owned only by PCP
-    rank zero. MTP must retain the global prefill decision in this step.
+    MTP drops one matched cache block. The cached request therefore recomputes
+    one block plus one token; a block-sized prefill chunk leaves the final token
+    for the next step, beside the other request's decode. Only PCP rank zero
+    owns that prompt token, so MTP must retain the global batch decision.
     """
     from tests.models.utils import check_logprobs_close
     from vllm import SamplingParams
 
-    prefix = [400] * 128
-    prompts = [{"prompt_token_ids": [500] * 64}, {"prompt_token_ids": prefix + [401]}]
+    block_size, prefix_length = 64, 128
+    token_budget = 2 * block_size
     sampling = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True, logprobs=5)
     results = []
     for enabled in (False, True):
@@ -339,8 +340,11 @@ def test_pcp_o_proj_tp_mtp_cached_prefill(vllm_runner):
             dtype="bfloat16",
             enforce_eager=True,
             max_model_len=256,
-            max_num_batched_tokens=64,
+            max_num_batched_tokens=token_budget,
             max_num_seqs=2,
+            block_size=block_size,
+            long_prefill_token_threshold=block_size,
+            async_scheduling=False,
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
             prefill_context_parallel_size=2,
@@ -350,11 +354,28 @@ def test_pcp_o_proj_tp_mtp_cached_prefill(vllm_runner):
             compilation_config={"custom_ops": ["all"]},
             speculative_config={"method": "mtp", "num_speculative_tokens": 2},
         ) as runner:
+            tokenizer = runner.model.get_tokenizer()
+            prefix = (tokenizer.encode("The planets orbit the Sun. ") * prefix_length)[
+                :prefix_length
+            ]
+            uncached = (tokenizer.encode("Explain how rain forms. ") * block_size)[
+                :block_size
+            ]
+            tail = tokenizer.encode("Continue", add_special_tokens=False)[:1]
+            prompts = [
+                {"prompt_token_ids": uncached},
+                {"prompt_token_ids": prefix + tail},
+            ]
             runner.model.generate(
                 [{"prompt_token_ids": prefix}],
                 SamplingParams(temperature=0, max_tokens=1),
             )
             outputs = runner.model.generate(prompts, sampling)
+            assert outputs[0].num_cached_tokens == 0
+            assert outputs[1].num_cached_tokens == prefix_length - block_size
+            assert all(
+                len(out.outputs[0].token_ids) == sampling.max_tokens for out in outputs
+            )
             results.append(
                 [
                     (
