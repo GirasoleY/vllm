@@ -326,6 +326,18 @@ class DeepGemmMegaMoEExperts(nn.Module):
             shared_experts
         )
         self._create_weights()
+        from vllm.model_executor.layers.fused_moe.expert_load_recorder import (
+            register_expert_load,
+        )
+
+        self.expert_load_counter = register_expert_load(
+            prefix,
+            num_experts,
+            num_local_experts,
+            experts_start_idx,
+            top_k,
+            device,
+        )
         for name, param in self.named_parameters(recurse=False):
             shared = name.startswith("shared_")
             loader = self.shared_weight_loader if shared else self.weight_loader
@@ -803,6 +815,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
             shared_x_sf = symm_buffer.shared_l1_acts_sf
             shared_block_m = self.get_block_m(num_tokens)
         kwargs = dict(self._kernel_kwargs)
+        if self.expert_load_counter is not None:
+            kwargs["cumulative_local_expert_recv_stats"] = self.expert_load_counter
         if fmt.uses_nvfp4_api:
             l2_activation_scale = self.l2_activation_scale
             prepare_megamoe_nvfp4_inputs(

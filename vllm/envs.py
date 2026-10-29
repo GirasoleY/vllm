@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     FORCE_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_MOE_EXPERT_LOAD_CONFIG: str = ""
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -621,6 +622,8 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in native MegaMoE telemetry; see docs/usage/metrics.md.
+    "VLLM_MOE_EXPERT_LOAD_CONFIG": lambda: os.getenv("VLLM_MOE_EXPERT_LOAD_CONFIG", ""),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

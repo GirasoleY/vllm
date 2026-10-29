@@ -64,8 +64,8 @@ def unregister_vllm_metrics():
     """
     registry = REGISTRY
     # Unregister any existing vLLM collectors
-    for collector in list(registry._collector_to_names):
-        if hasattr(collector, "_name") and collector._name.startswith("vllm:"):
+    for collector, names in list(registry._collector_to_names.items()):
+        if any(name.startswith("vllm:") for name in names):
             registry.unregister(collector)
 
 

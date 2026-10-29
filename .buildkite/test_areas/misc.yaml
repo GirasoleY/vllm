@@ -301,6 +301,7 @@ steps:
     - image-build-cpu
   source_file_dependencies:
     - vllm/config/
+    - vllm/entrypoints/serve/instrumentator/metrics.py
     - vllm/distributed/
     - "!vllm/distributed/kv_transfer/"
     - vllm/engine/

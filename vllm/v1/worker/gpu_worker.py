@@ -1330,7 +1330,12 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        output = self.model_runner.sample_tokens(grammar_output)
+        if envs.VLLM_MOE_EXPERT_LOAD_CONFIG:
+            from vllm.model_executor.layers.fused_moe import expert_load_recorder
+
+            expert_load_recorder.sample_expert_load()
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1372,6 +1377,12 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                if output is not None and envs.VLLM_MOE_EXPERT_LOAD_CONFIG:
+                    from vllm.model_executor.layers.fused_moe import (
+                        expert_load_recorder,
+                    )
+
+                    expert_load_recorder.sample_expert_load()
                 return output
 
         assert isinstance(output, IntermediateTensors)

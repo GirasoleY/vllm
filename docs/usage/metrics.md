@@ -87,6 +87,88 @@ These metrics are available via `--enable-mfu-metrics`:
 
 --8<-- "gen:metrics-mfu"
 
+## Native MegaMoE Load Metrics
+
+Native DeepGEMM MegaMoE can report expert-parallel rank imbalance without
+enabling EPLB. Collection is disabled by default. Set
+`VLLM_MOE_EXPERT_LOAD_CONFIG` to a JSON object before starting the API server
+and workers; unset it to disable collection:
+
+```bash
+export VLLM_MOE_EXPERT_LOAD_CONFIG='{
+  "directory": "/tmp/vllm-moe-load",
+  "ep_world": 4,
+  "interval_s": 10,
+  "rank_metrics": true,
+  "max_samples": 360
+}'
+```
+
+The configuration applies to one EP replica on one host. Its worker processes
+and API server must share the directory and hostname; give each replica its
+own directory. `ep_world` must match the number of EP ranks. Pipeline-parallel
+or multi-host EP replicas are not supported. All recorded target and draft
+layers must have the same number of local physical experts. This feature
+currently instruments `DeepGemmMegaMoEExperts`; other MoE backends do not
+produce these counters.
+
+| Configuration | Meaning |
+| --- | --- |
+| `directory` | Required writable directory for atomic CPU summaries. |
+| `ep_world` | Required number of EP ranks in the replica, from 1 to 256. |
+| `interval_s` | Sampling interval, from 1 to 3600 seconds. Default: 10. |
+| `stale_after_s` | Maximum observation age for imbalance values. Default: three sampling intervals. Must be at least `interval_s`. |
+| `rank_metrics` | Enable optional cumulative counters by layer and rank. Default: `false`. |
+| `target_layers` | Number of registered target layers preceding draft layers. Set this when using speculative decoding; otherwise all registered layers are labeled `target`. |
+| `max_samples` | Expert-capture budget, from 0 to 1440. Default: 360. Zero disables expert captures. |
+| `collection_id` | Optional identifier shared by workers and collector to reject summaries from another collection generation. |
+
+The existing `/metrics` endpoint exposes:
+
+| Metric | Meaning |
+| --- | --- |
+| `vllm:moe_rank_imbalance_average` | Assignment-weighted layer average of max-rank load divided by mean-rank load. |
+| `vllm:moe_rank_imbalance_worst` | Largest active layer max-rank/mean-rank ratio. |
+| `vllm:moe_received_assignments_total` | Optional cumulative native receive assignments, with `moe_layer`, `model_part`, and `ep_rank` labels. |
+| `vllm:moe_collection_age_seconds` | Age of the oldest rank's observation used for the current window. Absent before observations arrive. |
+| `vllm:moe_collection_complete` | One when every EP rank has compatible, fresh observations for a matching window; zero otherwise. |
+| `vllm:moe_collection_skew_seconds` | Largest timestamp spread across ranks at either window boundary. |
+
+The two imbalance metrics have a `model_part` label (`target` or `draft`). A
+value of 1 means balanced rank assignment counts. Idle windows produce no
+imbalance value. Missing, stale, restarted, or incompatible ranks suppress
+imbalance values until a complete window is available. The first observation
+is a baseline, excluding warmup assignments from subsequent differences.
+These counts measure native physical expert receives; they do not include
+the shared expert or represent per-request latency. Redundant experts are
+physical slots, so counts describe the placement actually executed by EPLB.
+
+Each worker reserves a counter bank and two pinned host buffers during model
+initialization, with capacity for 256 layers. It enqueues asynchronous copies
+after execution and publishes CPU summaries from a background thread. The
+serving thread does not wait for a copy or filesystem operation. A slow
+publisher skips samples when both buffers are busy. Four summary
+observations per rank bound online storage. Optional rank series add
+`registered_layers * ep_world` counters per replica; there are no online
+expert labels. Scrape-time aggregation reads only CPU summaries.
+
+### Bounded Expert Captures
+
+Request an expert-level capture in the same configured environment and
+filesystem namespace:
+
+```bash
+python -m vllm.v1.metrics.moe_load --capture imbalance-check --samples 6
+```
+
+The capture ID accepts up to 64 letters, digits, underscores, or hyphens.
+`--samples` must not exceed `max_samples`. Each rank writes at most that many
+snapshots under `directory/<hostname>/online/diagnostics/rank<rank>/`, and
+continues publishing online metrics after the capture finishes. The first
+snapshot is a capture baseline. Re-arming with a new ID reuses the numbered
+snapshot files; filter by `capture_id` when reading an archive. Compute
+per-expert differences modulo 2**32 because native int32 counters can wrap.
+
 ## Custom Histogram Buckets
 
 The core engine histograms ship with default bucket boundaries tuned for

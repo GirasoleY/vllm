@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+from threading import Lock
 
 import prometheus_client
 import regex as re
@@ -12,6 +15,8 @@ from starlette.routing import Match, Mount
 from starlette.types import Scope
 
 from vllm.v1.metrics.prometheus import get_prometheus_registry
+
+_registry_lock = Lock()
 
 
 def _patch_instrumentator_route_walk() -> None:
@@ -56,6 +61,17 @@ class PrometheusResponse(Response):
 def attach_router(app: FastAPI):
     """Mount prometheus metrics to a FastAPI app."""
     registry = get_prometheus_registry()
+    raw = os.getenv("VLLM_MOE_EXPERT_LOAD_CONFIG", "")
+    if raw:
+        config = json.loads(raw)
+        from vllm.v1.metrics.moe_load import MoeLoadCollector
+
+        with _registry_lock:
+            if not any(
+                isinstance(collector, MoeLoadCollector)
+                for collector in list(registry._collector_to_names)
+            ):
+                registry.register(MoeLoadCollector(config))
 
     # `response_class=PrometheusResponse` is needed to return an HTTP response
     # with header "Content-Type: text/plain; version=0.0.4; charset=utf-8"
@@ -78,4 +94,5 @@ def attach_router(app: FastAPI):
 
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
-    app.routes.append(metrics_route)
+    # Preserve custom collectors ahead of Instrumentator's multiprocess handler.
+    app.routes.insert(0, metrics_route)

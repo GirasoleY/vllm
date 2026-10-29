@@ -4,6 +4,8 @@
 input staging, and numerics against a dequantized reference for every routed
 format, activation and shared-expert fusion in the feature matrix."""
 
+import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1128,6 +1130,33 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     return (1 - 2 * (x * y).sum() / (x * x + y * y).sum()).item()
 
 
+@pytest.fixture
+def native_load_recorder(monkeypatch, tmp_path, request):
+    from vllm.model_executor.layers.fused_moe.expert_load_recorder import (
+        get_expert_load_recorder,
+    )
+
+    config = dict(
+        directory=str(tmp_path),
+        ep_world=1,
+        interval_s=1,
+        max_samples=2,
+        rank_metrics=True,
+    )
+    monkeypatch.setenv(
+        "VLLM_MOE_EXPERT_LOAD_CONFIG", json.dumps(config) if request.param else ""
+    )
+    get_expert_load_recorder.cache_clear()
+    recorder = get_expert_load_recorder()
+    try:
+        yield recorder
+    finally:
+        if recorder is not None and recorder.pool is not None:
+            recorder.pool.shutdown()
+        get_expert_load_recorder.cache_clear()
+
+
+@pytest.mark.parametrize("native_load_recorder", [False, True], indirect=True)
 @pytest.mark.skipif(
     not (
         current_platform.is_device_capability_family(100) and is_deep_gemm_supported()
@@ -1149,7 +1178,9 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
         for shared in (None, *(spec.dtype for spec in fmt.shared))
     ],
 )
-def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_name):
+def test_deep_gemm_mega_moe_matches_reference(
+    dist_init, fmt_name, shared, act_name, native_load_recorder
+):
     """``shared`` is the fused shared-expert dtype; None runs it unfused."""
     fmt, act = MEGA_MOE_WEIGHT_FORMATS[fmt_name], ACTIVATIONS[act_name]
     shared_spec = next(
@@ -1272,3 +1303,90 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     assert output.dtype == torch.bfloat16
     assert _calc_diff(output, expected) < 1e-3
     assert F.cosine_similarity(output.float(), expected, dim=-1).min() > 0.99
+
+    counter = experts.expert_load_counter
+    if native_load_recorder is None:
+        assert counter is None
+        return
+    assert counter is not None
+    expected_counts = torch.bincount(topk_ids.flatten(), minlength=NUM_EXPERTS).int()
+    torch.testing.assert_close(counter, expected_counts, rtol=0, atol=0)
+    experts.expert_load_counter = None
+    unrecorded = experts(
+        hidden_states, topk_weights, topk_ids, None if fuse_shared else reference_shared
+    )
+    torch.testing.assert_close(unrecorded, output, rtol=0, atol=0)
+    experts.expert_load_counter = counter
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = experts(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            None if fuse_shared else reference_shared,
+        )
+    counter.zero_()
+    for _ in range(3):
+        graph.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(graph_output, output, rtol=0, atol=0)
+    torch.testing.assert_close(counter, 3 * expected_counts, rtol=0, atol=0)
+
+    from prometheus_client import CollectorRegistry, generate_latest
+
+    from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
+    from vllm.v1.metrics.moe_load import MoeLoadCollector, request_diagnostic
+
+    recorder = native_load_recorder
+    registry = CollectorRegistry()
+    registry.register(MoeLoadCollector(recorder.config))
+    request_diagnostic(recorder.config, "native-kernel", 2)
+    enable_gpu_sync_check()
+    sample = with_gpu_sync_check(recorder.sample)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        graph.replay()
+        sample()
+        payload = generate_latest(registry)
+        captures = sorted(
+            recorder.publisher.root.glob("diagnostics/rank0/sample*.json")
+        )
+        if b"vllm:moe_collection_complete 1.0" in payload and len(captures) == 2:
+            break
+        time.sleep(0.01)
+    assert b"vllm:moe_collection_complete 1.0" in payload
+    assert b'vllm:moe_rank_imbalance_average{model_part="target"} 1.0' in payload
+    assert len(captures) == 2
+    first, last = [json.loads(file.read_text()) for file in captures]
+    assert first["baseline"] and not last["baseline"]
+    assert sum(last["cumulative_received_tokens"][0]) > sum(
+        first["cumulative_received_tokens"][0]
+    )
+
+
+@requires_sm100
+def test_recorder_stops_after_event_query_error(monkeypatch, tmp_path):
+    from vllm.model_executor.layers.fused_moe.expert_load_recorder import (
+        ExpertLoadRecorder,
+    )
+
+    recorder = ExpertLoadRecorder(dict(directory=str(tmp_path), ep_world=1))
+    recorder.register("model.layers.0.experts", 2, 2, 0, 1, torch.device("cuda"))
+
+    def query_error(self):
+        raise RuntimeError("event query failed")
+
+    try:
+        monkeypatch.setattr(torch.cuda.Event, "query", query_error)
+        recorder.sample()
+        deadline = time.monotonic() + 5
+        while not recorder.failed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert recorder.failed
+        recorder.sample()
+        assert recorder.samples == 1
+    finally:
+        if recorder.pool is not None:
+            recorder.pool.shutdown()
+        torch.accelerator.synchronize()
